@@ -1,0 +1,39 @@
+FROM quay.io/fedora/fedora@sha256:63773f454664cd77e239f8e0b13ae7f18effe9e3d6612a325b5646eb3bda11f1
+
+LABEL app.sculptlite.project="sculpt-lite"
+
+RUN dnf -y --setopt=install_weak_deps=False install \
+        appstream \
+        ca-certificates \
+        dbus-devel \
+        desktop-file-utils \
+        gcc \
+        gcc-c++ \
+        git-core \
+        libX11-devel \
+        libXcursor-devel \
+        libXi-devel \
+        libXrandr-devel \
+        libxkbcommon-devel \
+        libxml2 \
+        make \
+        mesa-libGL-devel \
+        pkgconf-pkg-config \
+        rpm-build \
+        rustup \
+        vulkan-loader-devel \
+        wayland-devel \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    PATH=/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.96.0 \
+        --component clippy \
+        --component rustfmt \
+    && rustc --version \
+    && cargo --version
+
+WORKDIR /workspace

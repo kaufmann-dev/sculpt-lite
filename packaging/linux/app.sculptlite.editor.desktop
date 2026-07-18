@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SculptLite
+GenericName=STL Sculpting Tool
+Comment=Sculpt and export STL meshes
+Exec=sculpt-lite %f
+TryExec=sculpt-lite
+Icon=app.sculptlite.editor
+Terminal=false
+Categories=Graphics;3DGraphics;
+Keywords=sculpt;mesh;STL;3D;model;
+MimeType=model/stl;
+StartupNotify=true
+StartupWMClass=app.sculptlite.editor

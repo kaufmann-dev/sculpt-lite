@@ -1,0 +1,172 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ubuntu:
+    name: Ubuntu checks and AppImage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Linux build and smoke-test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            appstream \
+            curl \
+            desktop-file-utils \
+            libdbus-1-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxrandr-dev \
+            libxml2-utils \
+            mesa-vulkan-drivers \
+            pkg-config \
+            shellcheck \
+            xdotool \
+            xvfb
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal --component clippy --component rustfmt
+          rustup default 1.96.0
+
+      - name: Check packaging shell scripts
+        run: |
+          shellcheck \
+            packaging/appimage/AppRun \
+            packaging/appimage/build-appimage.sh \
+            packaging/linux/smoke-x11.sh \
+            packaging/rpm/build-rpm.sh
+
+      - name: Check all targets and features
+        run: cargo check --locked --all-targets --all-features
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Run Rust tests with Mesa Vulkan
+        env:
+          VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          WGPU_BACKEND: vulkan
+        run: cargo test --locked --all-features
+
+      - name: Build release binary
+        run: cargo build --locked --release
+
+      - name: Smoke-test native X11 launch
+        run: packaging/linux/smoke-x11.sh target/release/sculpt-lite
+
+      - name: Install pinned AppImage tool
+        env:
+          APPIMAGE_RUNTIME_SHA256: 1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf
+          APPIMAGE_RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+          APPIMAGETOOL_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+        run: |
+          install -d "${RUNNER_TEMP}/appimagetool"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "$APPIMAGETOOL_URL" \
+            --output "${RUNNER_TEMP}/appimagetool/appimagetool"
+          printf '%s  %s\n' \
+            "$APPIMAGETOOL_SHA256" \
+            "${RUNNER_TEMP}/appimagetool/appimagetool" | sha256sum --check
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "$APPIMAGE_RUNTIME_URL" \
+            --output "${RUNNER_TEMP}/appimagetool/runtime-x86_64"
+          printf '%s  %s\n' \
+            "$APPIMAGE_RUNTIME_SHA256" \
+            "${RUNNER_TEMP}/appimagetool/runtime-x86_64" | sha256sum --check
+          chmod 0755 "${RUNNER_TEMP}/appimagetool/appimagetool"
+
+      - name: Build reproducible AppImage
+        env:
+          APPIMAGE_RUNTIME: ${{ runner.temp }}/appimagetool/runtime-x86_64
+          APPIMAGETOOL: ${{ runner.temp }}/appimagetool/appimagetool
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          packaging/appimage/build-appimage.sh
+
+      - name: Smoke-test AppImage launch
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: packaging/linux/smoke-x11.sh dist/SculptLite-0.1.0-x86_64.AppImage
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sculpt-lite-appimage-x86_64
+          path: dist/SculptLite-0.1.0-x86_64.AppImage
+          if-no-files-found: error
+          compression-level: 0
+
+  fedora-rpm:
+    name: Fedora RPM in Podman
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install Podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y podman rpm
+
+      - name: Build pinned Fedora image
+        run: |
+          podman pull quay.io/fedora/fedora@sha256:63773f454664cd77e239f8e0b13ae7f18effe9e3d6612a325b5646eb3bda11f1
+          podman build --pull=never --tag localhost/sculpt-lite-rpm:ci packaging/rpm
+
+      - name: Build RPM
+        run: |
+          podman run --rm \
+            --label app.sculptlite.project=sculpt-lite \
+            --volume "${GITHUB_WORKSPACE}:/workspace:Z" \
+            --workdir /workspace \
+            --env SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" \
+            localhost/sculpt-lite-rpm:ci \
+            bash -euo pipefail -c \
+              'cargo build --locked --release && packaging/rpm/build-rpm.sh'
+
+      - name: Verify RPM payload
+        run: |
+          rpm_path="$(find dist/rpm -maxdepth 1 -type f -name '*.x86_64.rpm' -print -quit)"
+          test -n "$rpm_path"
+          rpm --checksig "$rpm_path"
+          rpm --query --package --list "$rpm_path"
+
+      - name: Upload RPM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sculpt-lite-rpm-x86_64
+          path: dist/rpm/*.x86_64.rpm
+          if-no-files-found: error
+          compression-level: 0

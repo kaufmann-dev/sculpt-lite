@@ -12,6 +12,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
+            .with_app_id("app.sculptlite.editor")
             .with_title("SculptLite")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 600.0]),

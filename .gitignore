@@ -1,1 +1,5 @@
-/target
+/target/
+/artifacts/
+*.rpm
+*.AppImage
+perf.data*

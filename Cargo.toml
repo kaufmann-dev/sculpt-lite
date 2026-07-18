@@ -2,6 +2,9 @@
 name = "sculpt-lite"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.96"
+description = "Native focused STL mesh sculpting tool"
+repository = "https://github.com/kaufmann-dev/sculpt-lite"
 
 [dependencies]
 bytemuck = { version = "1.25", features = ["derive"] }
@@ -19,3 +22,6 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[lints.rust]
+unsafe_code = "forbid"
