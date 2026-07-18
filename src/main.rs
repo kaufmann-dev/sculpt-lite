@@ -8,6 +8,7 @@ mod stl;
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    let initial_path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -22,6 +23,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "SculptLite",
         options,
-        Box::new(|creation_context| Ok(Box::new(app::SculptLiteApp::new(creation_context)))),
+        Box::new(move |creation_context| {
+            Ok(Box::new(app::SculptLiteApp::new(
+                creation_context,
+                initial_path,
+            )))
+        }),
     )
 }

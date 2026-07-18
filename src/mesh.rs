@@ -99,6 +99,10 @@ pub struct RemeshStats {
 pub struct MeshBvh {
     nodes: Vec<BvhNode>,
     triangle_indices: Vec<u32>,
+    triangle_leaves: Vec<u32>,
+    parents: Vec<u32>,
+    dirty_marks: Vec<u32>,
+    dirty_generation: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -173,6 +177,43 @@ impl MeshTopology {
             }
         }
         protected
+    }
+
+    fn vertex_in_protected_neighborhood(&self, vertex: u32) -> bool {
+        let index = vertex as usize;
+        self.boundary_vertices.get(index).copied().unwrap_or(true)
+            || self
+                .non_manifold_vertices
+                .get(index)
+                .copied()
+                .unwrap_or(true)
+            || self
+                .vertex_neighbors
+                .get(index)
+                .into_iter()
+                .flatten()
+                .any(|&neighbor| {
+                    self.boundary_vertices[neighbor as usize]
+                        || self.non_manifold_vertices[neighbor as usize]
+                })
+    }
+
+    fn active_edges(&self, active: &[bool]) -> Vec<EdgeKey> {
+        let mut edges = Vec::new();
+        for (vertex, &is_active) in active.iter().enumerate() {
+            if !is_active {
+                continue;
+            }
+            let Ok(a) = u32::try_from(vertex) else {
+                continue;
+            };
+            for &b in &self.vertex_neighbors[vertex] {
+                if a < b && active.get(b as usize).copied().unwrap_or(false) {
+                    edges.push((a, b));
+                }
+            }
+        }
+        edges
     }
 
     fn build(positions: &[Vec3], triangles: &[[u32; 3]]) -> Self {
@@ -447,6 +488,48 @@ impl Mesh {
         self.topology.bvh.refit(&self.positions, &self.triangles);
     }
 
+    /// Recomputes only normals and BVH branches touched by moved vertices.
+    ///
+    /// Returns the complete set of vertices whose render normals changed, so
+    /// the renderer can issue compact partial vertex-buffer writes.
+    pub fn update_deformed_vertices(&mut self, moved_vertices: &[u32]) -> Vec<u32> {
+        let mut affected_faces = moved_vertices
+            .iter()
+            .filter_map(|&vertex| self.topology.vertex_triangles.get(vertex as usize))
+            .flat_map(|faces| faces.iter().copied())
+            .collect::<Vec<_>>();
+        affected_faces.sort_unstable();
+        affected_faces.dedup();
+        if affected_faces.is_empty() {
+            return Vec::new();
+        }
+
+        let mut normal_vertices = affected_faces
+            .iter()
+            .filter_map(|&face| self.triangles.get(face as usize))
+            .flat_map(|triangle| triangle.iter().copied())
+            .collect::<Vec<_>>();
+        normal_vertices.sort_unstable();
+        normal_vertices.dedup();
+
+        for &vertex in &normal_vertices {
+            let Some(normal) = self.normals.get_mut(vertex as usize) else {
+                continue;
+            };
+            *normal = self.topology.vertex_triangles[vertex as usize]
+                .iter()
+                .filter_map(|&face| self.triangles.get(face as usize))
+                .map(|&triangle| triangle_cross(&self.positions, triangle))
+                .sum::<Vec3>()
+                .try_normalize()
+                .unwrap_or(Vec3::ZERO);
+        }
+        self.topology
+            .bvh
+            .refit_triangles(&self.positions, &self.triangles, &affected_faces);
+        normal_vertices
+    }
+
     pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
         let mut positions = self
             .positions
@@ -610,19 +693,17 @@ impl Mesh {
     /// Splits a maximal set of long edges whose incident faces do not overlap,
     /// then rebuilds derived topology once for the whole set.
     fn split_active_edges_batch(&mut self, active: &mut Vec<bool>, threshold: f32) -> usize {
-        let protected = self.topology.protected_neighborhood();
         let mut candidates = self
             .topology
-            .edge_faces
-            .iter()
-            .filter(|(_, faces)| faces.len() == 2)
-            .filter_map(|(&edge @ (a, b), faces)| {
+            .active_edges(active)
+            .into_iter()
+            .filter_map(|edge @ (a, b)| {
+                let faces = self.topology.edge_faces.get(&edge)?;
                 let ai = a as usize;
                 let bi = b as usize;
-                if !active.get(ai).copied().unwrap_or(false)
-                    || !active.get(bi).copied().unwrap_or(false)
-                    || protected[ai]
-                    || protected[bi]
+                if faces.len() != 2
+                    || self.topology.vertex_in_protected_neighborhood(a)
+                    || self.topology.vertex_in_protected_neighborhood(b)
                 {
                     return None;
                 }
@@ -637,17 +718,14 @@ impl Mesh {
                 .then_with(|| left.0.cmp(&right.0))
         });
 
-        let mut used_faces = vec![false; self.triangles.len()];
+        let mut used_faces = HashSet::new();
         let mut selected = Vec::new();
         for (edge, faces, _) in candidates {
-            if faces
-                .iter()
-                .any(|&face| used_faces.get(face as usize).copied().unwrap_or(true))
-            {
+            if faces.iter().any(|face| used_faces.contains(face)) {
                 continue;
             }
             for &face in &faces {
-                used_faces[face as usize] = true;
+                used_faces.insert(face);
             }
             selected.push((edge, faces));
         }
@@ -691,19 +769,17 @@ impl Mesh {
 
     /// Collapses a maximal set of one-ring-disjoint short edges in one compacting pass.
     fn collapse_active_edges_batch(&mut self, active: &mut Vec<bool>, threshold: f32) -> usize {
-        let protected = self.topology.protected_neighborhood();
         let mut candidates = self
             .topology
-            .edge_faces
-            .iter()
-            .filter(|(_, faces)| faces.len() == 2)
-            .filter_map(|(&(a, b), _)| {
+            .active_edges(active)
+            .into_iter()
+            .filter_map(|(a, b)| {
+                let faces = self.topology.edge_faces.get(&(a, b))?;
                 let ai = a as usize;
                 let bi = b as usize;
-                if !active.get(ai).copied().unwrap_or(false)
-                    || !active.get(bi).copied().unwrap_or(false)
-                    || protected[ai]
-                    || protected[bi]
+                if faces.len() != 2
+                    || self.topology.vertex_in_protected_neighborhood(a)
+                    || self.topology.vertex_in_protected_neighborhood(b)
                 {
                     return None;
                 }
@@ -878,17 +954,15 @@ impl Mesh {
 
     /// Flips a maximal set of face-disjoint edges, followed by one topology rebuild.
     fn flip_active_edges_batch(&mut self, active: &[bool]) -> usize {
-        let protected = self.topology.protected_neighborhood();
         let mut candidates = self
             .topology
-            .edge_faces
-            .iter()
-            .filter(|(_, faces)| faces.len() == 2)
-            .filter_map(|(&(a, b), faces)| {
-                if !active.get(a as usize).copied().unwrap_or(false)
-                    || !active.get(b as usize).copied().unwrap_or(false)
-                    || protected[a as usize]
-                    || protected[b as usize]
+            .active_edges(active)
+            .into_iter()
+            .filter_map(|(a, b)| {
+                let faces = self.topology.edge_faces.get(&(a, b))?;
+                if faces.len() != 2
+                    || self.topology.vertex_in_protected_neighborhood(a)
+                    || self.topology.vertex_in_protected_neighborhood(b)
                 {
                     return None;
                 }
@@ -899,8 +973,8 @@ impl Mesh {
                 if c == d
                     || !active.get(c as usize).copied().unwrap_or(false)
                     || !active.get(d as usize).copied().unwrap_or(false)
-                    || protected[c as usize]
-                    || protected[d as usize]
+                    || self.topology.vertex_in_protected_neighborhood(c)
+                    || self.topology.vertex_in_protected_neighborhood(d)
                     || self.topology.edge_faces.contains_key(&edge_key(c, d))
                 {
                     return None;
@@ -932,15 +1006,15 @@ impl Mesh {
             .collect::<Vec<_>>();
         candidates.sort_unstable_by(|left, right| right.4.total_cmp(&left.4));
 
-        let mut used_faces = vec![false; self.triangles.len()];
+        let mut used_faces = HashSet::new();
         let mut new_edges = HashSet::new();
         let mut flip_count = 0;
         for (faces, new_edge, first, second, _) in candidates {
-            if faces.iter().any(|&face| used_faces[face as usize]) || !new_edges.insert(new_edge) {
+            if faces.iter().any(|face| used_faces.contains(face)) || !new_edges.insert(new_edge) {
                 continue;
             }
-            used_faces[faces[0] as usize] = true;
-            used_faces[faces[1] as usize] = true;
+            used_faces.insert(faces[0]);
+            used_faces.insert(faces[1]);
             self.triangles[faces[0] as usize] = first;
             self.triangles[faces[1] as usize] = second;
             flip_count += 1;
@@ -989,11 +1063,25 @@ impl MeshBvh {
         if triangles.is_empty() {
             return Self::default();
         }
+        let estimated_nodes = triangles
+            .len()
+            .div_ceil(BVH_LEAF_SIZE / 2)
+            .saturating_mul(2);
         let mut bvh = Self {
-            nodes: Vec::with_capacity(triangles.len().saturating_mul(2)),
+            nodes: Vec::with_capacity(estimated_nodes),
             triangle_indices: (0..triangles.len() as u32).collect(),
+            triangle_leaves: vec![u32::MAX; triangles.len()],
+            parents: Vec::with_capacity(estimated_nodes),
+            dirty_marks: Vec::with_capacity(estimated_nodes),
+            dirty_generation: 0,
         };
-        bvh.build_node(positions, triangles, 0, bvh.triangle_indices.len());
+        bvh.build_node(
+            positions,
+            triangles,
+            0,
+            bvh.triangle_indices.len(),
+            u32::MAX,
+        );
         bvh
     }
 
@@ -1003,9 +1091,12 @@ impl MeshBvh {
         triangles: &[[u32; 3]],
         start: usize,
         end: usize,
+        parent: u32,
     ) -> u32 {
         let node_index = self.nodes.len() as u32;
         self.nodes.push(BvhNode::default());
+        self.parents.push(parent);
+        self.dirty_marks.push(0);
         let (min, max, centroid_min, centroid_max) =
             triangle_range_bounds(positions, triangles, &self.triangle_indices[start..end]);
         let count = end - start;
@@ -1017,6 +1108,9 @@ impl MeshBvh {
                 count: count as u32,
                 ..BvhNode::default()
             };
+            for &triangle in &self.triangle_indices[start..end] {
+                self.triangle_leaves[triangle as usize] = node_index;
+            }
             return node_index;
         }
 
@@ -1036,8 +1130,8 @@ impl MeshBvh {
                     .total_cmp(&triangle_centroid(positions, triangles[right as usize])[axis])
             },
         );
-        let left = self.build_node(positions, triangles, start, middle);
-        let right = self.build_node(positions, triangles, middle, end);
+        let left = self.build_node(positions, triangles, start, middle, node_index);
+        let right = self.build_node(positions, triangles, middle, end, node_index);
         self.nodes[node_index as usize] = BvhNode {
             min,
             max,
@@ -1073,6 +1167,75 @@ impl MeshBvh {
             };
             self.nodes[node_index].min = min;
             self.nodes[node_index].max = max;
+        }
+    }
+
+    fn refit_triangles(
+        &mut self,
+        positions: &[Vec3],
+        triangles: &[[u32; 3]],
+        affected_faces: &[u32],
+    ) {
+        if affected_faces.is_empty() {
+            return;
+        }
+        if self.nodes.is_empty()
+            || self.triangle_indices.len() != triangles.len()
+            || self.triangle_leaves.len() != triangles.len()
+            || self.parents.len() != self.nodes.len()
+            || self.dirty_marks.len() != self.nodes.len()
+        {
+            *self = Self::build(positions, triangles);
+            return;
+        }
+        if affected_faces.len() >= triangles.len() / 4 {
+            self.refit(positions, triangles);
+            return;
+        }
+
+        self.dirty_generation = self.dirty_generation.wrapping_add(1);
+        if self.dirty_generation == 0 {
+            self.dirty_marks.fill(0);
+            self.dirty_generation = 1;
+        }
+        let generation = self.dirty_generation;
+        let mut dirty_nodes = Vec::with_capacity(affected_faces.len().saturating_mul(4));
+        for &face in affected_faces {
+            let Some(&leaf) = self.triangle_leaves.get(face as usize) else {
+                continue;
+            };
+            if leaf == u32::MAX {
+                continue;
+            }
+            let mut node = leaf;
+            while node != u32::MAX {
+                let mark = &mut self.dirty_marks[node as usize];
+                if *mark == generation {
+                    break;
+                }
+                *mark = generation;
+                dirty_nodes.push(node);
+                node = self.parents[node as usize];
+            }
+        }
+
+        // Nodes are allocated before their children, so descending indices always
+        // update children before the parent that encloses them.
+        dirty_nodes.sort_unstable_by(|left, right| right.cmp(left));
+        for node_index in dirty_nodes {
+            let node = self.nodes[node_index as usize];
+            let (min, max) = if node.is_leaf() {
+                let range = node.start as usize..(node.start + node.count) as usize;
+                let (min, max, _, _) =
+                    triangle_range_bounds(positions, triangles, &self.triangle_indices[range]);
+                (min, max)
+            } else {
+                let left = self.nodes[node.left as usize];
+                let right = self.nodes[node.right as usize];
+                (left.min.min(right.min), left.max.max(right.max))
+            };
+            self.nodes[node_index as usize].min = min;
+            self.nodes[node_index as usize].max = max;
         }
     }
 
@@ -1631,6 +1794,25 @@ mod tests {
     }
 
     #[test]
+    fn active_edge_collection_matches_topology_filter() {
+        let mesh = octahedron();
+        let mut active = vec![false; mesh.positions.len()];
+        for vertex in [0_usize, 1, 4, 5] {
+            active[vertex] = true;
+        }
+        let mut expected = mesh
+            .topology
+            .edge_faces
+            .keys()
+            .copied()
+            .filter(|&(a, b)| active[a as usize] && active[b as usize])
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+
+        assert_eq!(mesh.topology.active_edges(&active), expected);
+    }
+
+    #[test]
     fn bounds_center_and_diagonal_preserve_coordinates() {
         let mesh = Mesh::new(
             vec![Vec3::new(-2.0, 3.0, 4.0), Vec3::new(6.0, 7.0, 8.0)],
@@ -1677,6 +1859,28 @@ mod tests {
         .unwrap();
         assert_eq!(mesh.nearest_triangle(Vec3::new(10.2, 0.2, 3.0)), Some(1));
         assert_eq!(mesh.nearest_triangle(Vec3::new(0.2, 0.2, 3.0)), Some(0));
+    }
+
+    #[test]
+    fn local_deformation_refresh_matches_full_normals_and_refits_bvh() {
+        let mut local = octahedron();
+        local.positions[0] = Vec3::new(2.5, 0.2, 0.1);
+        let updated = local.update_deformed_vertices(&[0]);
+
+        let mut full = octahedron();
+        full.positions[0] = local.positions[0];
+        full.recompute_normals();
+
+        assert!(updated.contains(&0));
+        for (local_normal, full_normal) in local.normals.iter().zip(&full.normals) {
+            assert!(local_normal.abs_diff_eq(*full_normal, 1.0e-6));
+        }
+        let local_hit = local
+            .raycast(Vec3::new(1.8, 0.1, 2.0), Vec3::NEG_Z)
+            .expect("the expanded mesh bounds must be pickable after a local refit");
+        let full_hit = full.raycast(Vec3::new(1.8, 0.1, 2.0), Vec3::NEG_Z).unwrap();
+        assert!((local_hit.distance - full_hit.distance).abs() < 1.0e-5);
+        assert_eq!(local_hit.triangle, full_hit.triangle);
     }
 
     #[test]
@@ -1801,6 +2005,31 @@ mod tests {
     }
 
     #[test]
+    fn no_op_local_remesh_preserves_mesh_exactly() {
+        let mut mesh = octahedron();
+        let before = mesh.clone();
+        let stats = mesh.remesh_region(
+            &[0, 1, 4],
+            RemeshSettings {
+                target_edge_length: 1.0,
+                iterations: 1,
+                split_threshold: 10.0,
+                collapse_threshold: 0.01,
+                enable_flips: false,
+                relaxation: 0.0,
+            },
+        );
+
+        assert_eq!(stats.splits, 0);
+        assert_eq!(stats.collapses, 0);
+        assert_eq!(stats.flips, 0);
+        assert_eq!(stats.relaxed_vertices, 0);
+        assert_eq!(mesh.positions, before.positions);
+        assert_eq!(mesh.triangles, before.triangles);
+        assert_eq!(mesh.mask, before.mask);
+    }
+
+    #[test]
     fn closest_point_regions_cover_faces_edges_and_vertices() {
         let triangle = [Vec3::ZERO, Vec3::X, Vec3::Y];
         assert!(
@@ -1863,8 +2092,9 @@ mod tests {
             mesh.positions[vertex as usize].z = 0.01;
         }
         let deform_refresh_started = Instant::now();
-        mesh.recompute_normals();
+        let updated_vertices = mesh.update_deformed_vertices(&active);
         let deform_refresh_elapsed = deform_refresh_started.elapsed();
+        assert!(updated_vertices.len() >= active.len());
         let remesh_started = Instant::now();
         let stats = mesh.remesh_region(
             &active,
@@ -1872,7 +2102,7 @@ mod tests {
                 target_edge_length: 0.9,
                 iterations: 1,
                 enable_flips: true,
-                relaxation: 0.1,
+                relaxation: 0.0,
                 ..RemeshSettings::default()
             },
         );

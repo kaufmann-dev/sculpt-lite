@@ -1,4 +1,5 @@
 use std::mem::size_of;
+use std::ops::Range;
 use std::sync::{Arc, RwLock};
 
 use bytemuck::{Pod, Zeroable};
@@ -87,6 +88,8 @@ impl ViewportRenderer {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         input.mesh = upload;
+        input.full_vertex_upload = true;
+        input.dirty_vertices.clear();
         input.vertex_revision = input.vertex_revision.wrapping_add(1);
         input.topology_revision = input.topology_revision.wrapping_add(1);
     }
@@ -100,7 +103,47 @@ impl ViewportRenderer {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         input.mesh.vertices = vertices;
+        input.full_vertex_upload = true;
+        input.dirty_vertices.clear();
         input.vertex_revision = input.vertex_revision.wrapping_add(1);
+    }
+
+    /// Refreshes only vertices changed by a sculpt sample. The CPU mirror is
+    /// updated immediately; adjacent indices are coalesced into compact GPU
+    /// writes when the viewport callback is prepared.
+    pub fn update_vertices_partial(&self, mesh: &Mesh, changed_vertices: &[u32]) {
+        if changed_vertices.is_empty() {
+            return;
+        }
+        let mut input = self
+            .shared
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if input.mesh.vertices.len() != mesh.positions.len() {
+            input.mesh.vertices = MeshUpload::vertices(&mesh.positions, &mesh.normals, &mesh.mask);
+            input.full_vertex_upload = true;
+            input.dirty_vertices.clear();
+            input.vertex_revision = input.vertex_revision.wrapping_add(1);
+            return;
+        }
+
+        let mut changed = false;
+        for &vertex in changed_vertices {
+            let index = vertex as usize;
+            let Some(position) = mesh.positions.get(index).copied() else {
+                continue;
+            };
+            input.mesh.vertices[index] = MeshUpload::vertex(
+                position,
+                mesh.normals.get(index).copied(),
+                mesh.mask.get(index).copied(),
+            );
+            input.dirty_vertices.push(vertex);
+            changed = true;
+        }
+        if changed {
+            input.vertex_revision = input.vertex_revision.wrapping_add(1);
+        }
     }
 
     /// Updates view and lighting uniforms. Call after camera input and whenever
@@ -130,7 +173,7 @@ impl ViewportRenderer {
     /// Paints a clipped studio viewport and an optional screen-space brush ring.
     pub fn paint(&self, ui: &Ui, rect: Rect, brush_cursor: Option<BrushCursor>, wireframe: bool) {
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-        painter.rect_filled(rect, 0.0, Color32::from_rgb(27, 30, 36));
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(30, 34, 41));
         painter.add(self.paint_callback(rect, wireframe));
 
         if let Some(cursor) = brush_cursor.filter(|cursor| {
@@ -156,6 +199,8 @@ struct RenderInput {
     camera_revision: u64,
     mesh: MeshUpload,
     camera: CameraUniform,
+    full_vertex_upload: bool,
+    dirty_vertices: Vec<u32>,
 }
 
 #[derive(Default)]
@@ -194,27 +239,54 @@ impl MeshUpload {
             .iter()
             .enumerate()
             .map(|(index, &position)| {
-                let normal = normals
-                    .get(index)
-                    .copied()
-                    .filter(|normal| normal.is_finite())
-                    .unwrap_or(Vec3::Y)
-                    .normalize_or_zero();
-                let mask = masks
-                    .get(index)
-                    .copied()
-                    .filter(|mask| mask.is_finite())
-                    .unwrap_or(0.0)
-                    .clamp(0.0, 1.0);
-                GpuVertex {
-                    position: position.to_array(),
-                    mask,
-                    normal: normal.to_array(),
-                    _padding: 0.0,
-                }
+                Self::vertex(
+                    position,
+                    normals.get(index).copied(),
+                    masks.get(index).copied(),
+                )
             })
             .collect()
     }
+
+    fn vertex(position: Vec3, normal: Option<Vec3>, mask: Option<f32>) -> GpuVertex {
+        let normal = normal
+            .filter(|normal| normal.is_finite())
+            .unwrap_or(Vec3::Y)
+            .normalize_or_zero();
+        let mask = mask
+            .filter(|mask| mask.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+        GpuVertex {
+            position: position.to_array(),
+            mask,
+            normal: normal.to_array(),
+            _padding: 0.0,
+        }
+    }
+}
+
+fn coalesced_vertex_ranges(
+    dirty_vertices: &mut Vec<u32>,
+    vertex_count: usize,
+) -> Vec<Range<usize>> {
+    const MAX_UNCHANGED_GAP: u32 = 16;
+
+    dirty_vertices.retain(|&vertex| (vertex as usize) < vertex_count);
+    dirty_vertices.sort_unstable();
+    dirty_vertices.dedup();
+    let mut ranges = Vec::<Range<usize>>::new();
+    for &vertex in dirty_vertices.iter() {
+        let index = vertex as usize;
+        if let Some(last) = ranges.last_mut()
+            && vertex <= (last.end as u32).saturating_add(MAX_UNCHANGED_GAP)
+        {
+            last.end = index + 1;
+        } else {
+            ranges.push(index..index + 1);
+        }
+    }
+    ranges
 }
 
 #[repr(C)]
@@ -244,7 +316,8 @@ impl GpuVertex {
 struct CameraUniform {
     view_projection: [[f32; 4]; 4],
     eye: [f32; 4],
-    key_light: [f32; 4],
+    camera_right: [f32; 4],
+    camera_up: [f32; 4],
     material: [f32; 4],
 }
 
@@ -253,8 +326,10 @@ impl Default for CameraUniform {
         Self {
             view_projection: glam::Mat4::IDENTITY.to_cols_array_2d(),
             eye: [0.0, 0.0, 3.0, 1.0],
-            key_light: [-0.35, 0.8, 0.5, 0.0],
-            material: [0.38, 0.22, 0.0, 0.0],
+            camera_right: [1.0, 0.0, 0.0, 0.0],
+            camera_up: [0.0, 1.0, 0.0, 0.0],
+            // Curvature contrast, broad specular strength, and rim strength.
+            material: [0.10, 0.055, 0.025, 0.0],
         }
     }
 }
@@ -264,6 +339,18 @@ impl CameraUniform {
         Self {
             view_projection: camera.view_projection(aspect).to_cols_array_2d(),
             eye: camera.eye_position().extend(1.0).to_array(),
+            camera_right: camera
+                .right()
+                .try_normalize()
+                .unwrap_or(Vec3::X)
+                .extend(0.0)
+                .to_array(),
+            camera_up: camera
+                .up()
+                .try_normalize()
+                .unwrap_or(Vec3::Y)
+                .extend(0.0)
+                .to_array(),
             ..Self::default()
         }
     }
@@ -366,6 +453,38 @@ impl ViewportGpu {
     fn upload_vertices(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &MeshUpload) {
         self.vertices
             .write(device, queue, "sculpt viewport vertices", &mesh.vertices);
+    }
+
+    fn upload_changed_vertices(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshUpload,
+        mut dirty_vertices: Vec<u32>,
+    ) {
+        if self.vertices.buffer.is_none() {
+            self.upload_vertices(device, queue, mesh);
+            return;
+        }
+        let ranges = coalesced_vertex_ranges(&mut dirty_vertices, mesh.vertices.len());
+        let uploaded_vertices = ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<usize>();
+        if uploaded_vertices > mesh.vertices.len() / 4 || ranges.len() > 2_048 {
+            self.upload_vertices(device, queue, mesh);
+            return;
+        }
+        let Some(buffer) = &self.vertices.buffer else {
+            return;
+        };
+        for range in ranges {
+            queue.write_buffer(
+                buffer,
+                (range.start * size_of::<GpuVertex>()) as u64,
+                bytemuck::cast_slice(&mesh.vertices[range]),
+            );
+        }
     }
 
     fn upload_topology(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: &MeshUpload) {
@@ -503,13 +622,20 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
         let Some(gpu) = callback_resources.get_mut::<ViewportGpu>() else {
             return Vec::new();
         };
-        let input = self
+        let mut input = self
             .shared
-            .read()
+            .write()
             .unwrap_or_else(|error| error.into_inner());
 
         if input.vertex_revision != gpu.vertex_revision {
-            gpu.upload_vertices(device, queue, &input.mesh);
+            let full_upload = input.full_vertex_upload || gpu.vertex_revision == u64::MAX;
+            let dirty_vertices = std::mem::take(&mut input.dirty_vertices);
+            input.full_vertex_upload = false;
+            if full_upload {
+                gpu.upload_vertices(device, queue, &input.mesh);
+            } else {
+                gpu.upload_changed_vertices(device, queue, &input.mesh, dirty_vertices);
+            }
             gpu.vertex_revision = input.vertex_revision;
         }
         if input.topology_revision != gpu.topology_revision {
@@ -589,6 +715,41 @@ mod tests {
         );
         let masks: Vec<_> = upload.vertices.iter().map(|vertex| vertex.mask).collect();
         assert_eq!(masks, [0.0, 0.4, 1.0]);
+    }
+
+    #[test]
+    fn partial_vertex_ranges_deduplicate_clip_and_coalesce_nearby_writes() {
+        let mut dirty = vec![99, 20, 2, 2, 18, 0];
+        let ranges = coalesced_vertex_ranges(&mut dirty, 32);
+
+        assert_eq!(dirty, [0, 2, 18, 20]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..21);
+
+        let mut separated = vec![1, 25];
+        assert_eq!(coalesced_vertex_ranges(&mut separated, 32), [1..2, 25..26]);
+    }
+
+    #[test]
+    fn camera_uniform_keeps_studio_lights_in_camera_space() {
+        let mut camera = Camera::default();
+        camera.yaw = 1.37;
+        camera.pitch = -0.42;
+
+        let uniform = CameraUniform::from_camera(&camera, 16.0 / 9.0);
+        let right = Vec3::from_array(uniform.camera_right[..3].try_into().unwrap());
+        let up = Vec3::from_array(uniform.camera_up[..3].try_into().unwrap());
+
+        assert!(right.abs_diff_eq(camera.right(), 1.0e-6));
+        assert!(up.abs_diff_eq(camera.up(), 1.0e-6));
+        assert!(right.dot(up).abs() < 1.0e-6);
+        assert_eq!(uniform.camera_right[3], 0.0);
+        assert_eq!(uniform.camera_up[3], 0.0);
+    }
+
+    #[test]
+    fn camera_uniform_layout_matches_wgsl_uniform_alignment() {
+        assert_eq!(size_of::<CameraUniform>(), 128);
     }
 
     #[test]

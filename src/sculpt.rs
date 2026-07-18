@@ -168,10 +168,29 @@ pub struct StrokeState {
     changed: bool,
 }
 
+/// Topology work collected during a stroke and safe to execute after the
+/// interactive pointer gesture has finished.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemeshRequest {
+    pub affected_vertices: Vec<u32>,
+    pub settings: RemeshSettings,
+}
+
+/// The editable result of a completed stroke.
+///
+/// Remeshing is deliberately returned as work instead of being applied here so
+/// callers can move a large mesh to a worker thread without cloning it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StrokeOutcome {
+    pub changed: bool,
+    pub remesh: Option<RemeshRequest>,
+}
+
 #[derive(Default, Debug)]
 pub struct SculptEngine {
     active: Option<StrokeState>,
     symmetry_center: Option<Vec3>,
+    updated_vertices: Vec<u32>,
 }
 
 impl SculptEngine {
@@ -184,6 +203,7 @@ impl SculptEngine {
     pub fn reset_for_mesh(&mut self, mesh: &Mesh) {
         self.active = None;
         self.symmetry_center = Some(mesh.center().unwrap_or(Vec3::ZERO));
+        self.updated_vertices.clear();
     }
 
     pub fn begin_stroke(&mut self, mesh: &Mesh) {
@@ -197,6 +217,16 @@ impl SculptEngine {
             remesh_target: None,
             changed: false,
         });
+        self.updated_vertices.clear();
+    }
+
+    /// Takes the deduplicated vertex IDs changed by the latest brush sample.
+    ///
+    /// This includes mask-only edits and is cleared before every sample, so an
+    /// empty result always means the latest sample made no editable change.
+    #[must_use]
+    pub fn take_updated_vertices(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.updated_vertices)
     }
 
     /// Applies one brush sample and returns whether it changed the mesh.
@@ -207,6 +237,7 @@ impl SculptEngine {
         settings: &BrushSettings,
         sample: BrushSample,
     ) -> bool {
+        self.updated_vertices.clear();
         let Some(stroke) = self.active.as_ref() else {
             return false;
         };
@@ -248,21 +279,29 @@ impl SculptEngine {
             changed |= apply_pass(mesh, tool, settings, pass, &source_positions, &mut affected);
         }
 
-        if changed && tool != SculptTool::Mask {
-            mesh.recompute_normals();
+        if changed {
             affected.sort_unstable();
             affected.dedup();
 
-            if settings.detail.is_finite()
-                && settings.detail > 0.0
-                && let Some(stroke) = self.active.as_mut()
-            {
-                let target_edge_length = settings.radius * settings.detail.clamp(0.01, 1.0);
-                stroke.affected_vertices.extend(affected);
-                stroke.remesh_target =
-                    Some(stroke.remesh_target.map_or(target_edge_length, |current| {
-                        current.min(target_edge_length)
-                    }));
+            if tool != SculptTool::Mask {
+                self.updated_vertices = mesh.update_deformed_vertices(&affected);
+                self.updated_vertices.extend(affected.iter().copied());
+                self.updated_vertices.sort_unstable();
+                self.updated_vertices.dedup();
+
+                if settings.detail.is_finite()
+                    && settings.detail > 0.0
+                    && let Some(stroke) = self.active.as_mut()
+                {
+                    let target_edge_length = settings.radius * settings.detail.clamp(0.01, 1.0);
+                    stroke.affected_vertices.extend(affected);
+                    stroke.remesh_target =
+                        Some(stroke.remesh_target.map_or(target_edge_length, |current| {
+                            current.min(target_edge_length)
+                        }));
+                }
+            } else {
+                self.updated_vertices.clone_from(&affected);
             }
         }
 
@@ -272,23 +311,31 @@ impl SculptEngine {
         changed
     }
 
-    /// Ends the active stroke and returns whether any sample changed the mesh.
-    pub fn end_stroke(&mut self, mesh: &mut Mesh) -> bool {
+    /// Ends the active stroke and returns any deferred topology work.
+    #[must_use]
+    pub fn end_stroke(&mut self) -> StrokeOutcome {
         let Some(mut stroke) = self.active.take() else {
-            return false;
+            return StrokeOutcome::default();
         };
         if !stroke.changed {
-            return false;
+            return StrokeOutcome::default();
         }
 
-        if let Some(target_edge_length) = stroke.remesh_target {
+        let remesh = stroke.remesh_target.map(|target_edge_length| {
             stroke.affected_vertices.sort_unstable();
             stroke.affected_vertices.dedup();
             let mut remesh = RemeshSettings::new(target_edge_length);
             remesh.iterations = 1;
-            let _ = mesh.remesh_region(&stroke.affected_vertices, remesh);
+            remesh.relaxation = 0.0;
+            RemeshRequest {
+                affected_vertices: stroke.affected_vertices,
+                settings: remesh,
+            }
+        });
+        StrokeOutcome {
+            changed: true,
+            remesh,
         }
-        true
     }
 }
 
@@ -350,6 +397,7 @@ fn apply_pass(
             let next = (*mask + direction * strength * weight).clamp(0.0, 1.0);
             if next != *mask {
                 *mask = next;
+                affected.push(vertex);
                 changed = true;
             }
             continue;
@@ -622,6 +670,40 @@ mod tests {
         brush_sample.invert_modifier = true;
         assert!(engine.apply_sample(&mut mesh, SculptTool::Mask, &settings, brush_sample,));
         assert_eq!(mesh.mask[4], 0.0);
-        assert!(engine.end_stroke(&mut mesh));
+        let outcome = engine.end_stroke();
+        assert!(outcome.changed);
+        assert!(outcome.remesh.is_none());
+    }
+
+    #[test]
+    fn end_stroke_returns_remeshing_without_applying_it() {
+        let mut mesh = grid();
+        let original_triangles = mesh.triangles.clone();
+        let mut settings = test_settings();
+        settings.radius = 0.8;
+        settings.detail = 0.2;
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &settings,
+            sample(Vec3::ZERO, 0),
+        ));
+        let updated = engine.take_updated_vertices();
+        let outcome = engine.end_stroke();
+
+        assert!(outcome.changed);
+        let remesh = outcome.remesh.expect("geometry stroke requests remeshing");
+        assert!(!updated.is_empty());
+        assert!(
+            remesh
+                .affected_vertices
+                .iter()
+                .all(|vertex| updated.contains(vertex))
+        );
+        assert!((remesh.settings.target_edge_length - 0.16).abs() < 1.0e-6);
+        assert_eq!(mesh.triangles, original_triangles);
     }
 }
