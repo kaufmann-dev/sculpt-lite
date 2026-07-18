@@ -235,6 +235,17 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_pan_makes_the_object_track_the_pointer() {
+        let mut camera = Camera::default();
+        let before = camera.target;
+        let right = camera.right();
+        camera.pan(Vec2::new(40.0, 0.0), 600.0);
+
+        assert!((camera.target - before).dot(right) < 0.0);
+        assert!((camera.target - before).dot(camera.up()).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn world_scale_matches_vertical_field_of_view() {
         let camera = Camera::default();
         let height = 600.0;

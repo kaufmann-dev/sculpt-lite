@@ -71,18 +71,18 @@ impl ViewportRenderer {
     /// Uploads the public geometry representation used by the mesh core. Invalid
     /// triangle indices are skipped instead of reaching wgpu validation.
     pub fn update_mesh(&self, mesh: &Mesh) {
-        self.update_mesh_data(&mesh.positions, &mesh.normals, &mesh.mask, &mesh.triangles);
+        self.install_prepared_mesh(Self::prepare_mesh(mesh));
     }
 
-    /// Lower-level upload entry point useful for previews and renderer tests.
-    pub fn update_mesh_data(
-        &self,
-        positions: &[Vec3],
-        normals: &[Vec3],
-        masks: &[f32],
-        triangles: &[[u32; 3]],
-    ) {
-        let upload = MeshUpload::new(positions, normals, masks, triangles);
+    /// Performs all CPU-side vertex and index packing. This is device-independent
+    /// and may run on the mesh worker before the result reaches the UI thread.
+    #[must_use]
+    pub(crate) fn prepare_mesh(mesh: &Mesh) -> MeshUpload {
+        MeshUpload::new(&mesh.positions, &mesh.normals, &mesh.mask, &mesh.triangles)
+    }
+
+    /// Installs an already packed mesh without scanning its vertices or faces.
+    pub(crate) fn install_prepared_mesh(&self, upload: MeshUpload) {
         let mut input = self
             .shared
             .write()
@@ -92,20 +92,6 @@ impl ViewportRenderer {
         input.dirty_vertices.clear();
         input.vertex_revision = input.vertex_revision.wrapping_add(1);
         input.topology_revision = input.topology_revision.wrapping_add(1);
-    }
-
-    /// Refreshes deformable per-vertex data without rebuilding or uploading
-    /// the unchanged triangle and wireframe index buffers.
-    pub fn update_vertices(&self, mesh: &Mesh) {
-        let vertices = MeshUpload::vertices(&mesh.positions, &mesh.normals, &mesh.mask);
-        let mut input = self
-            .shared
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        input.mesh.vertices = vertices;
-        input.full_vertex_upload = true;
-        input.dirty_vertices.clear();
-        input.vertex_revision = input.vertex_revision.wrapping_add(1);
     }
 
     /// Refreshes only vertices changed by a sculpt sample. The CPU mirror is
@@ -204,7 +190,7 @@ struct RenderInput {
 }
 
 #[derive(Default)]
-struct MeshUpload {
+pub(crate) struct MeshUpload {
     vertices: Vec<GpuVertex>,
     triangle_indices: Vec<u32>,
     edge_indices: Vec<u32>,
