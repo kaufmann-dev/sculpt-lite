@@ -17,7 +17,7 @@ cargo run
 Install or replace the user-local executable without `sudo`:
 
 ```sh
-cargo install --force --path . --root "$HOME/.local"
+cargo install --locked --force --path . --root "$HOME/.local"
 ```
 
 The executable is installed at `~/.local/bin/sculpt-lite`. Ensure that directory appears before `/usr/bin` in `PATH`, then confirm it is the active copy:

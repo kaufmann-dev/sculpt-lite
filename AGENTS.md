@@ -5,7 +5,7 @@
 After **every** repository change, rebuild and replace the user-local application before handing off work:
 
 ```sh
-cargo install --force --path . --root "$HOME/.local"
+cargo install --locked --force --path . --root "$HOME/.local"
 test -x "$HOME/.local/bin/sculpt-lite"
 ```
 
