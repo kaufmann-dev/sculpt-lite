@@ -15,7 +15,7 @@ pub struct Ray {
 
 /// Orbit camera centered on the active sculpting area.
 ///
-/// Positive Y is up. `yaw == 0` places the eye on the positive Z axis and the
+/// Positive Z is up. `yaw == 0` places the eye on the positive X axis and the
 /// camera always looks at `target`.
 #[derive(Clone, Debug)]
 pub struct Camera {
@@ -62,9 +62,9 @@ impl Camera {
     pub fn eye_position(&self) -> Vec3 {
         let cos_pitch = self.pitch.cos();
         let offset = Vec3::new(
+            self.yaw.cos() * cos_pitch,
             self.yaw.sin() * cos_pitch,
             self.pitch.sin(),
-            self.yaw.cos() * cos_pitch,
         );
         self.target + offset * self.distance
     }
@@ -76,7 +76,7 @@ impl Camera {
 
     #[must_use]
     pub fn right(&self) -> Vec3 {
-        self.forward().cross(Vec3::Y).normalize_or_zero()
+        self.forward().cross(Vec3::Z).normalize_or_zero()
     }
 
     #[must_use]
@@ -86,7 +86,7 @@ impl Camera {
 
     #[must_use]
     pub fn view_matrix(&self) -> Mat4 {
-        glam::camera::rh::view::look_at_mat4(self.eye_position(), self.target, Vec3::Y)
+        glam::camera::rh::view::look_at_mat4(self.eye_position(), self.target, Vec3::Z)
     }
 
     #[must_use]
@@ -243,6 +243,19 @@ mod tests {
         camera.orbit(Vec2::new(-40.0, 0.0));
 
         assert!((camera.yaw - (yaw + 40.0 * ORBIT_RADIANS_PER_POINT)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn horizontal_orbit_keeps_world_z_upright() {
+        let mut camera = Camera::default();
+        let pitch = camera.pitch;
+
+        assert!(camera.right().dot(Vec3::Z).abs() < 1.0e-6);
+        camera.orbit(Vec2::new(-80.0, 0.0));
+
+        assert!((camera.pitch - pitch).abs() < 1.0e-6);
+        assert!(camera.right().dot(Vec3::Z).abs() < 1.0e-6);
+        assert!(camera.up().dot(Vec3::Z) > 0.0);
     }
 
     #[test]
