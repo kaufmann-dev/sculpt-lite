@@ -108,7 +108,7 @@ impl Camera {
 
     /// Orbits by an egui pointer delta measured in logical points.
     pub fn orbit(&mut self, delta_points: Vec2) {
-        self.yaw = (self.yaw - delta_points.x * ORBIT_RADIANS_PER_POINT).rem_euclid(TAU);
+        self.yaw = (self.yaw + delta_points.x * ORBIT_RADIANS_PER_POINT).rem_euclid(TAU);
         self.pitch = (self.pitch + delta_points.y * ORBIT_RADIANS_PER_POINT)
             .clamp(-FRAC_PI_2 + MIN_PITCH_MARGIN, FRAC_PI_2 - MIN_PITCH_MARGIN);
     }
@@ -226,23 +226,23 @@ mod tests {
     }
 
     #[test]
-    fn orbit_drag_right_decreases_yaw() {
+    fn orbit_drag_right_increases_yaw() {
         let mut camera = Camera::default();
         let yaw = camera.yaw;
 
         camera.orbit(Vec2::new(40.0, 0.0));
 
-        assert!((camera.yaw - (yaw - 40.0 * ORBIT_RADIANS_PER_POINT)).abs() < 1.0e-6);
+        assert!((camera.yaw - (yaw + 40.0 * ORBIT_RADIANS_PER_POINT)).abs() < 1.0e-6);
     }
 
     #[test]
-    fn orbit_drag_left_increases_yaw() {
+    fn orbit_drag_left_decreases_yaw() {
         let mut camera = Camera::default();
         let yaw = camera.yaw;
 
         camera.orbit(Vec2::new(-40.0, 0.0));
 
-        assert!((camera.yaw - (yaw + 40.0 * ORBIT_RADIANS_PER_POINT)).abs() < 1.0e-6);
+        assert!((camera.yaw - (yaw - 40.0 * ORBIT_RADIANS_PER_POINT)).abs() < 1.0e-6);
     }
 
     #[test]
