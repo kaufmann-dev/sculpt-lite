@@ -40,13 +40,13 @@ struct MeshDocument {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavigationAction {
     Pan,
-    Turntable,
+    Orbit,
 }
 
 fn navigation_action(button: PointerButton) -> Option<NavigationAction> {
     match button {
         PointerButton::Secondary => Some(NavigationAction::Pan),
-        PointerButton::Middle => Some(NavigationAction::Turntable),
+        PointerButton::Middle => Some(NavigationAction::Orbit),
         _ => None,
     }
 }
@@ -1247,7 +1247,7 @@ impl SculptLiteApp {
                     let budget_mib = self.history.byte_budget() as f64 / (1024.0 * 1024.0);
                     ui.small(format!("Undo: {mib:.1} / {budget_mib:.0} MiB"));
                     ui.small("Shift: smooth · Ctrl: invert");
-                    ui.small("RMB: pan · MMB: turn · Wheel: zoom");
+                    ui.small("RMB: pan · MMB: orbit · Wheel: zoom");
                 });
             });
     }
@@ -1350,7 +1350,7 @@ impl SculptLiteApp {
                     Some(NavigationAction::Pan) => {
                         self.camera.pan(pointer_delta, rect.height());
                     }
-                    Some(NavigationAction::Turntable) => self.camera.turntable(pointer_delta.x),
+                    Some(NavigationAction::Orbit) => self.camera.orbit(pointer_delta),
                     None => {}
                 }
                 if response.hovered() {
@@ -1673,14 +1673,14 @@ mod tests {
     }
 
     #[test]
-    fn navigation_uses_right_drag_to_pan_and_middle_drag_to_turn() {
+    fn navigation_uses_right_drag_to_pan_and_middle_drag_to_orbit() {
         assert_eq!(
             navigation_action(PointerButton::Secondary),
             Some(NavigationAction::Pan)
         );
         assert_eq!(
             navigation_action(PointerButton::Middle),
-            Some(NavigationAction::Turntable)
+            Some(NavigationAction::Orbit)
         );
         assert_eq!(navigation_action(PointerButton::Primary), None);
     }
