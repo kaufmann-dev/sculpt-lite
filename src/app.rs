@@ -17,12 +17,10 @@ use glam::Vec3;
 
 use crate::{
     camera::Camera,
-    history::{
-        History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot, SnapshotRestore,
-    },
-    mesh::{Mesh, RayHit, RemeshStats},
+    history::{History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot},
+    mesh::{Mesh, MeshChangeSet, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
-    sculpt::{BrushSample, BrushSettings, RemeshRequest, SculptEngine, SculptTool, SymmetryAxis},
+    sculpt::{BrushSample, BrushSettings, SculptEngine, SculptTool, SymmetryAxis},
     stl::{ImportReport, load_stl, save_stl_atomic},
 };
 
@@ -60,19 +58,7 @@ enum PendingAction {
 
 enum WorkerJob {
     Import(PathBuf),
-    Remesh {
-        mesh: Box<Mesh>,
-        request: RemeshRequest,
-        edit: LocalEdit,
-    },
-    HistoryRestore {
-        mesh: Box<Mesh>,
-        restore: SnapshotRestore,
-    },
-    Export {
-        mesh: Box<Mesh>,
-        path: PathBuf,
-    },
+    Export { mesh: Box<Mesh>, path: PathBuf },
 }
 
 type ImportResult = Result<(Box<Mesh>, ImportReport, Option<Box<PreparedMeshUpload>>), String>;
@@ -81,20 +67,6 @@ enum WorkerResult {
     Import {
         path: PathBuf,
         result: ImportResult,
-    },
-    RemeshCheckpoint(Arc<MeshSnapshot>),
-    Remesh {
-        mesh: Box<Mesh>,
-        upload: Option<Box<PreparedMeshUpload>>,
-        history: HistoryEntry,
-        error: Option<String>,
-    },
-    HistoryCheckpoint(Arc<MeshSnapshot>),
-    HistoryRestore {
-        mesh: Box<Mesh>,
-        upload: Option<Box<PreparedMeshUpload>>,
-        inverse: Arc<MeshSnapshot>,
-        error: Option<String>,
     },
     ExportCheckpoint(Arc<MeshSnapshot>),
     Export {
@@ -134,70 +106,6 @@ impl BackgroundWorker {
                             .and_then(|result| result);
                             WorkerResult::Import { path, result }
                         }
-                        WorkerJob::Remesh {
-                            mesh,
-                            request,
-                            edit,
-                        } => {
-                            let mut mesh = *mesh;
-                            let recovery = Arc::new(MeshSnapshot::capture(&mesh));
-                            if result_sender
-                                .send(WorkerResult::RemeshCheckpoint(Arc::clone(&recovery)))
-                                .is_err()
-                            {
-                                break;
-                            }
-                            context.request_repaint();
-                            let undo = Arc::new(MeshSnapshot::capture_before_edit(&mesh, &edit));
-                            let remesh_result = catch_unwind(AssertUnwindSafe(|| {
-                                mesh.remesh_region(&request.affected_vertices, request.settings)
-                            }));
-                            let (stats, error) = match remesh_result {
-                                Ok(stats) => (stats, None),
-                                Err(payload) => (Default::default(), Some(panic_message(payload))),
-                            };
-                            if error.is_some() {
-                                recovery.restore(&mut mesh);
-                            }
-                            let history = remesh_history_entry(edit, undo, stats);
-                            let upload = mesh_preparer
-                                .as_ref()
-                                .map(|preparer| Box::new(preparer.prepare_mesh(&mesh)));
-                            WorkerResult::Remesh {
-                                mesh: Box::new(mesh),
-                                upload,
-                                history,
-                                error,
-                            }
-                        }
-                        WorkerJob::HistoryRestore { mesh, restore } => {
-                            let mut mesh = *mesh;
-                            let inverse = Arc::new(MeshSnapshot::capture(&mesh));
-                            if result_sender
-                                .send(WorkerResult::HistoryCheckpoint(Arc::clone(&inverse)))
-                                .is_err()
-                            {
-                                break;
-                            }
-                            context.request_repaint();
-                            let error = catch_unwind(AssertUnwindSafe(|| {
-                                restore.target().restore(&mut mesh);
-                            }))
-                            .err()
-                            .map(panic_message);
-                            if error.is_some() {
-                                inverse.restore(&mut mesh);
-                            }
-                            let upload = mesh_preparer
-                                .as_ref()
-                                .map(|preparer| Box::new(preparer.prepare_mesh(&mesh)));
-                            WorkerResult::HistoryRestore {
-                                mesh: Box::new(mesh),
-                                upload,
-                                inverse,
-                                error,
-                            }
-                        }
                         WorkerJob::Export { mesh, path } => {
                             let recovery = Arc::new(MeshSnapshot::capture(&mesh));
                             if result_sender
@@ -233,17 +141,6 @@ enum BackgroundTask {
         path: PathBuf,
         started: Instant,
     },
-    Remesh {
-        tool: SculptTool,
-        edit: LocalEdit,
-        started: Instant,
-        recovery: Option<Arc<MeshSnapshot>>,
-    },
-    HistoryRestore {
-        restore: SnapshotRestore,
-        started: Instant,
-        recovery: Option<Arc<MeshSnapshot>>,
-    },
     Export {
         path: PathBuf,
         started: Instant,
@@ -255,10 +152,7 @@ enum BackgroundTask {
 
 impl BackgroundTask {
     fn owns_mesh(&self) -> bool {
-        matches!(
-            self,
-            Self::Remesh { .. } | Self::HistoryRestore { .. } | Self::Export { .. }
-        )
+        matches!(self, Self::Export { .. })
     }
 
     fn progress_text(&self) -> String {
@@ -270,13 +164,6 @@ impl BackgroundTask {
                     .unwrap_or("STL mesh");
                 (format!("Importing {name}"), started)
             }
-            Self::Remesh { started, .. } => ("Optimizing sculpt topology".to_owned(), started),
-            Self::HistoryRestore {
-                restore, started, ..
-            } => (
-                format!("{}ing topology", restore.direction().label()),
-                started,
-            ),
             Self::Export { path, started, .. } => {
                 let name = path
                     .file_name()
@@ -454,103 +341,6 @@ impl SculptLiteApp {
         self.stroke_last_pointer = None;
     }
 
-    fn start_remesh(&mut self, request: RemeshRequest, edit: LocalEdit, context: &egui::Context) {
-        let Some(mesh) = self
-            .document
-            .as_mut()
-            .and_then(|document| document.mesh.take())
-        else {
-            self.error =
-                Some("Could not optimize the stroke because its mesh is missing".to_owned());
-            return;
-        };
-        let Some(worker) = &self.worker else {
-            if let Some(document) = self.document.as_mut() {
-                document.mesh = Some(mesh);
-            }
-            self.history.record(HistoryEntry::Local(edit));
-            self.error = Some(
-                self.worker_error
-                    .clone()
-                    .unwrap_or_else(|| "The mesh worker is unavailable".to_owned()),
-            );
-            return;
-        };
-
-        match worker.sender.send(WorkerJob::Remesh {
-            mesh: Box::new(mesh),
-            request,
-            edit: edit.clone(),
-        }) {
-            Ok(()) => {
-                self.background_task = Some(BackgroundTask::Remesh {
-                    tool: self.tool,
-                    edit,
-                    started: Instant::now(),
-                    recovery: None,
-                });
-                self.status = "Optimizing sculpt topology".to_owned();
-                context.request_repaint();
-            }
-            Err(error) => {
-                let WorkerJob::Remesh { mesh, .. } = error.0 else {
-                    unreachable!("the submitted worker job remains a remesh")
-                };
-                if let Some(document) = self.document.as_mut() {
-                    document.mesh = Some(*mesh);
-                }
-                self.history.record(HistoryEntry::Local(edit));
-                self.worker_error = Some("The mesh worker stopped unexpectedly".to_owned());
-                self.error = Some(
-                    "Could not optimize the stroke because the mesh worker stopped unexpectedly"
-                        .to_owned(),
-                );
-            }
-        }
-    }
-
-    fn start_history_restore(&mut self, restore: SnapshotRestore, context: &egui::Context) {
-        let Some(mesh) = self
-            .document
-            .as_mut()
-            .and_then(|document| document.mesh.take())
-        else {
-            self.history.cancel_restore(restore);
-            return;
-        };
-        let Some(worker) = &self.worker else {
-            if let Some(document) = self.document.as_mut() {
-                document.mesh = Some(mesh);
-            }
-            self.history.cancel_restore(restore);
-            self.error = Some("The mesh worker is unavailable".to_owned());
-            return;
-        };
-        match worker.sender.send(WorkerJob::HistoryRestore {
-            mesh: Box::new(mesh),
-            restore: restore.clone(),
-        }) {
-            Ok(()) => {
-                self.background_task = Some(BackgroundTask::HistoryRestore {
-                    restore,
-                    started: Instant::now(),
-                    recovery: None,
-                });
-                context.request_repaint();
-            }
-            Err(error) => {
-                let WorkerJob::HistoryRestore { mesh, .. } = error.0 else {
-                    unreachable!("the submitted worker job remains a history restore")
-                };
-                if let Some(document) = self.document.as_mut() {
-                    document.mesh = Some(*mesh);
-                }
-                self.history.cancel_restore(restore);
-                self.worker_error = Some("The mesh worker stopped unexpectedly".to_owned());
-            }
-        }
-    }
-
     fn poll_background_task(&mut self, context: &egui::Context) {
         if self.background_task.is_none() {
             return;
@@ -592,96 +382,6 @@ impl SculptLiteApp {
             ) => {
                 self.status = "Import failed; the current mesh was left unchanged".to_owned();
                 self.error = Some(format!("Could not import {}\n\n{error}", path.display()));
-            }
-            (
-                BackgroundTask::Remesh {
-                    tool,
-                    edit,
-                    started,
-                    ..
-                },
-                WorkerResult::RemeshCheckpoint(recovery),
-            ) => {
-                self.background_task = Some(BackgroundTask::Remesh {
-                    tool,
-                    edit,
-                    started,
-                    recovery: Some(recovery),
-                });
-            }
-            (
-                BackgroundTask::Remesh { tool, started, .. },
-                WorkerResult::Remesh {
-                    mesh,
-                    upload,
-                    history,
-                    error,
-                },
-            ) => {
-                if let Some(document) = self.document.as_mut() {
-                    document.mesh = Some(*mesh);
-                    document.dirty = true;
-                }
-                if let (Some(renderer), Some(upload)) = (&self.renderer, upload) {
-                    renderer.install_prepared_mesh(*upload);
-                }
-                let history_saved = self.history.record(history);
-                let undo_note = if history_saved {
-                    ""
-                } else {
-                    " (undo memory limit reached)"
-                };
-                self.status = format!(
-                    "{} stroke optimized in {:.1}s{undo_note}",
-                    tool.label(),
-                    started.elapsed().as_secs_f32()
-                );
-                if let Some(error) = error {
-                    self.error = Some(format!(
-                        "The sculpt was kept, but topology optimization failed.\n\n{error}"
-                    ));
-                }
-            }
-            (
-                BackgroundTask::HistoryRestore {
-                    restore, started, ..
-                },
-                WorkerResult::HistoryCheckpoint(recovery),
-            ) => {
-                self.background_task = Some(BackgroundTask::HistoryRestore {
-                    restore,
-                    started,
-                    recovery: Some(recovery),
-                });
-            }
-            (
-                BackgroundTask::HistoryRestore { restore, .. },
-                WorkerResult::HistoryRestore {
-                    mesh,
-                    upload,
-                    inverse,
-                    error,
-                },
-            ) => {
-                if let Some(document) = self.document.as_mut() {
-                    document.mesh = Some(*mesh);
-                    document.dirty = true;
-                }
-                if let (Some(renderer), Some(upload)) = (&self.renderer, upload) {
-                    renderer.install_prepared_mesh(*upload);
-                }
-                if let Some(error) = error {
-                    self.history.cancel_restore(restore);
-                    self.error = Some(format!("Could not restore mesh history\n\n{error}"));
-                } else {
-                    let label = restore.direction().label();
-                    let inverse_saved = self.history.complete_restore(&restore, inverse);
-                    self.status = if inverse_saved {
-                        label.to_owned()
-                    } else {
-                        format!("{label} (inverse exceeds undo memory limit)")
-                    };
-                }
             }
             (
                 BackgroundTask::Export {
@@ -735,24 +435,6 @@ impl SculptLiteApp {
         match task {
             BackgroundTask::Import { .. } => {
                 "The mesh worker stopped before finishing the import".to_owned()
-            }
-            BackgroundTask::Remesh { edit, recovery, .. } => {
-                if let Some(recovery) = recovery {
-                    self.restore_recovery(&recovery, true);
-                    self.history.record(HistoryEntry::Local(edit));
-                    "The sculpt was restored without topology optimization".to_owned()
-                } else {
-                    "The mesh worker stopped before it could preserve the sculpted mesh".to_owned()
-                }
-            }
-            BackgroundTask::HistoryRestore {
-                restore, recovery, ..
-            } => {
-                if let Some(recovery) = recovery {
-                    self.restore_recovery(&recovery, true);
-                }
-                self.history.cancel_restore(restore);
-                "The mesh history operation was cancelled and its entry was restored".to_owned()
             }
             BackgroundTask::Export {
                 recovery,
@@ -887,6 +569,17 @@ impl SculptLiteApp {
         }
     }
 
+    fn upload_mesh_partial(&self, changes: &MeshChangeSet) {
+        if let (Some(renderer), Some(mesh)) = (
+            &self.renderer,
+            self.document
+                .as_ref()
+                .and_then(|document| document.mesh.as_ref()),
+        ) {
+            renderer.update_mesh_partial(mesh, changes);
+        }
+    }
+
     fn frame_mesh(&mut self) {
         if let Some((minimum, maximum)) = self
             .document
@@ -898,7 +591,7 @@ impl SculptLiteApp {
         }
     }
 
-    fn undo(&mut self, context: &egui::Context) {
+    fn undo(&mut self, _context: &egui::Context) {
         if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
@@ -916,11 +609,17 @@ impl SculptLiteApp {
                 self.upload_vertices_partial(&changed_vertices);
                 self.status = "Undo".to_owned();
             }
-            HistoryAction::Restore(restore) => self.start_history_restore(restore, context),
+            HistoryAction::Topology { changes } => {
+                if let Some(document) = self.document.as_mut() {
+                    document.dirty = true;
+                }
+                self.upload_mesh_partial(&changes);
+                self.status = "Undo".to_owned();
+            }
         }
     }
 
-    fn redo(&mut self, context: &egui::Context) {
+    fn redo(&mut self, _context: &egui::Context) {
         if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
@@ -938,7 +637,13 @@ impl SculptLiteApp {
                 self.upload_vertices_partial(&changed_vertices);
                 self.status = "Redo".to_owned();
             }
-            HistoryAction::Restore(restore) => self.start_history_restore(restore, context),
+            HistoryAction::Topology { changes } => {
+                if let Some(document) = self.document.as_mut() {
+                    document.dirty = true;
+                }
+                self.upload_mesh_partial(&changes);
+                self.status = "Redo".to_owned();
+            }
         }
     }
 
@@ -1109,11 +814,6 @@ impl SculptLiteApp {
                         .document
                         .as_ref()
                         .is_some_and(|document| document.mesh.is_some());
-                let face_count = self
-                    .document
-                    .as_ref()
-                    .and_then(|document| document.mesh.as_ref())
-                    .map_or(0, |mesh| mesh.triangles.len());
                 ui.add_enabled_ui(mesh_ready, |ui| {
                     egui::Grid::new("tool_grid")
                         .num_columns(2)
@@ -1144,8 +844,7 @@ impl SculptLiteApp {
                     ui.add_enabled_ui(self.tool != SculptTool::Mask, |ui| {
                         ui.checkbox(&mut self.adaptive_topology, "Adaptive topology");
                         if self.adaptive_topology {
-                            let warning = adaptive_topology_warning(face_count);
-                            ui.colored_label(Color32::from_rgb(238, 178, 72), warning);
+                            ui.small("Updates topology continuously inside the brush region.");
                             ui.label("Detail");
                             ui.add(
                                 egui::Slider::new(&mut self.brush.detail, 0.03..=0.35)
@@ -1401,21 +1100,22 @@ impl SculptLiteApp {
                         .and_then(|document| document.mesh.as_ref())
                         .map(|mesh| self.sculpt.end_stroke(mesh))
                         .unwrap_or_default();
-                    if !outcome.edit.is_empty() {
+                    let history_entry = outcome
+                        .topology
+                        .map(|edit| HistoryEntry::Topology(Arc::new(edit)))
+                        .or_else(|| {
+                            (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit))
+                        });
+                    if let Some(history_entry) = history_entry {
                         if let Some(document) = self.document.as_mut() {
                             document.dirty = true;
                         }
-                        if let Some(request) = outcome.remesh {
-                            self.start_remesh(request, outcome.edit, context);
+                        let history_saved = self.history.record(history_entry);
+                        self.status = if history_saved {
+                            format!("{} stroke", self.tool.label())
                         } else {
-                            let history_saved =
-                                self.history.record(HistoryEntry::Local(outcome.edit));
-                            self.status = if history_saved {
-                                format!("{} stroke", self.tool.label())
-                            } else {
-                                format!("{} stroke (undo memory limit reached)", self.tool.label())
-                            };
-                        }
+                            format!("{} stroke (undo memory limit reached)", self.tool.label())
+                        };
                     }
                     self.stroke_last_pointer = None;
                 }
@@ -1491,11 +1191,19 @@ impl SculptLiteApp {
             })
         });
         let updated_vertices = self.sculpt.take_updated_vertices();
+        let mesh_changes = self.sculpt.take_mesh_changes();
+        if let Some(error) = self.sculpt.take_error() {
+            self.error = Some(error);
+        }
         if changed {
             if let Some(document) = self.document.as_mut() {
                 document.dirty = true;
             }
-            self.upload_vertices_partial(&updated_vertices);
+            if let Some(changes) = mesh_changes {
+                self.upload_mesh_partial(&changes);
+            } else {
+                self.upload_vertices_partial(&updated_vertices);
+            }
             context.request_repaint();
         }
     }
@@ -1629,29 +1337,6 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-fn adaptive_topology_warning(face_count: usize) -> String {
-    if face_count > 250_000 {
-        format!(
-            "Warning: this mesh has {} faces. Topology updates may take several seconds after each stroke.",
-            grouped(face_count)
-        )
-    } else {
-        "Warning: adaptive topology rebuilds the mesh after each stroke.".to_owned()
-    }
-}
-
-fn remesh_history_entry(
-    edit: LocalEdit,
-    undo: Arc<MeshSnapshot>,
-    stats: RemeshStats,
-) -> HistoryEntry {
-    if stats.splits != 0 || stats.collapses != 0 || stats.flips != 0 {
-        HistoryEntry::Topology(undo)
-    } else {
-        HistoryEntry::Local(edit)
-    }
-}
-
 fn grouped(value: usize) -> String {
     let digits = value.to_string();
     let mut output = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1677,14 +1362,6 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_topology_warning_never_disables_dense_meshes() {
-        assert!(adaptive_topology_warning(20_000).contains("rebuilds the mesh"));
-        let warning = adaptive_topology_warning(1_590_000);
-        assert!(warning.contains("1,590,000 faces"));
-        assert!(!warning.contains("Unavailable"));
-    }
-
-    #[test]
     fn navigation_uses_right_drag_to_pan_and_middle_drag_to_orbit() {
         assert_eq!(
             navigation_action(PointerButton::Secondary),
@@ -1695,30 +1372,5 @@ mod tests {
             Some(NavigationAction::Orbit)
         );
         assert_eq!(navigation_action(PointerButton::Primary), None);
-    }
-
-    #[test]
-    fn remesh_history_uses_snapshots_only_when_topology_changed() {
-        let mesh = Mesh::new(vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![[0, 1, 2]]).unwrap();
-        let snapshot = Arc::new(MeshSnapshot::capture(&mesh));
-        assert!(matches!(
-            remesh_history_entry(
-                LocalEdit::default(),
-                Arc::clone(&snapshot),
-                RemeshStats::default()
-            ),
-            HistoryEntry::Local(_)
-        ));
-        assert!(matches!(
-            remesh_history_entry(
-                LocalEdit::default(),
-                snapshot,
-                RemeshStats {
-                    splits: 1,
-                    ..RemeshStats::default()
-                }
-            ),
-            HistoryEntry::Topology(_)
-        ));
     }
 }

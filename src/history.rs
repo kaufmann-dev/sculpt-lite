@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use glam::Vec3;
 
-use crate::mesh::Mesh;
+use crate::mesh::{Mesh, MeshChangeSet, MeshEditDelta};
 
 /// Default memory budget shared by undo and redo entries (512 MiB).
 pub const DEFAULT_HISTORY_BUDGET: usize = 512 * 1024 * 1024;
@@ -117,39 +117,6 @@ impl MeshSnapshot {
         }
     }
 
-    /// Captures the mesh topology while reverting a pending local edit. This
-    /// creates the pre-stroke undo target after deformation has already happened.
-    #[must_use]
-    pub fn capture_before_edit(mesh: &Mesh, edit: &LocalEdit) -> Self {
-        let mut snapshot = Self::capture(mesh);
-        for change in &edit.positions {
-            if let Some(position) = snapshot.positions.get_mut(change.vertex as usize) {
-                *position = change.before;
-            }
-        }
-        for change in &edit.masks {
-            if let Some(mask) = snapshot.mask.get_mut(change.vertex as usize) {
-                *mask = change.before;
-            }
-        }
-        snapshot
-    }
-
-    #[must_use]
-    pub fn byte_len(&self) -> usize {
-        self.positions.len() * size_of::<Vec3>()
-            + self.triangles.len() * size_of::<[u32; 3]>()
-            + self.mask.len() * size_of::<f32>()
-    }
-
-    #[cfg(test)]
-    #[must_use]
-    pub fn matches(&self, mesh: &Mesh) -> bool {
-        self.positions.as_ref() == mesh.positions.as_slice()
-            && self.triangles.as_ref() == mesh.triangles.as_slice()
-            && self.mask.as_ref() == mesh.mask.as_slice()
-    }
-
     pub fn restore(&self, mesh: &mut Mesh) {
         mesh.positions.clear();
         mesh.positions.extend_from_slice(&self.positions);
@@ -164,7 +131,7 @@ impl MeshSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HistoryEntry {
     Local(LocalEdit),
-    Topology(Arc<MeshSnapshot>),
+    Topology(Arc<MeshEditDelta>),
 }
 
 impl HistoryEntry {
@@ -172,7 +139,7 @@ impl HistoryEntry {
     pub fn byte_len(&self) -> usize {
         match self {
             Self::Local(edit) => edit.byte_len(),
-            Self::Topology(snapshot) => snapshot.byte_len(),
+            Self::Topology(edit) => edit.byte_len(),
         }
     }
 }
@@ -183,39 +150,11 @@ pub enum HistoryDirection {
     Redo,
 }
 
-impl HistoryDirection {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Undo => "Undo",
-            Self::Redo => "Redo",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct SnapshotRestore {
-    direction: HistoryDirection,
-    target: Arc<MeshSnapshot>,
-}
-
-impl SnapshotRestore {
-    #[must_use]
-    pub fn direction(&self) -> HistoryDirection {
-        self.direction
-    }
-
-    #[must_use]
-    pub fn target(&self) -> &Arc<MeshSnapshot> {
-        &self.target
-    }
-}
-
 #[derive(Debug)]
 pub enum HistoryAction {
     Empty,
     Local { changed_vertices: Vec<u32> },
-    Restore(SnapshotRestore),
+    Topology { changes: MeshChangeSet },
 }
 
 #[derive(Debug)]
@@ -297,37 +236,18 @@ impl History {
                 self.push_opposite(direction, StoredEntry::new(HistoryEntry::Local(edit)));
                 HistoryAction::Local { changed_vertices }
             }
-            HistoryEntry::Topology(target) => {
-                HistoryAction::Restore(SnapshotRestore { direction, target })
+            HistoryEntry::Topology(edit) => {
+                let changes = match direction {
+                    HistoryDirection::Undo => edit.apply_before(mesh),
+                    HistoryDirection::Redo => edit.apply_after(mesh),
+                };
+                self.push_opposite(
+                    direction,
+                    StoredEntry::new(HistoryEntry::Topology(Arc::clone(&edit))),
+                );
+                HistoryAction::Topology { changes }
             }
         }
-    }
-
-    /// Completes a worker-backed topology restore by saving the state that was
-    /// active immediately before the restore as the inverse history target.
-    pub fn complete_restore(
-        &mut self,
-        restore: &SnapshotRestore,
-        inverse: Arc<MeshSnapshot>,
-    ) -> bool {
-        let stored = StoredEntry::new(HistoryEntry::Topology(inverse));
-        if stored.bytes > self.byte_budget {
-            return false;
-        }
-        self.push_opposite(restore.direction, stored);
-        self.trim_to_budget();
-        true
-    }
-
-    /// Reinstates a topology entry when its background restore did not commit.
-    pub fn cancel_restore(&mut self, restore: SnapshotRestore) {
-        let stored = StoredEntry::new(HistoryEntry::Topology(restore.target));
-        self.bytes_used += stored.bytes;
-        match restore.direction {
-            HistoryDirection::Undo => self.undo.push_back(stored),
-            HistoryDirection::Redo => self.redo.push(stored),
-        }
-        self.trim_to_budget();
     }
 
     pub fn clear(&mut self) {
@@ -456,28 +376,28 @@ mod tests {
     }
 
     #[test]
-    fn topology_restore_transaction_can_complete_or_cancel() {
-        let mesh = triangle();
-        let target = Arc::new(MeshSnapshot::capture(&mesh));
+    fn topology_delta_undo_and_redo_are_exact() {
+        let mut mesh = triangle();
+        let before = mesh.positions[1];
+        let after = Vec3::new(3.0, 0.0, 0.0);
+        let mut recorder = crate::mesh::MeshEditRecorder::new(&mesh);
+        recorder.record_vertex(&mesh, 1);
+        mesh.positions[1] = after;
+        mesh.update_deformed_vertices(&[1]);
+        let edit = Arc::new(recorder.finish(&mesh));
         let mut history = History::default();
-        assert!(history.record(HistoryEntry::Topology(Arc::clone(&target))));
+        assert!(history.record(HistoryEntry::Topology(edit)));
 
-        let mut edited = mesh.clone();
-        edited.positions[1].x = 3.0;
-        edited.rebuild();
-        let inverse = Arc::new(MeshSnapshot::capture(&edited));
-        let HistoryAction::Restore(restore) = history.undo(&mut edited) else {
-            panic!("topology restore expected");
+        let HistoryAction::Topology { .. } = history.undo(&mut mesh) else {
+            panic!("topology delta expected");
         };
-        assert!(!history.can_undo());
-        history.cancel_restore(restore);
-        assert!(history.can_undo());
-
-        let HistoryAction::Restore(restore) = history.undo(&mut edited) else {
-            panic!("topology restore expected");
-        };
-        assert!(history.complete_restore(&restore, inverse));
+        assert_eq!(mesh.positions[1], before);
         assert!(history.can_redo());
+
+        let HistoryAction::Topology { .. } = history.redo(&mut mesh) else {
+            panic!("topology delta expected");
+        };
+        assert_eq!(mesh.positions[1], after);
     }
 
     #[test]
@@ -490,21 +410,6 @@ mod tests {
             history.record(HistoryEntry::Local(edit.clone()));
             assert!(history.bytes_used() <= history.byte_budget());
         }
-    }
-
-    #[test]
-    fn snapshot_capture_can_revert_a_local_edit() {
-        let mut mesh = triangle();
-        let before = mesh.positions[1];
-        let after = Vec3::new(2.0, 0.0, 0.0);
-        mesh.positions[1] = after;
-        let edit = position_edit(before, after);
-
-        let snapshot = MeshSnapshot::capture_before_edit(&mesh, &edit);
-        let mut restored = Mesh::default();
-        snapshot.restore(&mut restored);
-        assert_eq!(restored.positions[1], before);
-        assert!(snapshot.matches(&restored));
     }
 
     #[test]
