@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use glam::Vec3;
 use thiserror::Error;
 
-use crate::mesh::{CleanupReport, Mesh, MeshError};
+use crate::mesh::{CleanupReport, Mesh, MeshError, TriangleSoupBuilder};
 
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -112,15 +112,15 @@ pub fn load_stl(path: &Path) -> Result<(Mesh, ImportReport), StlError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut triangle_soup = Vec::new();
+    let mut mesh_builder = TriangleSoupBuilder::new();
     for triangle in stl_reader {
         let triangle = triangle.map_err(|source| StlError::Read {
             path: path.to_path_buf(),
             source,
         })?;
-        triangle_soup.push(triangle.vertices.map(|vertex| Vec3::from_array(vertex.0)));
+        mesh_builder.push_triangle(triangle.vertices.map(|vertex| Vec3::from_array(vertex.0)))?;
     }
-    let (mesh, cleanup) = Mesh::from_triangle_soup(&triangle_soup)?;
+    let (mesh, cleanup) = mesh_builder.finish();
     Ok((mesh, cleanup.into()))
 }
 

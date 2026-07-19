@@ -1,6 +1,8 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use glam::Vec3;
+use hashbrown::{HashMap, HashSet};
+use smallvec::SmallVec;
 use thiserror::Error;
 
 pub type EdgeKey = (u32, u32);
@@ -123,9 +125,9 @@ impl BvhNode {
 
 #[derive(Clone, Debug, Default)]
 pub struct MeshTopology {
-    pub vertex_neighbors: Vec<Vec<u32>>,
-    pub vertex_triangles: Vec<Vec<u32>>,
-    pub edge_faces: HashMap<EdgeKey, Vec<u32>>,
+    pub vertex_neighbors: Vec<SmallVec<[u32; 8]>>,
+    pub vertex_triangles: Vec<SmallVec<[u32; 8]>>,
+    pub edge_faces: HashMap<EdgeKey, SmallVec<[u32; 2]>>,
     pub boundary_vertices: Vec<bool>,
     pub non_manifold_vertices: Vec<bool>,
     pub bvh: MeshBvh,
@@ -218,8 +220,8 @@ impl MeshTopology {
 
     fn build(positions: &[Vec3], triangles: &[[u32; 3]]) -> Self {
         let mut topology = Self {
-            vertex_neighbors: vec![Vec::new(); positions.len()],
-            vertex_triangles: vec![Vec::new(); positions.len()],
+            vertex_neighbors: vec![SmallVec::new(); positions.len()],
+            vertex_triangles: vec![SmallVec::new(); positions.len()],
             edge_faces: HashMap::with_capacity(triangles.len().saturating_mul(3) / 2),
             boundary_vertices: vec![false; positions.len()],
             non_manifold_vertices: vec![false; positions.len()],
@@ -332,6 +334,81 @@ pub struct Mesh {
     pub topology: MeshTopology,
 }
 
+#[derive(Default)]
+pub(crate) struct TriangleSoupBuilder {
+    positions: Vec<Vec3>,
+    triangles: Vec<[u32; 3]>,
+    vertices: HashMap<[u32; 3], u32>,
+    input_vertices: usize,
+    input_triangles: usize,
+}
+
+impl TriangleSoupBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    #[cfg(test)]
+    fn with_triangle_capacity(triangle_count: usize) -> Self {
+        Self {
+            positions: Vec::with_capacity(triangle_count.saturating_mul(3)),
+            triangles: Vec::with_capacity(triangle_count),
+            vertices: HashMap::new(),
+            input_vertices: 0,
+            input_triangles: 0,
+        }
+    }
+
+    pub(crate) fn push_triangle(&mut self, triangle: [Vec3; 3]) -> Result<(), MeshError> {
+        if self.input_vertices > u32::MAX as usize - 3 {
+            return Err(MeshError::TooManyVertices);
+        }
+
+        let mut indices = [0_u32; 3];
+        for (corner, position) in triangle.into_iter().enumerate() {
+            if !position.is_finite() {
+                return Err(MeshError::NonFiniteVertex {
+                    index: self.input_vertices + corner,
+                });
+            }
+            let bits = [
+                position.x.to_bits(),
+                position.y.to_bits(),
+                position.z.to_bits(),
+            ];
+            indices[corner] = if let Some(&index) = self.vertices.get(&bits) {
+                index
+            } else {
+                let index =
+                    u32::try_from(self.positions.len()).map_err(|_| MeshError::TooManyVertices)?;
+                self.vertices.insert(bits, index);
+                self.positions.push(position);
+                index
+            };
+        }
+        self.triangles.push(indices);
+        self.input_triangles += 1;
+        self.input_vertices += 3;
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> (Mesh, CleanupReport) {
+        let unique_vertices = self.positions.len();
+        let mut mesh = Mesh {
+            positions: self.positions,
+            triangles: self.triangles,
+            normals: vec![Vec3::ZERO; unique_vertices],
+            mask: vec![0.0; unique_vertices],
+            topology: MeshTopology::default(),
+        };
+        let mut report = mesh.rebuild();
+        report.input_vertices = self.input_vertices;
+        report.input_triangles = self.input_triangles;
+        report.welded_vertices = report.input_vertices.saturating_sub(unique_vertices);
+        (mesh, report)
+    }
+}
+
 impl Mesh {
     #[cfg(test)]
     pub fn new(positions: Vec<Vec3>, triangles: Vec<[u32; 3]>) -> Result<Self, MeshError> {
@@ -348,53 +425,16 @@ impl Mesh {
         Ok(mesh)
     }
 
+    #[cfg(test)]
     pub fn from_triangle_soup(soup: &[[Vec3; 3]]) -> Result<(Self, CleanupReport), MeshError> {
         if soup.len().saturating_mul(3) > u32::MAX as usize {
             return Err(MeshError::TooManyVertices);
         }
-        let mut positions = Vec::with_capacity(soup.len().saturating_mul(3));
-        let mut triangles = Vec::with_capacity(soup.len());
-        let mut vertices = HashMap::<[u32; 3], u32>::new();
-
-        for triangle in soup {
-            let mut indices = [0_u32; 3];
-            for (corner, &position) in triangle.iter().enumerate() {
-                if !position.is_finite() {
-                    return Err(MeshError::NonFiniteVertex {
-                        index: positions.len(),
-                    });
-                }
-                let bits = [
-                    position.x.to_bits(),
-                    position.y.to_bits(),
-                    position.z.to_bits(),
-                ];
-                indices[corner] = if let Some(&index) = vertices.get(&bits) {
-                    index
-                } else {
-                    let index =
-                        u32::try_from(positions.len()).map_err(|_| MeshError::TooManyVertices)?;
-                    vertices.insert(bits, index);
-                    positions.push(position);
-                    index
-                };
-            }
-            triangles.push(indices);
+        let mut builder = TriangleSoupBuilder::with_triangle_capacity(soup.len());
+        for &triangle in soup {
+            builder.push_triangle(triangle)?;
         }
-
-        let unique_vertices = positions.len();
-        let mut mesh = Self {
-            positions,
-            triangles,
-            normals: vec![Vec3::ZERO; unique_vertices],
-            mask: vec![0.0; unique_vertices],
-            topology: MeshTopology::default(),
-        };
-        let mut report = mesh.rebuild();
-        report.input_vertices = soup.len().saturating_mul(3);
-        report.input_triangles = soup.len();
-        report.welded_vertices = report.input_vertices.saturating_sub(unique_vertices);
-        Ok((mesh, report))
+        Ok(builder.finish())
     }
 
     pub fn validate(&self) -> Result<(), MeshError> {
@@ -448,7 +488,6 @@ impl Mesh {
             true
         });
 
-        report.flipped_faces = orient_manifold_faces(&mut self.triangles);
         self.mask.resize(self.positions.len(), 0.0);
         for weight in &mut self.mask {
             *weight = if weight.is_finite() {
@@ -457,8 +496,10 @@ impl Mesh {
                 0.0
             };
         }
-        self.recompute_normals();
         self.topology = MeshTopology::build(&self.positions, &self.triangles);
+        report.flipped_faces =
+            orient_manifold_faces(&mut self.triangles, &self.topology.edge_faces);
+        self.recompute_normals();
 
         report.output_vertices = self.positions.len();
         report.output_triangles = self.triangles.len();
@@ -913,7 +954,11 @@ impl Mesh {
         let merged_position =
             self.positions[keep as usize].midpoint(self.positions[remove as usize]);
         let mut incident = self.topology.vertex_triangles[keep as usize].clone();
-        incident.extend(&self.topology.vertex_triangles[remove as usize]);
+        incident.extend(
+            self.topology.vertex_triangles[remove as usize]
+                .iter()
+                .copied(),
+        );
         incident.sort_unstable();
         incident.dedup();
         for face in incident {
@@ -1075,9 +1120,14 @@ impl MeshBvh {
             dirty_marks: Vec::with_capacity(estimated_nodes),
             dirty_generation: 0,
         };
+        let centroids = triangles
+            .iter()
+            .map(|&triangle| triangle_centroid(positions, triangle))
+            .collect::<Vec<_>>();
         bvh.build_node(
             positions,
             triangles,
+            &centroids,
             0,
             bvh.triangle_indices.len(),
             u32::MAX,
@@ -1089,6 +1139,7 @@ impl MeshBvh {
         &mut self,
         positions: &[Vec3],
         triangles: &[[u32; 3]],
+        centroids: &[Vec3],
         start: usize,
         end: usize,
         parent: u32,
@@ -1097,10 +1148,12 @@ impl MeshBvh {
         self.nodes.push(BvhNode::default());
         self.parents.push(parent);
         self.dirty_marks.push(0);
-        let (min, max, centroid_min, centroid_max) =
-            triangle_range_bounds(positions, triangles, &self.triangle_indices[start..end]);
+        let (centroid_min, centroid_max) =
+            centroid_range_bounds(centroids, &self.triangle_indices[start..end]);
         let count = end - start;
         if count <= BVH_LEAF_SIZE {
+            let (min, max, _, _) =
+                triangle_range_bounds(positions, triangles, &self.triangle_indices[start..end]);
             self.nodes[node_index as usize] = BvhNode {
                 min,
                 max,
@@ -1126,15 +1179,16 @@ impl MeshBvh {
         self.triangle_indices[start..end].select_nth_unstable_by(
             middle - start,
             |&left, &right| {
-                triangle_centroid(positions, triangles[left as usize])[axis]
-                    .total_cmp(&triangle_centroid(positions, triangles[right as usize])[axis])
+                centroids[left as usize][axis].total_cmp(&centroids[right as usize][axis])
             },
         );
-        let left = self.build_node(positions, triangles, start, middle, node_index);
-        let right = self.build_node(positions, triangles, middle, end, node_index);
+        let left = self.build_node(positions, triangles, centroids, start, middle, node_index);
+        let right = self.build_node(positions, triangles, centroids, middle, end, node_index);
+        let left_node = self.nodes[left as usize];
+        let right_node = self.nodes[right as usize];
         self.nodes[node_index as usize] = BvhNode {
-            min,
-            max,
+            min: left_node.min.min(right_node.min),
+            max: left_node.max.max(right_node.max),
             left,
             right,
             start: 0,
@@ -1433,22 +1487,19 @@ fn positions_form_valid_triangle([a, b, c]: [Vec3; 3]) -> bool {
         && cross_squared > max_edge_squared * max_edge_squared * TRIANGLE_RELATIVE_EPSILON
 }
 
-fn orient_manifold_faces(triangles: &mut [[u32; 3]]) -> usize {
-    let mut edges = HashMap::<EdgeKey, Vec<(usize, bool)>>::new();
-    for (face, triangle) in triangles.iter().enumerate() {
-        for edge_index in 0..3 {
-            let a = triangle[edge_index];
-            let b = triangle[(edge_index + 1) % 3];
-            edges.entry(edge_key(a, b)).or_default().push((face, a < b));
-        }
-    }
-    let mut adjacency = vec![Vec::<(usize, bool)>::new(); triangles.len()];
-    for occurrences in edges.values().filter(|faces| faces.len() == 2) {
-        let (first_face, first_direction) = occurrences[0];
-        let (second_face, second_direction) = occurrences[1];
+fn orient_manifold_faces(
+    triangles: &mut [[u32; 3]],
+    edge_faces: &HashMap<EdgeKey, SmallVec<[u32; 2]>>,
+) -> usize {
+    let mut adjacency = vec![SmallVec::<[(u32, bool); 3]>::new(); triangles.len()];
+    for (&(a, b), occurrences) in edge_faces.iter().filter(|(_, faces)| faces.len() == 2) {
+        let first_face = occurrences[0];
+        let second_face = occurrences[1];
+        let first_direction = triangle_edge_direction(triangles[first_face as usize], a, b);
+        let second_direction = triangle_edge_direction(triangles[second_face as usize], a, b);
         let parity_changes = first_direction == second_direction;
-        adjacency[first_face].push((second_face, parity_changes));
-        adjacency[second_face].push((first_face, parity_changes));
+        adjacency[first_face as usize].push((second_face, parity_changes));
+        adjacency[second_face as usize].push((first_face, parity_changes));
     }
 
     let mut flips = vec![None; triangles.len()];
@@ -1457,13 +1508,13 @@ fn orient_manifold_faces(triangles: &mut [[u32; 3]]) -> usize {
             continue;
         }
         flips[seed] = Some(false);
-        let mut queue = VecDeque::from([seed]);
+        let mut queue = VecDeque::from([seed as u32]);
         while let Some(face) = queue.pop_front() {
-            let face_flip = flips[face].unwrap_or(false);
-            for &(neighbor, parity_changes) in &adjacency[face] {
+            let face_flip = flips[face as usize].unwrap_or(false);
+            for &(neighbor, parity_changes) in &adjacency[face as usize] {
                 let expected = face_flip ^ parity_changes;
-                if flips[neighbor].is_none() {
-                    flips[neighbor] = Some(expected);
+                if flips[neighbor as usize].is_none() {
+                    flips[neighbor as usize] = Some(expected);
                     queue.push_back(neighbor);
                 }
             }
@@ -1478,6 +1529,10 @@ fn orient_manifold_faces(triangles: &mut [[u32; 3]]) -> usize {
         }
     }
     flipped_count
+}
+
+fn triangle_edge_direction(triangle: [u32; 3], a: u32, b: u32) -> bool {
+    (0..3).any(|index| triangle[index] == a && triangle[(index + 1) % 3] == b)
 }
 
 fn split_triangle(
@@ -1563,6 +1618,17 @@ fn triangle_range_bounds(
         centroid_max = centroid_max.max(centroid);
     }
     (min, max, centroid_min, centroid_max)
+}
+
+fn centroid_range_bounds(centroids: &[Vec3], indices: &[u32]) -> (Vec3, Vec3) {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for &triangle_index in indices {
+        let centroid = centroids[triangle_index as usize];
+        min = min.min(centroid);
+        max = max.max(centroid);
+    }
+    (min, max)
 }
 
 fn ray_aabb(origin: Vec3, direction: Vec3, min: Vec3, max: Vec3) -> Option<f32> {

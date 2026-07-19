@@ -12,7 +12,9 @@ eframe = { version = "0.35", default-features = false, features = ["accesskit", 
 egui-wgpu = { version = "0.35", features = ["winit"] }
 env_logger = "0.11"
 glam = { version = "0.33", features = ["bytemuck"] }
+hashbrown = "0.16"
 rfd = "0.17"
+smallvec = "1.15"
 stl_io = "0.11"
 thiserror = "2"
 

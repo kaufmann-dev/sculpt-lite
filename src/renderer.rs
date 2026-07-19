@@ -7,6 +7,8 @@ use eframe::egui::{Color32, PaintCallback, Pos2, Rect, Stroke, Ui};
 use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt as _;
 use glam::Vec3;
+#[cfg(test)]
+use hashbrown::HashSet;
 use thiserror::Error;
 
 use crate::camera::Camera;
@@ -48,6 +50,12 @@ impl BrushCursor {
 /// revisioned, so invoking `paint` every frame only uploads data that changed.
 pub struct ViewportRenderer {
     shared: Arc<RwLock<RenderInput>>,
+    mesh_preparer: MeshGpuPreparer,
+}
+
+#[derive(Clone)]
+pub(crate) struct MeshGpuPreparer {
+    device: wgpu::Device,
 }
 
 impl ViewportRenderer {
@@ -65,30 +73,45 @@ impl ViewportRenderer {
             .callback_resources
             .insert(resources);
 
-        Ok(Self { shared })
+        Ok(Self {
+            shared,
+            mesh_preparer: MeshGpuPreparer {
+                device: render_state.device.clone(),
+            },
+        })
     }
 
     /// Uploads the public geometry representation used by the mesh core. Invalid
     /// triangle indices are skipped instead of reaching wgpu validation.
     pub fn update_mesh(&self, mesh: &Mesh) {
-        self.install_prepared_mesh(Self::prepare_mesh(mesh));
-    }
-
-    /// Performs all CPU-side vertex and index packing. This is device-independent
-    /// and may run on the mesh worker before the result reaches the UI thread.
-    #[must_use]
-    pub(crate) fn prepare_mesh(mesh: &Mesh) -> MeshUpload {
-        MeshUpload::new(&mesh.positions, &mesh.normals, &mesh.mask, &mesh.triangles)
-    }
-
-    /// Installs an already packed mesh without scanning its vertices or faces.
-    pub(crate) fn install_prepared_mesh(&self, upload: MeshUpload) {
         let mut input = self
             .shared
             .write()
             .unwrap_or_else(|error| error.into_inner());
-        input.mesh = upload;
+        input.mesh = MeshUpload::from_mesh(mesh);
+        input.prepared_gpu = None;
         input.full_vertex_upload = true;
+        input.dirty_vertices.clear();
+        input.vertex_revision = input.vertex_revision.wrapping_add(1);
+        input.topology_revision = input.topology_revision.wrapping_add(1);
+    }
+
+    /// Returns a cloneable device-backed preparer for the mesh worker.
+    #[must_use]
+    pub(crate) fn mesh_preparer(&self) -> MeshGpuPreparer {
+        self.mesh_preparer.clone()
+    }
+
+    /// Installs CPU geometry and already populated GPU buffers without staging
+    /// large transfers on the event thread.
+    pub(crate) fn install_prepared_mesh(&self, upload: PreparedMeshUpload) {
+        let mut input = self
+            .shared
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        input.mesh = upload.mesh;
+        input.prepared_gpu = Some(upload.gpu);
+        input.full_vertex_upload = false;
         input.dirty_vertices.clear();
         input.vertex_revision = input.vertex_revision.wrapping_add(1);
         input.topology_revision = input.topology_revision.wrapping_add(1);
@@ -184,6 +207,7 @@ struct RenderInput {
     topology_revision: u64,
     camera_revision: u64,
     mesh: MeshUpload,
+    prepared_gpu: Option<PreparedGpuMesh>,
     camera: CameraUniform,
     full_vertex_upload: bool,
     dirty_vertices: Vec<u32>,
@@ -196,12 +220,81 @@ pub(crate) struct MeshUpload {
     edge_indices: Vec<u32>,
 }
 
+pub(crate) struct PreparedMeshUpload {
+    mesh: MeshUpload,
+    gpu: PreparedGpuMesh,
+}
+
+struct PreparedGpuMesh {
+    vertices: BufferSlot,
+    triangles: BufferSlot,
+    edges: BufferSlot,
+    triangle_index_count: u32,
+    edge_index_count: u32,
+}
+
+impl MeshGpuPreparer {
+    #[must_use]
+    pub(crate) fn prepare_mesh(&self, mesh: &Mesh) -> PreparedMeshUpload {
+        let mesh = MeshUpload::from_mesh(mesh);
+        let gpu = PreparedGpuMesh {
+            vertices: BufferSlot::prepared(
+                &self.device,
+                wgpu::BufferUsages::VERTEX,
+                "sculpt viewport vertices",
+                &mesh.vertices,
+            ),
+            triangles: BufferSlot::prepared(
+                &self.device,
+                wgpu::BufferUsages::INDEX,
+                "sculpt viewport triangle indices",
+                &mesh.triangle_indices,
+            ),
+            edges: BufferSlot::prepared(
+                &self.device,
+                wgpu::BufferUsages::INDEX,
+                "sculpt viewport edge indices",
+                &mesh.edge_indices,
+            ),
+            triangle_index_count: index_count(&mesh.triangle_indices),
+            edge_index_count: index_count(&mesh.edge_indices),
+        };
+        PreparedMeshUpload { mesh, gpu }
+    }
+}
+
 impl MeshUpload {
+    fn from_mesh(mesh: &Mesh) -> Self {
+        let vertices = Self::vertices(&mesh.positions, &mesh.normals, &mesh.mask);
+        let vertex_count = mesh.positions.len();
+        let mut triangle_indices = Vec::with_capacity(mesh.triangles.len().saturating_mul(3));
+        for &[a, b, c] in &mesh.triangles {
+            if [a, b, c]
+                .into_iter()
+                .all(|index| (index as usize) < vertex_count)
+            {
+                triangle_indices.extend_from_slice(&[a, b, c]);
+            }
+        }
+        let mut edge_indices = Vec::with_capacity(mesh.topology.edge_faces.len().saturating_mul(2));
+        for &(a, b) in mesh.topology.edge_faces.keys() {
+            if (a as usize) < vertex_count && (b as usize) < vertex_count {
+                edge_indices.extend_from_slice(&[a, b]);
+            }
+        }
+        Self {
+            vertices,
+            triangle_indices,
+            edge_indices,
+        }
+    }
+
+    #[cfg(test)]
     fn new(positions: &[Vec3], normals: &[Vec3], masks: &[f32], triangles: &[[u32; 3]]) -> Self {
         let vertices = Self::vertices(positions, normals, masks);
 
         let mut triangle_indices = Vec::with_capacity(triangles.len().saturating_mul(3));
-        let mut edge_indices = Vec::with_capacity(triangles.len().saturating_mul(6));
+        let mut edges = HashSet::with_capacity(triangles.len().saturating_mul(3) / 2);
         let vertex_count = positions.len();
         for &[a, b, c] in triangles {
             if [a, b, c]
@@ -209,8 +302,18 @@ impl MeshUpload {
                 .all(|index| (index as usize) < vertex_count)
             {
                 triangle_indices.extend_from_slice(&[a, b, c]);
-                edge_indices.extend_from_slice(&[a, b, b, c, c, a]);
+                for (left, right) in [(a, b), (b, c), (c, a)] {
+                    edges.insert(if left < right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    });
+                }
             }
+        }
+        let mut edge_indices = Vec::with_capacity(edges.len().saturating_mul(2));
+        for (a, b) in edges {
+            edge_indices.extend_from_slice(&[a, b]);
         }
 
         Self {
@@ -250,6 +353,10 @@ impl MeshUpload {
             _padding: 0.0,
         }
     }
+}
+
+fn index_count(indices: &[u32]) -> u32 {
+    u32::try_from(indices.len()).unwrap_or(u32::MAX)
 }
 
 fn coalesced_vertex_ranges(
@@ -486,8 +593,16 @@ impl ViewportGpu {
             "sculpt viewport edge indices",
             &mesh.edge_indices,
         );
-        self.triangle_index_count = u32::try_from(mesh.triangle_indices.len()).unwrap_or(u32::MAX);
-        self.edge_index_count = u32::try_from(mesh.edge_indices.len()).unwrap_or(u32::MAX);
+        self.triangle_index_count = index_count(&mesh.triangle_indices);
+        self.edge_index_count = index_count(&mesh.edge_indices);
+    }
+
+    fn install_prepared_mesh(&mut self, prepared: PreparedGpuMesh) {
+        self.vertices = prepared.vertices;
+        self.triangles = prepared.triangles;
+        self.edges = prepared.edges;
+        self.triangle_index_count = prepared.triangle_index_count;
+        self.edge_index_count = prepared.edge_index_count;
     }
 }
 
@@ -559,6 +674,28 @@ impl BufferSlot {
         }
     }
 
+    fn prepared<T: Pod>(
+        device: &wgpu::Device,
+        usage: wgpu::BufferUsages,
+        label: &'static str,
+        values: &[T],
+    ) -> Self {
+        let bytes = bytemuck::cast_slice(values);
+        if bytes.is_empty() {
+            return Self::new(usage);
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: usage | wgpu::BufferUsages::COPY_DST,
+        });
+        Self {
+            usage,
+            capacity: buffer.size(),
+            buffer: Some(buffer),
+        }
+    }
+
     fn write<T: Pod>(
         &mut self,
         device: &wgpu::Device,
@@ -613,6 +750,13 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
             .write()
             .unwrap_or_else(|error| error.into_inner());
 
+        if let Some(prepared) = input.prepared_gpu.take() {
+            gpu.install_prepared_mesh(prepared);
+            input.full_vertex_upload = false;
+            input.dirty_vertices.clear();
+            gpu.vertex_revision = input.vertex_revision;
+            gpu.topology_revision = input.topology_revision;
+        }
         if input.vertex_revision != gpu.vertex_revision {
             let full_upload = input.full_vertex_upload || gpu.vertex_revision == u64::MAX;
             let dirty_vertices = std::mem::take(&mut input.dirty_vertices);
@@ -686,9 +830,34 @@ mod tests {
 
         assert_eq!(upload.vertices.len(), 3);
         assert_eq!(upload.triangle_indices, [0, 1, 2]);
-        assert_eq!(upload.edge_indices, [0, 1, 1, 2, 2, 0]);
+        let edges = upload
+            .edge_indices
+            .chunks_exact(2)
+            .map(|edge| (edge[0], edge[1]))
+            .collect::<HashSet<_>>();
+        assert_eq!(edges, HashSet::from([(0, 1), (0, 2), (1, 2)]));
         assert_eq!(upload.vertices[0].mask, 0.0);
         assert_eq!(upload.vertices[0].normal, Vec3::Y.to_array());
+    }
+
+    #[test]
+    fn mesh_upload_emits_each_wire_edge_once() {
+        let mesh = Mesh::new(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::ONE],
+            vec![[0, 1, 2], [2, 1, 3]],
+        )
+        .unwrap();
+        let upload = MeshUpload::from_mesh(&mesh);
+        let edges = upload
+            .edge_indices
+            .chunks_exact(2)
+            .map(|edge| (edge[0], edge[1]))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            edges,
+            HashSet::from([(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)])
+        );
     }
 
     #[test]

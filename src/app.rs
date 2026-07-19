@@ -21,7 +21,7 @@ use crate::{
         History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot, SnapshotRestore,
     },
     mesh::{Mesh, RayHit, RemeshStats},
-    renderer::{BrushCursor, MeshUpload, ViewportRenderer},
+    renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
     sculpt::{BrushSample, BrushSettings, RemeshRequest, SculptEngine, SculptTool, SymmetryAxis},
     stl::{ImportReport, load_stl, save_stl_atomic},
 };
@@ -75,22 +75,24 @@ enum WorkerJob {
     },
 }
 
+type ImportResult = Result<(Box<Mesh>, ImportReport, Option<Box<PreparedMeshUpload>>), String>;
+
 enum WorkerResult {
     Import {
         path: PathBuf,
-        result: Result<(Box<Mesh>, ImportReport, Box<MeshUpload>), String>,
+        result: ImportResult,
     },
     RemeshCheckpoint(Arc<MeshSnapshot>),
     Remesh {
         mesh: Box<Mesh>,
-        upload: Box<MeshUpload>,
+        upload: Option<Box<PreparedMeshUpload>>,
         history: HistoryEntry,
         error: Option<String>,
     },
     HistoryCheckpoint(Arc<MeshSnapshot>),
     HistoryRestore {
         mesh: Box<Mesh>,
-        upload: Box<MeshUpload>,
+        upload: Option<Box<PreparedMeshUpload>>,
         inverse: Arc<MeshSnapshot>,
         error: Option<String>,
     },
@@ -108,7 +110,10 @@ struct BackgroundWorker {
 }
 
 impl BackgroundWorker {
-    fn start(context: egui::Context) -> std::io::Result<Self> {
+    fn start(
+        context: egui::Context,
+        mesh_preparer: Option<MeshGpuPreparer>,
+    ) -> std::io::Result<Self> {
         let (job_sender, job_receiver) = mpsc::channel::<WorkerJob>();
         let (result_sender, result_receiver) = mpsc::channel::<WorkerResult>();
         thread::Builder::new()
@@ -120,8 +125,10 @@ impl BackgroundWorker {
                             let result = catch_unwind(AssertUnwindSafe(|| {
                                 let (mesh, report) =
                                     load_stl(&path).map_err(|error| error.to_string())?;
-                                let upload = ViewportRenderer::prepare_mesh(&mesh);
-                                Ok::<_, String>((Box::new(mesh), report, Box::new(upload)))
+                                let upload = mesh_preparer
+                                    .as_ref()
+                                    .map(|preparer| Box::new(preparer.prepare_mesh(&mesh)));
+                                Ok::<_, String>((Box::new(mesh), report, upload))
                             }))
                             .map_err(panic_message)
                             .and_then(|result| result);
@@ -153,10 +160,12 @@ impl BackgroundWorker {
                                 recovery.restore(&mut mesh);
                             }
                             let history = remesh_history_entry(edit, undo, stats);
-                            let upload = ViewportRenderer::prepare_mesh(&mesh);
+                            let upload = mesh_preparer
+                                .as_ref()
+                                .map(|preparer| Box::new(preparer.prepare_mesh(&mesh)));
                             WorkerResult::Remesh {
                                 mesh: Box::new(mesh),
-                                upload: Box::new(upload),
+                                upload,
                                 history,
                                 error,
                             }
@@ -179,10 +188,12 @@ impl BackgroundWorker {
                             if error.is_some() {
                                 inverse.restore(&mut mesh);
                             }
-                            let upload = ViewportRenderer::prepare_mesh(&mesh);
+                            let upload = mesh_preparer
+                                .as_ref()
+                                .map(|preparer| Box::new(preparer.prepare_mesh(&mesh)));
                             WorkerResult::HistoryRestore {
                                 mesh: Box::new(mesh),
-                                upload: Box::new(upload),
+                                upload,
                                 inverse,
                                 error,
                             }
@@ -314,8 +325,9 @@ impl SculptLiteApp {
 
         creation_context.egui_ctx.set_visuals(egui::Visuals::dark());
 
+        let mesh_preparer = renderer.as_ref().map(ViewportRenderer::mesh_preparer);
         let (worker, worker_error) =
-            match BackgroundWorker::start(creation_context.egui_ctx.clone()) {
+            match BackgroundWorker::start(creation_context.egui_ctx.clone(), mesh_preparer) {
                 Ok(worker) => (Some(worker), None),
                 Err(error) => (
                     None,
@@ -419,13 +431,13 @@ impl SculptLiteApp {
         path: PathBuf,
         mesh: Mesh,
         report: ImportReport,
-        upload: MeshUpload,
+        upload: Option<PreparedMeshUpload>,
     ) {
         let (minimum, maximum) = mesh.bounds().unwrap_or((Vec3::splat(-1.0), Vec3::ONE));
         self.camera.fit(minimum, maximum);
         self.history.clear();
         self.sculpt.reset_for_mesh(&mesh);
-        if let Some(renderer) = &self.renderer {
+        if let (Some(renderer), Some(upload)) = (&self.renderer, upload) {
             renderer.install_prepared_mesh(upload);
         }
         self.status = if report.has_topology_warnings() {
@@ -570,7 +582,7 @@ impl SculptLiteApp {
                     path,
                     result: Ok((mesh, report, upload)),
                 },
-            ) => self.install_import(path, *mesh, report, *upload),
+            ) => self.install_import(path, *mesh, report, upload.map(|upload| *upload)),
             (
                 BackgroundTask::Import { .. },
                 WorkerResult::Import {
@@ -610,7 +622,7 @@ impl SculptLiteApp {
                     document.mesh = Some(*mesh);
                     document.dirty = true;
                 }
-                if let Some(renderer) = &self.renderer {
+                if let (Some(renderer), Some(upload)) = (&self.renderer, upload) {
                     renderer.install_prepared_mesh(*upload);
                 }
                 let history_saved = self.history.record(history);
@@ -655,7 +667,7 @@ impl SculptLiteApp {
                     document.mesh = Some(*mesh);
                     document.dirty = true;
                 }
-                if let Some(renderer) = &self.renderer {
+                if let (Some(renderer), Some(upload)) = (&self.renderer, upload) {
                     renderer.install_prepared_mesh(*upload);
                 }
                 if let Some(error) = error {
