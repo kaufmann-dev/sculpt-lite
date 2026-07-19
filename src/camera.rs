@@ -1,10 +1,9 @@
-use std::f32::consts::{FRAC_PI_2, TAU};
+use std::f32::consts::TAU;
 
 use eframe::egui::{Pos2, Rect, Vec2};
 use glam::{Mat4, Vec3, Vec4};
 
-const MIN_PITCH_MARGIN: f32 = 0.01;
-const ORBIT_RADIANS_PER_POINT: f32 = 0.008;
+const TURN_RADIANS_PER_POINT: f32 = 0.008;
 
 /// A world-space ray cast from the perspective camera through the viewport.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -106,11 +105,12 @@ impl Camera {
         self.projection_matrix(aspect) * self.view_matrix()
     }
 
-    /// Orbits by an egui pointer delta measured in logical points.
-    pub fn orbit(&mut self, delta_points: Vec2) {
-        self.yaw = (self.yaw - delta_points.x * ORBIT_RADIANS_PER_POINT).rem_euclid(TAU);
-        self.pitch = (self.pitch + delta_points.y * ORBIT_RADIANS_PER_POINT)
-            .clamp(-FRAC_PI_2 + MIN_PITCH_MARGIN, FRAC_PI_2 - MIN_PITCH_MARGIN);
+    /// Turns horizontally by an egui pointer delta measured in logical points.
+    ///
+    /// A positive delta turns the view towards the mesh's right side. The
+    /// camera elevation remains fixed so middle-button dragging stays level.
+    pub fn turntable(&mut self, horizontal_delta_points: f32) {
+        self.yaw = (self.yaw + horizontal_delta_points * TURN_RADIANS_PER_POINT).rem_euclid(TAU);
     }
 
     /// Pans so the object tracks the pointer. `viewport_height_points` is the
@@ -226,12 +226,33 @@ mod tests {
     }
 
     #[test]
-    fn orbit_clamps_away_from_singular_poles() {
+    fn turntable_drag_right_turns_towards_the_mesh_right_side() {
         let mut camera = Camera::default();
-        camera.orbit(Vec2::new(0.0, 100_000.0));
-        assert!(camera.pitch < FRAC_PI_2);
-        camera.orbit(Vec2::new(0.0, -200_000.0));
-        assert!(camera.pitch > -FRAC_PI_2);
+        let yaw = camera.yaw;
+
+        camera.turntable(40.0);
+
+        assert!((camera.yaw - (yaw + 40.0 * TURN_RADIANS_PER_POINT)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn turntable_drag_left_turns_towards_the_mesh_left_side() {
+        let mut camera = Camera::default();
+        let yaw = camera.yaw;
+
+        camera.turntable(-40.0);
+
+        assert!((camera.yaw - (yaw - 40.0 * TURN_RADIANS_PER_POINT)).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn turntable_keeps_the_camera_elevation_fixed() {
+        let mut camera = Camera::default();
+        let pitch = camera.pitch;
+
+        camera.turntable(100_000.0);
+
+        assert_eq!(camera.pitch, pitch);
     }
 
     #[test]
