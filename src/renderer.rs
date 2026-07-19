@@ -665,7 +665,9 @@ impl ViewportGpu {
         mesh: &MeshUpload,
         mut dirty_vertices: Vec<u32>,
     ) {
-        if self.vertices.buffer.is_none() {
+        if self.vertices.buffer.is_none()
+            || !buffer_capacity_fits::<GpuVertex>(mesh.vertices.len(), self.vertices.capacity)
+        {
             self.upload_vertices(device, queue, mesh);
             return;
         }
@@ -762,6 +764,13 @@ impl ViewportGpu {
         self.triangle_index_count = prepared.triangle_index_count;
         self.edge_index_count = prepared.edge_index_count;
     }
+}
+
+fn buffer_capacity_fits<T>(element_count: usize, capacity: u64) -> bool {
+    u64::try_from(element_count)
+        .ok()
+        .and_then(|count| count.checked_mul(size_of::<T>() as u64))
+        .is_some_and(|required| required <= capacity)
 }
 
 struct PipelineSpec {
@@ -1052,6 +1061,21 @@ mod tests {
 
         let mut separated = vec![1, 25];
         assert_eq!(coalesced_vertex_ranges(&mut separated, 32), [1..2, 25..26]);
+    }
+
+    #[test]
+    fn partial_vertex_upload_reallocates_when_adaptive_topology_outgrows_buffer() {
+        const CRASHED_BUFFER_BYTES: u64 = 7_510_368;
+        let original_vertices = CRASHED_BUFFER_BYTES as usize / size_of::<GpuVertex>();
+
+        assert!(buffer_capacity_fits::<GpuVertex>(
+            original_vertices,
+            CRASHED_BUFFER_BYTES
+        ));
+        assert!(!buffer_capacity_fits::<GpuVertex>(
+            original_vertices + 1,
+            CRASHED_BUFFER_BYTES
+        ));
     }
 
     #[test]
