@@ -781,6 +781,9 @@ mod tests {
             ],
         )
         .unwrap();
+        let before_positions = mesh.positions.clone();
+        let before_triangles = mesh.triangles.clone();
+        let before_mask = mesh.mask.clone();
         let original_vertex_count = mesh.positions.len();
         let original_triangles = mesh.triangles.clone();
         let mut settings = test_settings();
@@ -820,7 +823,13 @@ mod tests {
         let outcome = engine.end_stroke(&mesh);
 
         assert!(!updated.is_empty());
-        assert!(outcome.topology.is_some());
+        let topology = outcome
+            .topology
+            .expect("adaptive stroke records exact topology history");
+        topology.apply_before(&mut mesh);
+        assert_eq!(mesh.positions, before_positions);
+        assert_eq!(mesh.triangles, before_triangles);
+        assert_eq!(mesh.mask, before_mask);
     }
 
     #[test]

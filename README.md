@@ -1,6 +1,6 @@
 # SculptLite
 
-SculptLite is a native Linux desktop application for importing, sculpting, and exporting STL meshes. It provides direct sculpting brushes, symmetry, optional adaptive topology, undo and redo, a wireframe overlay, and STL export.
+SculptLite is a native Linux desktop application for importing, sculpting, and exporting STL meshes. It provides distance-spaced sculpting brushes with optional Airbrush buildup, symmetry, optional adaptive topology, undo and redo, a wireframe overlay, and STL export.
 
 ## Run from source
 

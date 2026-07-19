@@ -22,11 +22,16 @@ use crate::{
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
     sculpt::{BrushSample, BrushSettings, SculptEngine, SculptTool, SymmetryAxis},
     stl::{ImportReport, load_stl, save_stl_atomic},
+    stroke::{MAX_DABS_PER_FRAME, StrokeSampler},
 };
 
 const INITIAL_BRUSH_RADIUS_POINTS: f32 = 55.0;
 const MIN_BRUSH_RADIUS_POINTS: f32 = 4.0;
 const MAX_BRUSH_RADIUS_POINTS: f32 = 300.0;
+const DEFAULT_AIRBRUSH_DABS_PER_SECOND: f32 = 10.0;
+const MIN_AIRBRUSH_DABS_PER_SECOND: f32 = 2.0;
+const MAX_AIRBRUSH_DABS_PER_SECOND: f32 = 30.0;
+const BRUSH_SPACING_RADIUS_FRACTION: f32 = 0.15;
 
 struct MeshDocument {
     mesh: Option<Mesh>,
@@ -47,6 +52,10 @@ fn navigation_action(button: PointerButton) -> Option<NavigationAction> {
         PointerButton::Middle => Some(NavigationAction::Orbit),
         _ => None,
     }
+}
+
+fn viewport_sense() -> Sense {
+    Sense::drag()
 }
 
 #[derive(Clone)]
@@ -186,9 +195,11 @@ pub struct SculptLiteApp {
     tool: SculptTool,
     brush: BrushSettings,
     adaptive_topology: bool,
+    airbrush: bool,
+    airbrush_dabs_per_second: f32,
     brush_radius_points: f32,
     wireframe: bool,
-    stroke_last_pointer: Option<Pos2>,
+    stroke_sampler: Option<StrokeSampler>,
     pending_action: Option<PendingAction>,
     worker: Option<BackgroundWorker>,
     background_task: Option<BackgroundTask>,
@@ -232,9 +243,11 @@ impl SculptLiteApp {
             tool: SculptTool::default(),
             brush: BrushSettings::default(),
             adaptive_topology: false,
+            airbrush: false,
+            airbrush_dabs_per_second: DEFAULT_AIRBRUSH_DABS_PER_SECOND,
             brush_radius_points: INITIAL_BRUSH_RADIUS_POINTS,
             wireframe: false,
-            stroke_last_pointer: None,
+            stroke_sampler: None,
             pending_action: None,
             worker,
             background_task: None,
@@ -338,7 +351,7 @@ impl SculptLiteApp {
             report,
             dirty: false,
         });
-        self.stroke_last_pointer = None;
+        self.stroke_sampler = None;
     }
 
     fn poll_background_task(&mut self, context: &egui::Context) {
@@ -841,6 +854,19 @@ impl SculptLiteApp {
                     ui.add(egui::Slider::new(&mut self.brush.strength, 0.01..=1.0));
                     ui.label("Hardness");
                     ui.add(egui::Slider::new(&mut self.brush.falloff, 0.0..=0.95));
+                    ui.add_enabled_ui(self.tool != SculptTool::Grab, |ui| {
+                        ui.checkbox(&mut self.airbrush, "Airbrush");
+                        if self.airbrush {
+                            ui.label("Rate");
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.airbrush_dabs_per_second,
+                                    MIN_AIRBRUSH_DABS_PER_SECOND..=MAX_AIRBRUSH_DABS_PER_SECOND,
+                                )
+                                .suffix(" dabs/s"),
+                            );
+                        }
+                    });
                     ui.add_enabled_ui(self.tool != SculptTool::Mask, |ui| {
                         ui.checkbox(&mut self.adaptive_topology, "Adaptive topology");
                         if self.adaptive_topology {
@@ -989,7 +1015,10 @@ impl SculptLiteApp {
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(25, 27, 31)))
             .show(root_ui, |ui| {
                 let rect = ui.available_rect_before_wrap();
-                let response = ui.allocate_rect(rect, Sense::click_and_drag());
+                let response = ui.allocate_rect(rect, viewport_sense());
+                if let Some(sampler) = self.stroke_sampler.as_mut() {
+                    sampler.advance_to(Instant::now());
+                }
 
                 if self.document.is_none() {
                     ui.painter().text(
@@ -1080,44 +1109,61 @@ impl SculptLiteApp {
                     && let Some(mesh) = document.mesh.as_ref()
                 {
                     self.sculpt.begin_stroke(mesh);
-                    self.stroke_last_pointer = Some(position);
-                    self.apply_pointer_sample(context, rect, position, Vec2::ZERO);
+                    self.stroke_sampler = Some(StrokeSampler::begin(position, Instant::now()));
+                    let effective_tool =
+                        self.effective_tool(context.input(|input| input.modifiers));
+                    if effective_tool != SculptTool::Grab {
+                        let initial_dab = self
+                            .stroke_sampler
+                            .as_mut()
+                            .and_then(StrokeSampler::take_initial_dab);
+                        if let Some(initial_dab) = initial_dab {
+                            self.apply_pointer_sample(context, rect, initial_dab, Vec2::ZERO);
+                        }
+                    }
                     began_stroke = true;
                 }
 
-                if response.dragged_by(PointerButton::Primary)
-                    && !began_stroke
-                    && self.sculpt.is_stroking()
-                    && let Some(position) = pointer
-                {
-                    self.apply_pointer_segment(context, rect, position);
-                }
-
-                if response.drag_stopped_by(PointerButton::Primary) && self.sculpt.is_stroking() {
-                    let outcome = self
-                        .document
-                        .as_ref()
-                        .and_then(|document| document.mesh.as_ref())
-                        .map(|mesh| self.sculpt.end_stroke(mesh))
-                        .unwrap_or_default();
-                    let history_entry = outcome
-                        .topology
-                        .map(|edit| HistoryEntry::Topology(Arc::new(edit)))
-                        .or_else(|| {
-                            (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit))
-                        });
-                    if let Some(history_entry) = history_entry {
-                        if let Some(document) = self.document.as_mut() {
-                            document.dirty = true;
+                if !began_stroke && self.sculpt.is_stroking() {
+                    let stopped = response.drag_stopped_by(PointerButton::Primary);
+                    let primary_down =
+                        context.input(|input| input.pointer.button_down(PointerButton::Primary));
+                    let effective_tool =
+                        self.effective_tool(context.input(|input| input.modifiers));
+                    if (primary_down || stopped)
+                        && let Some(position) = pointer
+                    {
+                        if effective_tool == SculptTool::Grab {
+                            let delta = self
+                                .stroke_sampler
+                                .as_mut()
+                                .map(|sampler| sampler.consume_grab_delta(position))
+                                .unwrap_or(Vec2::ZERO);
+                            if delta.length_sq() > f32::EPSILON {
+                                self.apply_pointer_sample(context, rect, position, delta);
+                                if let Some(sampler) = self.stroke_sampler.as_mut() {
+                                    sampler.record_spatial_dab();
+                                }
+                            }
+                        } else if let Some(sampler) = self.stroke_sampler.as_mut() {
+                            sampler.enqueue_pointer(position);
                         }
-                        let history_saved = self.history.record(history_entry);
-                        self.status = if history_saved {
-                            format!("{} stroke", self.tool.label())
-                        } else {
-                            format!("{} stroke (undo memory limit reached)", self.tool.label())
-                        };
                     }
-                    self.stroke_last_pointer = None;
+                    if stopped && let Some(sampler) = self.stroke_sampler.as_mut() {
+                        sampler.release();
+                    }
+
+                    if effective_tool != SculptTool::Grab {
+                        self.apply_spatial_dabs(context, rect);
+                        self.apply_airbrush_dab(context, rect);
+                    }
+
+                    let finished = self.stroke_sampler.as_ref().is_some_and(|sampler| {
+                        sampler.is_released() && !sampler.has_pending_path()
+                    });
+                    if finished {
+                        self.finish_pointer_stroke();
+                    }
                 }
             });
     }
@@ -1131,21 +1177,80 @@ impl SculptLiteApp {
             .raycast(ray.origin, ray.direction)
     }
 
-    fn apply_pointer_segment(&mut self, context: &egui::Context, viewport: Rect, pointer: Pos2) {
-        let previous = self.stroke_last_pointer.unwrap_or(pointer);
-        let delta = pointer - previous;
-        if delta.length_sq() < 0.25 {
+    fn effective_tool(&self, modifiers: Modifiers) -> SculptTool {
+        if modifiers.shift && self.tool != SculptTool::Mask {
+            SculptTool::Smooth
+        } else {
+            self.tool
+        }
+    }
+
+    fn apply_spatial_dabs(&mut self, context: &egui::Context, viewport: Rect) {
+        let spacing = (self.brush_radius_points * BRUSH_SPACING_RADIUS_FRACTION).max(1.0);
+        let dabs = self
+            .stroke_sampler
+            .as_mut()
+            .map(|sampler| sampler.drain_spatial_dabs(spacing, MAX_DABS_PER_FRAME))
+            .unwrap_or_default();
+        if dabs.is_empty() {
             return;
         }
-        let spacing = (self.brush_radius_points * 0.15).max(1.0);
-        let steps = (delta.length() / spacing).ceil().clamp(1.0, 8.0) as usize;
-        let mut prior = previous;
-        for step in 1..=steps {
-            let position = previous + delta * (step as f32 / steps as f32);
-            self.apply_pointer_sample(context, viewport, position, position - prior);
-            prior = position;
+        for pointer in dabs {
+            self.apply_pointer_sample(context, viewport, pointer, Vec2::ZERO);
         }
-        self.stroke_last_pointer = Some(pointer);
+        if let Some(sampler) = self.stroke_sampler.as_mut() {
+            sampler.record_spatial_dab();
+        }
+    }
+
+    fn apply_airbrush_dab(&mut self, context: &egui::Context, viewport: Rect) {
+        if !self.airbrush || self.tool == SculptTool::Grab {
+            return;
+        }
+        let interval = self.airbrush_interval();
+        let pointer = self.stroke_sampler.as_ref().and_then(|sampler| {
+            (!sampler.is_released() && sampler.airbrush_due(interval)).then_some(sampler.pointer())
+        });
+        let Some(pointer) = pointer else {
+            return;
+        };
+        self.apply_pointer_sample(context, viewport, pointer, Vec2::ZERO);
+        if let Some(sampler) = self.stroke_sampler.as_mut() {
+            sampler.record_airbrush_dab();
+        }
+    }
+
+    fn airbrush_interval(&self) -> Duration {
+        Duration::from_secs_f32(
+            self.airbrush_dabs_per_second
+                .clamp(MIN_AIRBRUSH_DABS_PER_SECOND, MAX_AIRBRUSH_DABS_PER_SECOND)
+                .recip(),
+        )
+    }
+
+    fn finish_pointer_stroke(&mut self) {
+        let outcome = self
+            .document
+            .as_ref()
+            .and_then(|document| document.mesh.as_ref())
+            .map(|mesh| self.sculpt.end_stroke(mesh))
+            .unwrap_or_default();
+        let history_entry = outcome
+            .topology
+            .map(|edit| HistoryEntry::Topology(Arc::new(edit)))
+            .or_else(|| (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit)));
+        if let Some(history_entry) = history_entry {
+            if let Some(document) = self.document.as_mut() {
+                document.dirty = true;
+            }
+            let history_saved = self.history.record(history_entry);
+            self.status = if history_saved {
+                format!("{} stroke", self.tool.label())
+            } else {
+                format!("{} stroke (undo memory limit reached)", self.tool.label())
+            };
+        }
+        self.stroke_sampler = None;
     }
 
     fn apply_pointer_sample(
@@ -1172,11 +1277,7 @@ impl SculptLiteApp {
         let world_drag = self.camera.right() * pointer_delta.x * units_per_point
             - self.camera.up() * pointer_delta.y * units_per_point;
         let modifiers = context.input(|input| input.modifiers);
-        let effective_tool = if modifiers.shift && self.tool != SculptTool::Mask {
-            SculptTool::Smooth
-        } else {
-            self.tool
-        };
+        let effective_tool = self.effective_tool(modifiers);
         let mut settings = self.brush;
         settings.radius = self.brush_radius_points * units_per_point;
         if effective_tool == SculptTool::Mask || !self.adaptive_topology {
@@ -1318,8 +1419,12 @@ impl eframe::App for SculptLiteApp {
             self.unsaved_prompt(&context);
         }
 
-        if self.sculpt.is_stroking() {
-            context.request_repaint();
+        if let Some(sampler) = &self.stroke_sampler {
+            if sampler.has_pending_path() {
+                context.request_repaint();
+            } else if self.airbrush && self.tool != SculptTool::Grab && !sampler.is_released() {
+                context.request_repaint_after(sampler.airbrush_wait(self.airbrush_interval()));
+            }
         }
         if self.background_task.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
@@ -1372,5 +1477,13 @@ mod tests {
             Some(NavigationAction::Orbit)
         );
         assert_eq!(navigation_action(PointerButton::Primary), None);
+    }
+
+    #[test]
+    fn viewport_drag_sense_has_no_click_threshold_delay() {
+        let sense = viewport_sense();
+
+        assert!(sense.senses_drag());
+        assert!(!sense.senses_click());
     }
 }

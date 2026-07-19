@@ -27,7 +27,7 @@ For a release GUI smoke check, build `target/release/sculpt-lite` and run `packa
 ## Project structure
 
 - `src/app.rs` owns the egui UI, input handling, background mesh jobs, and document lifecycle.
-- `src/mesh.rs` owns validated mesh data, topology, remeshing, normals, and spatial queries; `src/sculpt.rs` applies brush operations.
+- `src/mesh.rs` owns validated mesh data, topology, remeshing, normals, and spatial queries; `src/sculpt.rs` applies brush operations; `src/stroke.rs` schedules distance- and time-based brush dabs.
 - `src/renderer.rs` and `src/shader.wgsl` own the wgpu viewport; keep GPU updates revisioned and avoid blocking the UI thread.
 - `src/history.rs`, `src/camera.rs`, and `src/stl.rs` respectively own undo/redo, orbit-camera math, and STL I/O.
 
