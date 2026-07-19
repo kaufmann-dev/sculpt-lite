@@ -46,15 +46,6 @@ fn vs_mesh(input: VertexInput) -> VertexOutput {
     return vertex_common(input);
 }
 
-@vertex
-fn vs_wire(input: VertexInput) -> VertexOutput {
-    var output = vertex_common(input);
-    // Pull the line overlay slightly toward the camera without changing the
-    // sculpt surface depth values.
-    output.clip_position.z -= output.clip_position.w * 0.0001;
-    return output;
-}
-
 @fragment
 fn fs_solid(input: VertexOutput) -> @location(0) vec4<f32> {
     let view = safe_normalize(

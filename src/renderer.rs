@@ -414,7 +414,7 @@ impl ViewportGpu {
             PipelineSpec {
                 label: "sculpt viewport wire pipeline",
                 topology: wgpu::PrimitiveTopology::LineList,
-                vertex_entry: "vs_wire",
+                vertex_entry: "vs_mesh",
                 fragment_entry: "fs_wire",
                 depth_write_enabled: false,
             },
