@@ -24,11 +24,13 @@ cargo test
 
 For a release GUI smoke check, build `target/release/sculpt-lite` and run `packaging/linux/smoke-x11.sh target/release/sculpt-lite`.
 
+Run the ignored large-mesh probes documented in `README.md` individually and in release mode after performance-sensitive sculpt, mesh, or renderer changes. Do not run them concurrently; CPU and allocator contention makes their timings misleading.
+
 ## Project structure
 
-- `src/app.rs` owns the egui UI, input handling, background mesh jobs, and document lifecycle.
-- `src/mesh.rs` owns validated mesh data, topology, remeshing, normals, and spatial queries; `src/sculpt.rs` applies brush operations; `src/stroke.rs` schedules distance- and time-based brush dabs.
-- `src/renderer.rs` and `src/shader.wgsl` own the wgpu viewport; keep GPU updates revisioned and avoid blocking the UI thread.
+- `src/app.rs` owns the egui UI, input handling, exact cached document bounds, per-frame render batching, background mesh jobs, and document lifecycle.
+- `src/mesh.rs` owns validated mesh data, local topology updates, remeshing, normals, and spatial queries; `src/sculpt.rs` applies and validates brush operations; `src/stroke.rs` retains captured input state while scheduling distance- and time-based brush dabs.
+- `src/renderer.rs` and `src/shader.wgsl` own the wgpu viewport; keep CPU/GPU updates revisioned and local, preserve growth headroom within device limits, and avoid blocking the UI thread.
 - `src/history.rs`, `src/camera.rs`, and `src/stl.rs` respectively own undo/redo, orbit-camera math, and STL I/O.
 
 ## Packaging

@@ -13,6 +13,76 @@ pub struct Ray {
     pub direction: Vec3,
 }
 
+/// Immutable projection values shared by viewport work and queued brush samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraFrame {
+    viewport: Rect,
+    eye: Vec3,
+    right: Vec3,
+    up: Vec3,
+    view_projection: Mat4,
+    inverse_view_projection: Mat4,
+    world_units_per_point: f32,
+    distance: f32,
+}
+
+impl CameraFrame {
+    #[must_use]
+    pub fn screen_ray(self, pointer: Pos2) -> Option<Ray> {
+        if !self.viewport.contains(pointer) {
+            return None;
+        }
+        let ndc_x = ((pointer.x - self.viewport.left()) / self.viewport.width()) * 2.0 - 1.0;
+        let ndc_y = 1.0 - ((pointer.y - self.viewport.top()) / self.viewport.height()) * 2.0;
+        let near = unproject(
+            self.inverse_view_projection,
+            Vec4::new(ndc_x, ndc_y, 0.0, 1.0),
+        )?;
+        let far = unproject(
+            self.inverse_view_projection,
+            Vec4::new(ndc_x, ndc_y, 1.0, 1.0),
+        )?;
+        let direction = (far - near).normalize_or_zero();
+        if direction == Vec3::ZERO || !direction.is_finite() {
+            return None;
+        }
+        Some(Ray {
+            origin: self.eye,
+            direction,
+        })
+    }
+
+    #[must_use]
+    pub fn eye(self) -> Vec3 {
+        self.eye
+    }
+
+    #[must_use]
+    pub fn right(self) -> Vec3 {
+        self.right
+    }
+
+    #[must_use]
+    pub fn up(self) -> Vec3 {
+        self.up
+    }
+
+    #[must_use]
+    pub fn view_projection(self) -> Mat4 {
+        self.view_projection
+    }
+
+    #[must_use]
+    pub fn world_units_per_point(self) -> f32 {
+        self.world_units_per_point
+    }
+
+    #[must_use]
+    pub fn distance(self) -> f32 {
+        self.distance
+    }
+}
+
 /// Orbit camera centered on the active sculpting area.
 ///
 /// Positive Z is up. `yaw == 0` places the eye on the positive X axis and the
@@ -85,11 +155,6 @@ impl Camera {
     }
 
     #[must_use]
-    pub fn view_matrix(&self) -> Mat4 {
-        glam::camera::rh::view::look_at_mat4(self.eye_position(), self.target, Vec3::Z)
-    }
-
-    #[must_use]
     pub fn projection_matrix(&self, aspect: f32) -> Mat4 {
         let (near, far) = self.near_far();
         glam::camera::rh::proj::directx::perspective(
@@ -99,11 +164,6 @@ impl Camera {
             near,
             far,
         )
-    }
-
-    #[must_use]
-    pub fn view_projection(&self, aspect: f32) -> Mat4 {
-        self.projection_matrix(aspect) * self.view_matrix()
     }
 
     /// Orbits by an egui pointer delta measured in logical points.
@@ -143,29 +203,36 @@ impl Camera {
         2.0 * self.distance * (self.fov_y_radians * 0.5).tan() / viewport_height_points
     }
 
-    /// Returns a perspective ray for a logical screen position. Positions
-    /// outside the supplied viewport produce `None`.
+    /// Computes camera data once for all viewport work in the current frame.
     #[must_use]
-    pub fn screen_ray(&self, pointer: Pos2, viewport: Rect) -> Option<Ray> {
-        if !viewport.contains(pointer) || viewport.width() <= 0.0 || viewport.height() <= 0.0 {
+    pub fn frame(&self, viewport: Rect) -> Option<CameraFrame> {
+        if viewport.width() <= 0.0 || viewport.height() <= 0.0 {
             return None;
         }
-
-        let ndc_x = ((pointer.x - viewport.left()) / viewport.width()) * 2.0 - 1.0;
-        let ndc_y = 1.0 - ((pointer.y - viewport.top()) / viewport.height()) * 2.0;
         let aspect = viewport.width() / viewport.height();
-        let inverse = self.view_projection(aspect).inverse();
-
-        let near = unproject(inverse, Vec4::new(ndc_x, ndc_y, 0.0, 1.0))?;
-        let far = unproject(inverse, Vec4::new(ndc_x, ndc_y, 1.0, 1.0))?;
-        let direction = (far - near).normalize_or_zero();
-        if direction == Vec3::ZERO || !direction.is_finite() {
+        let eye = self.eye_position();
+        let forward = (self.target - eye).normalize_or_zero();
+        let right = forward.cross(Vec3::Z).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        let view = glam::camera::rh::view::look_at_mat4(eye, self.target, Vec3::Z);
+        let view_projection = self.projection_matrix(aspect) * view;
+        let inverse_view_projection = view_projection.inverse();
+        if right == Vec3::ZERO
+            || up == Vec3::ZERO
+            || !view_projection.is_finite()
+            || !inverse_view_projection.is_finite()
+        {
             return None;
         }
-
-        Some(Ray {
-            origin: self.eye_position(),
-            direction,
+        Some(CameraFrame {
+            viewport,
+            eye,
+            right,
+            up,
+            view_projection,
+            inverse_view_projection,
+            world_units_per_point: self.world_units_per_pixel(viewport.height()),
+            distance: self.distance,
         })
     }
 
@@ -199,7 +266,9 @@ mod tests {
     fn center_screen_ray_points_at_target() {
         let camera = Camera::default();
         let ray = camera
-            .screen_ray(viewport().center(), viewport())
+            .frame(viewport())
+            .expect("valid viewport")
+            .screen_ray(viewport().center())
             .expect("center is inside viewport");
 
         assert!(ray.direction.dot(camera.forward()) > 0.999_99);
@@ -211,7 +280,9 @@ mod tests {
         let camera = Camera::default();
         assert!(
             camera
-                .screen_ray(Pos2::new(20.0, 20.0), viewport())
+                .frame(viewport())
+                .expect("valid viewport")
+                .screen_ray(Pos2::new(20.0, 20.0))
                 .is_none()
         );
     }

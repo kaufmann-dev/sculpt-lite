@@ -16,7 +16,7 @@ use eframe::egui::{
 use glam::Vec3;
 
 use crate::{
-    camera::Camera,
+    camera::{Camera, CameraFrame},
     history::{History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot},
     mesh::{Mesh, MeshChangeSet, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
@@ -25,6 +25,53 @@ use crate::{
     stroke::{MAX_DABS_PER_FRAME, StrokeSampler},
 };
 
+#[derive(Clone, Copy)]
+struct PointerHit {
+    hit: RayHit,
+    view_direction: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SculptInput {
+    camera: CameraFrame,
+    tool: SculptTool,
+    brush: BrushSettings,
+    adaptive_topology: bool,
+    radius_points: f32,
+}
+
+#[derive(Debug, Default)]
+struct FrameRenderBatch {
+    vertices: Vec<u32>,
+    changes: MeshChangeSet,
+    has_topology: bool,
+    changed: bool,
+}
+
+impl FrameRenderBatch {
+    fn clear(&mut self) {
+        self.vertices.clear();
+        self.changes.clear();
+        self.has_topology = false;
+        self.changed = false;
+    }
+
+    fn queue(&mut self, updated_vertices: Vec<u32>, mesh_changes: Option<MeshChangeSet>) {
+        self.changed = true;
+        if let Some(changes) = mesh_changes {
+            if !self.has_topology {
+                self.changes.include_vertices(self.vertices.drain(..));
+                self.has_topology = true;
+            }
+            self.changes.merge(changes);
+        } else if self.has_topology {
+            self.changes.include_vertices(updated_vertices);
+        } else {
+            self.vertices.extend(updated_vertices);
+        }
+    }
+}
+
 const INITIAL_BRUSH_RADIUS_POINTS: f32 = 55.0;
 const MIN_BRUSH_RADIUS_POINTS: f32 = 4.0;
 const MAX_BRUSH_RADIUS_POINTS: f32 = 300.0;
@@ -32,12 +79,98 @@ const DEFAULT_AIRBRUSH_DABS_PER_SECOND: f32 = 10.0;
 const MIN_AIRBRUSH_DABS_PER_SECOND: f32 = 2.0;
 const MAX_AIRBRUSH_DABS_PER_SECOND: f32 = 30.0;
 const BRUSH_SPACING_RADIUS_FRACTION: f32 = 0.15;
+const SCULPT_FRAME_BUDGET: Duration = Duration::from_millis(8);
 
 struct MeshDocument {
     mesh: Option<Mesh>,
+    bounds: Option<MeshBounds>,
     source_path: PathBuf,
     report: ImportReport,
     dirty: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MeshBounds {
+    minimum: Vec3,
+    maximum: Vec3,
+    minimum_vertices: [u32; 3],
+    maximum_vertices: [u32; 3],
+    exact: bool,
+}
+
+impl MeshBounds {
+    fn from_mesh(mesh: &Mesh) -> Option<Self> {
+        let (&first, positions) = mesh.positions.split_first()?;
+        if !first.is_finite() {
+            return None;
+        }
+        let mut bounds = Self {
+            minimum: first,
+            maximum: first,
+            minimum_vertices: [0; 3],
+            maximum_vertices: [0; 3],
+            exact: true,
+        };
+        for (index, &position) in positions.iter().enumerate() {
+            if !position.is_finite() {
+                continue;
+            }
+            bounds.include(index as u32 + 1, position);
+        }
+        Some(bounds)
+    }
+
+    fn include(&mut self, vertex: u32, position: Vec3) {
+        for axis in 0..3 {
+            if position[axis] < self.minimum[axis] {
+                self.minimum[axis] = position[axis];
+                self.minimum_vertices[axis] = vertex;
+            }
+            if position[axis] > self.maximum[axis] {
+                self.maximum[axis] = position[axis];
+                self.maximum_vertices[axis] = vertex;
+            }
+        }
+    }
+
+    fn update(&mut self, mesh: &Mesh, changed_vertices: &[u32]) {
+        if self
+            .minimum_vertices
+            .iter()
+            .chain(&self.maximum_vertices)
+            .any(|&vertex| vertex as usize >= mesh.positions.len())
+        {
+            self.exact = false;
+        }
+        let invalidated = changed_vertices.iter().copied().any(|vertex| {
+            let Some(&position) = mesh.positions.get(vertex as usize) else {
+                return self.minimum_vertices.contains(&vertex)
+                    || self.maximum_vertices.contains(&vertex);
+            };
+            if !position.is_finite() {
+                return true;
+            }
+            (0..3).any(|axis| {
+                (self.minimum_vertices[axis] == vertex && position[axis] > self.minimum[axis])
+                    || (self.maximum_vertices[axis] == vertex
+                        && position[axis] < self.maximum[axis])
+            })
+        });
+        if invalidated {
+            self.exact = false;
+        }
+        for &vertex in changed_vertices {
+            if let Some(&position) = mesh.positions.get(vertex as usize)
+                && position.is_finite()
+            {
+                self.include(vertex, position);
+            }
+        }
+    }
+
+    fn min_max(self) -> (Vec3, Vec3) {
+        (self.minimum, self.maximum)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +189,14 @@ fn navigation_action(button: PointerButton) -> Option<NavigationAction> {
 
 fn viewport_sense() -> Sense {
     Sense::drag()
+}
+
+fn effective_tool(tool: SculptTool, modifiers: Modifiers) -> SculptTool {
+    if modifiers.shift && tool != SculptTool::Mask {
+        SculptTool::Smooth
+    } else {
+        tool
+    }
 }
 
 #[derive(Clone)]
@@ -199,7 +340,8 @@ pub struct SculptLiteApp {
     airbrush_dabs_per_second: f32,
     brush_radius_points: f32,
     wireframe: bool,
-    stroke_sampler: Option<StrokeSampler>,
+    stroke_sampler: Option<StrokeSampler<SculptInput>>,
+    frame_render: FrameRenderBatch,
     pending_action: Option<PendingAction>,
     worker: Option<BackgroundWorker>,
     background_task: Option<BackgroundTask>,
@@ -248,6 +390,7 @@ impl SculptLiteApp {
             brush_radius_points: INITIAL_BRUSH_RADIUS_POINTS,
             wireframe: false,
             stroke_sampler: None,
+            frame_render: FrameRenderBatch::default(),
             pending_action: None,
             worker,
             background_task: None,
@@ -333,7 +476,10 @@ impl SculptLiteApp {
         report: ImportReport,
         upload: Option<PreparedMeshUpload>,
     ) {
-        let (minimum, maximum) = mesh.bounds().unwrap_or((Vec3::splat(-1.0), Vec3::ONE));
+        let bounds = MeshBounds::from_mesh(&mesh);
+        let (minimum, maximum) = bounds
+            .map(MeshBounds::min_max)
+            .unwrap_or((Vec3::splat(-1.0), Vec3::ONE));
         self.camera.fit(minimum, maximum);
         self.history.clear();
         self.sculpt.reset_for_mesh(&mesh);
@@ -347,11 +493,13 @@ impl SculptLiteApp {
         };
         self.document = Some(MeshDocument {
             mesh: Some(mesh),
+            bounds,
             source_path: path,
             report,
             dirty: false,
         });
         self.stroke_sampler = None;
+        self.frame_render = FrameRenderBatch::default();
     }
 
     fn poll_background_task(&mut self, context: &egui::Context) {
@@ -469,6 +617,7 @@ impl SculptLiteApp {
         recovery.restore(&mut mesh);
         if let Some(document) = self.document.as_mut() {
             document.mesh = Some(mesh);
+            document.bounds = document.mesh.as_ref().and_then(MeshBounds::from_mesh);
             document.dirty = dirty;
         }
         self.upload_mesh();
@@ -593,14 +742,72 @@ impl SculptLiteApp {
         }
     }
 
+    fn begin_frame_render_batch(&mut self) {
+        self.frame_render.clear();
+    }
+
+    fn queue_frame_render_update(
+        &mut self,
+        updated_vertices: Vec<u32>,
+        mesh_changes: Option<MeshChangeSet>,
+    ) {
+        self.frame_render.queue(updated_vertices, mesh_changes);
+    }
+
+    fn flush_frame_render_batch(&mut self, context: &egui::Context) {
+        if !self.frame_render.changed {
+            return;
+        }
+        if self.frame_render.has_topology {
+            let counts = self
+                .document
+                .as_ref()
+                .and_then(|document| document.mesh.as_ref())
+                .map(|mesh| (mesh.positions.len(), mesh.triangles.len()));
+            if let Some((vertex_count, face_count)) = counts {
+                self.frame_render.changes.finalize(vertex_count, face_count);
+                self.upload_mesh_partial(&self.frame_render.changes);
+            }
+        } else {
+            self.frame_render.vertices.sort_unstable();
+            self.frame_render.vertices.dedup();
+            self.upload_vertices_partial(&self.frame_render.vertices);
+        }
+        context.request_repaint();
+    }
+
     fn frame_mesh(&mut self) {
-        if let Some((minimum, maximum)) = self
+        let bounds = self
             .document
             .as_ref()
             .and_then(|document| document.mesh.as_ref())
-            .and_then(Mesh::bounds)
-        {
+            .and_then(MeshBounds::from_mesh);
+        if let Some(document) = self.document.as_mut() {
+            document.bounds = bounds;
+        }
+        if let Some((minimum, maximum)) = bounds.map(MeshBounds::min_max) {
             self.camera.fit(minimum, maximum);
+        }
+    }
+
+    fn refresh_document_bounds(&mut self) {
+        if let Some(document) = self.document.as_mut() {
+            document.bounds = document.mesh.as_ref().and_then(MeshBounds::from_mesh);
+        }
+    }
+
+    fn update_document_bounds(&mut self, changed_vertices: &[u32]) {
+        let Some(document) = self.document.as_mut() else {
+            return;
+        };
+        let Some(mesh) = document.mesh.as_ref() else {
+            document.bounds = None;
+            return;
+        };
+        if let Some(bounds) = document.bounds.as_mut() {
+            bounds.update(mesh, changed_vertices);
+        } else {
+            document.bounds = MeshBounds::from_mesh(mesh);
         }
     }
 
@@ -620,6 +827,7 @@ impl SculptLiteApp {
                     document.dirty = true;
                 }
                 self.upload_vertices_partial(&changed_vertices);
+                self.refresh_document_bounds();
                 self.status = "Undo".to_owned();
             }
             HistoryAction::Topology { changes } => {
@@ -627,6 +835,7 @@ impl SculptLiteApp {
                     document.dirty = true;
                 }
                 self.upload_mesh_partial(&changes);
+                self.refresh_document_bounds();
                 self.status = "Undo".to_owned();
             }
         }
@@ -648,6 +857,7 @@ impl SculptLiteApp {
                     document.dirty = true;
                 }
                 self.upload_vertices_partial(&changed_vertices);
+                self.refresh_document_bounds();
                 self.status = "Redo".to_owned();
             }
             HistoryAction::Topology { changes } => {
@@ -655,6 +865,7 @@ impl SculptLiteApp {
                     document.dirty = true;
                 }
                 self.upload_mesh_partial(&changes);
+                self.refresh_document_bounds();
                 self.status = "Redo".to_owned();
             }
         }
@@ -927,7 +1138,7 @@ impl SculptLiteApp {
                             grouped(mesh.positions.len()),
                             grouped(mesh.triangles.len())
                         ));
-                        if let Some((minimum, maximum)) = mesh.bounds() {
+                        if let Some((minimum, maximum)) = document.bounds.map(MeshBounds::min_max) {
                             let size = maximum - minimum;
                             ui.label(format!("{:.1} × {:.1} × {:.1}", size.x, size.y, size.z));
                         }
@@ -1011,6 +1222,7 @@ impl SculptLiteApp {
     }
 
     fn viewport(&mut self, root_ui: &mut egui::Ui, context: &egui::Context) {
+        self.begin_frame_render_batch();
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(25, 27, 31)))
             .show(root_ui, |ui| {
@@ -1053,31 +1265,6 @@ impl SculptLiteApp {
                 let pointer = response
                     .hover_pos()
                     .or_else(|| context.pointer_latest_pos());
-                let hover_hit = pointer.and_then(|position| self.hit_at(position, rect));
-                let cursor = pointer
-                    .filter(|position| rect.contains(*position))
-                    .map(|position| {
-                        let mut cursor = BrushCursor::new(position, self.brush_radius_points);
-                        cursor.active = self.sculpt.is_stroking();
-                        cursor.color = if context.input(|input| input.modifiers.ctrl) {
-                            Color32::from_rgb(238, 128, 92)
-                        } else {
-                            Color32::from_rgb(115, 205, 255)
-                        };
-                        cursor
-                    });
-
-                if let Some(renderer) = &self.renderer {
-                    renderer.update_camera(
-                        &self.camera,
-                        (rect.width() / rect.height().max(1.0)).max(0.001),
-                    );
-                    renderer.paint(ui, rect, cursor, self.wireframe);
-                } else {
-                    ui.painter()
-                        .rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 25));
-                }
-
                 let pointer_delta = context.input(|input| input.pointer.delta());
                 let navigation = if response.dragged_by(PointerButton::Secondary) {
                     navigation_action(PointerButton::Secondary)
@@ -1100,25 +1287,61 @@ impl SculptLiteApp {
                     }
                 }
 
+                let Some(camera_frame) = self.camera.frame(rect) else {
+                    return;
+                };
+                let cursor = pointer
+                    .filter(|position| rect.contains(*position))
+                    .map(|position| {
+                        let mut cursor = BrushCursor::new(position, self.brush_radius_points);
+                        cursor.active = self.sculpt.is_stroking();
+                        cursor.color = if context.input(|input| input.modifiers.ctrl) {
+                            Color32::from_rgb(238, 128, 92)
+                        } else {
+                            Color32::from_rgb(115, 205, 255)
+                        };
+                        cursor
+                    });
+                if let Some(renderer) = &self.renderer {
+                    renderer.update_camera(camera_frame);
+                    renderer.paint(ui, rect, cursor, self.wireframe);
+                } else {
+                    ui.painter()
+                        .rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 25));
+                }
+
                 let mut began_stroke = false;
                 if self.background_task.is_none()
                     && response.drag_started_by(PointerButton::Primary)
                     && let Some(position) = pointer
-                    && hover_hit.is_some()
+                    && let Some(pointer_hit) = self.hit_at(position, camera_frame)
                     && let Some(document) = self.document.as_ref()
                     && let Some(mesh) = document.mesh.as_ref()
                 {
                     self.sculpt.begin_stroke(mesh);
-                    self.stroke_sampler = Some(StrokeSampler::begin(position, Instant::now()));
-                    let effective_tool =
-                        self.effective_tool(context.input(|input| input.modifiers));
+                    let modifiers = context.input(|input| input.modifiers);
+                    let sculpt_input = self.sculpt_input(camera_frame);
+                    self.stroke_sampler = Some(StrokeSampler::begin(
+                        position,
+                        modifiers,
+                        self.brush_spacing(),
+                        sculpt_input,
+                        Instant::now(),
+                    ));
+                    let effective_tool = effective_tool(sculpt_input.tool, modifiers);
                     if effective_tool != SculptTool::Grab {
                         let initial_dab = self
                             .stroke_sampler
                             .as_mut()
                             .and_then(StrokeSampler::take_initial_dab);
                         if let Some(initial_dab) = initial_dab {
-                            self.apply_pointer_sample(context, rect, initial_dab, Vec2::ZERO);
+                            self.apply_pointer_sample(
+                                initial_dab.context,
+                                initial_dab.position,
+                                Vec2::ZERO,
+                                initial_dab.modifiers,
+                                Some(pointer_hit),
+                            );
                         }
                     }
                     began_stroke = true;
@@ -1128,8 +1351,10 @@ impl SculptLiteApp {
                     let stopped = response.drag_stopped_by(PointerButton::Primary);
                     let primary_down =
                         context.input(|input| input.pointer.button_down(PointerButton::Primary));
-                    let effective_tool =
-                        self.effective_tool(context.input(|input| input.modifiers));
+                    let modifiers = context.input(|input| input.modifiers);
+                    let sculpt_input = self.sculpt_input(camera_frame);
+                    let brush_spacing = self.brush_spacing();
+                    let effective_tool = effective_tool(sculpt_input.tool, modifiers);
                     if (primary_down || stopped)
                         && let Some(position) = pointer
                     {
@@ -1137,25 +1362,36 @@ impl SculptLiteApp {
                             let delta = self
                                 .stroke_sampler
                                 .as_mut()
-                                .map(|sampler| sampler.consume_grab_delta(position))
+                                .and_then(|sampler| sampler.consume_grab_delta(position))
                                 .unwrap_or(Vec2::ZERO);
                             if delta.length_sq() > f32::EPSILON {
-                                self.apply_pointer_sample(context, rect, position, delta);
+                                self.apply_pointer_sample(
+                                    sculpt_input,
+                                    position,
+                                    delta,
+                                    modifiers,
+                                    None,
+                                );
                                 if let Some(sampler) = self.stroke_sampler.as_mut() {
                                     sampler.record_spatial_dab();
                                 }
                             }
                         } else if let Some(sampler) = self.stroke_sampler.as_mut() {
-                            sampler.enqueue_pointer(position);
+                            sampler.enqueue_pointer(
+                                position,
+                                modifiers,
+                                brush_spacing,
+                                sculpt_input,
+                            );
                         }
                     }
                     if stopped && let Some(sampler) = self.stroke_sampler.as_mut() {
                         sampler.release();
                     }
 
+                    self.apply_spatial_dabs();
                     if effective_tool != SculptTool::Grab {
-                        self.apply_spatial_dabs(context, rect);
-                        self.apply_airbrush_dab(context, rect);
+                        self.apply_airbrush_dab();
                     }
 
                     let finished = self.stroke_sampler.as_ref().is_some_and(|sampler| {
@@ -1166,55 +1402,73 @@ impl SculptLiteApp {
                     }
                 }
             });
+        self.flush_frame_render_batch(context);
     }
 
-    fn hit_at(&self, pointer: Pos2, viewport: Rect) -> Option<RayHit> {
-        let ray = self.camera.screen_ray(pointer, viewport)?;
-        self.document
+    fn hit_at(&self, pointer: Pos2, camera: CameraFrame) -> Option<PointerHit> {
+        let ray = camera.screen_ray(pointer)?;
+        let hit = self
+            .document
             .as_ref()?
             .mesh
             .as_ref()?
-            .raycast(ray.origin, ray.direction)
+            .raycast(ray.origin, ray.direction)?;
+        Some(PointerHit {
+            hit,
+            view_direction: ray.direction,
+        })
     }
 
-    fn effective_tool(&self, modifiers: Modifiers) -> SculptTool {
-        if modifiers.shift && self.tool != SculptTool::Mask {
-            SculptTool::Smooth
-        } else {
-            self.tool
+    fn sculpt_input(&self, camera: CameraFrame) -> SculptInput {
+        SculptInput {
+            camera,
+            tool: self.tool,
+            brush: self.brush,
+            adaptive_topology: self.adaptive_topology,
+            radius_points: self.brush_radius_points,
         }
     }
 
-    fn apply_spatial_dabs(&mut self, context: &egui::Context, viewport: Rect) {
-        let spacing = (self.brush_radius_points * BRUSH_SPACING_RADIUS_FRACTION).max(1.0);
-        let dabs = self
-            .stroke_sampler
-            .as_mut()
-            .map(|sampler| sampler.drain_spatial_dabs(spacing, MAX_DABS_PER_FRAME))
-            .unwrap_or_default();
-        if dabs.is_empty() {
-            return;
+    fn brush_spacing(&self) -> f32 {
+        (self.brush_radius_points * BRUSH_SPACING_RADIUS_FRACTION).max(1.0)
+    }
+
+    fn apply_spatial_dabs(&mut self) {
+        let started = Instant::now();
+        let mut processed = 0;
+        while processed < MAX_DABS_PER_FRAME {
+            let dab = self
+                .stroke_sampler
+                .as_mut()
+                .and_then(StrokeSampler::next_spatial_dab);
+            let Some(dab) = dab else {
+                break;
+            };
+            self.apply_pointer_sample(dab.context, dab.position, Vec2::ZERO, dab.modifiers, None);
+            processed += 1;
+            if started.elapsed() >= SCULPT_FRAME_BUDGET {
+                break;
+            }
         }
-        for pointer in dabs {
-            self.apply_pointer_sample(context, viewport, pointer, Vec2::ZERO);
-        }
-        if let Some(sampler) = self.stroke_sampler.as_mut() {
+        if processed != 0
+            && let Some(sampler) = self.stroke_sampler.as_mut()
+        {
             sampler.record_spatial_dab();
         }
     }
 
-    fn apply_airbrush_dab(&mut self, context: &egui::Context, viewport: Rect) {
+    fn apply_airbrush_dab(&mut self) {
         if !self.airbrush || self.tool == SculptTool::Grab {
             return;
         }
         let interval = self.airbrush_interval();
-        let pointer = self.stroke_sampler.as_ref().and_then(|sampler| {
+        let dab = self.stroke_sampler.as_ref().and_then(|sampler| {
             (!sampler.is_released() && sampler.airbrush_due(interval)).then_some(sampler.pointer())
         });
-        let Some(pointer) = pointer else {
+        let Some(dab) = dab else {
             return;
         };
-        self.apply_pointer_sample(context, viewport, pointer, Vec2::ZERO);
+        self.apply_pointer_sample(dab.context, dab.position, Vec2::ZERO, dab.modifiers, None);
         if let Some(sampler) = self.stroke_sampler.as_mut() {
             sampler.record_airbrush_dab();
         }
@@ -1250,40 +1504,47 @@ impl SculptLiteApp {
                 format!("{} stroke (undo memory limit reached)", self.tool.label())
             };
         }
+        if self
+            .document
+            .as_ref()
+            .and_then(|document| document.bounds)
+            .is_some_and(|bounds| !bounds.exact)
+        {
+            self.refresh_document_bounds();
+        }
         self.stroke_sampler = None;
     }
 
     fn apply_pointer_sample(
         &mut self,
-        context: &egui::Context,
-        viewport: Rect,
+        input: SculptInput,
         pointer: Pos2,
         pointer_delta: Vec2,
+        modifiers: Modifiers,
+        pointer_hit: Option<PointerHit>,
     ) {
-        let Some(ray) = self.camera.screen_ray(pointer, viewport) else {
+        let Some(pointer_hit) = pointer_hit.or_else(|| self.hit_at(pointer, input.camera)) else {
             return;
         };
-        let Some(hit) = self
-            .document
-            .as_ref()
-            .and_then(|document| document.mesh.as_ref())
-            .and_then(|mesh| mesh.raycast(ray.origin, ray.direction))
-        else {
-            return;
-        };
+        let hit = pointer_hit.hit;
 
-        let depth_scale = (hit.distance / self.camera.distance.max(1.0e-6)).max(0.05);
-        let units_per_point = self.camera.world_units_per_pixel(viewport.height()) * depth_scale;
-        let world_drag = self.camera.right() * pointer_delta.x * units_per_point
-            - self.camera.up() * pointer_delta.y * units_per_point;
-        let modifiers = context.input(|input| input.modifiers);
-        let effective_tool = self.effective_tool(modifiers);
-        let mut settings = self.brush;
-        settings.radius = self.brush_radius_points * units_per_point;
-        if effective_tool == SculptTool::Mask || !self.adaptive_topology {
+        let depth_scale = (hit.distance / input.camera.distance().max(1.0e-6)).max(0.05);
+        let units_per_point = input.camera.world_units_per_point() * depth_scale;
+        let world_drag = input.camera.right() * pointer_delta.x * units_per_point
+            - input.camera.up() * pointer_delta.y * units_per_point;
+        let effective_tool = effective_tool(input.tool, modifiers);
+        let mut settings = input.brush;
+        settings.radius = input.radius_points * units_per_point;
+        if effective_tool == SculptTool::Mask || !input.adaptive_topology {
             settings.detail = 0.0;
         }
-        let sample = BrushSample::from_hit(&hit, world_drag, ray.direction, 1.0, modifiers.ctrl);
+        let sample = BrushSample::from_hit(
+            &hit,
+            world_drag,
+            pointer_hit.view_direction,
+            1.0,
+            modifiers.ctrl,
+        );
 
         let changed = self.document.as_mut().is_some_and(|document| {
             document.mesh.as_mut().is_some_and(|mesh| {
@@ -1300,12 +1561,10 @@ impl SculptLiteApp {
             if let Some(document) = self.document.as_mut() {
                 document.dirty = true;
             }
-            if let Some(changes) = mesh_changes {
-                self.upload_mesh_partial(&changes);
-            } else {
-                self.upload_vertices_partial(&updated_vertices);
+            if effective_tool != SculptTool::Mask {
+                self.update_document_bounds(&updated_vertices);
             }
-            context.request_repaint();
+            self.queue_frame_render_update(updated_vertices, mesh_changes);
         }
     }
 
@@ -1485,5 +1744,74 @@ mod tests {
 
         assert!(sense.senses_drag());
         assert!(!sense.senses_click());
+    }
+
+    #[test]
+    fn frame_render_batch_preserves_fixed_edits_around_topology_edits() {
+        let mut batch = FrameRenderBatch::default();
+        batch.queue(vec![1, 2], None);
+        let mut topology = MeshChangeSet::default();
+        topology.dirty_vertices = vec![3, 4];
+        topology.dirty_faces = vec![7];
+        topology.vertex_count = 12;
+        topology.face_count = 9;
+        batch.queue(vec![3], Some(topology));
+        batch.queue(vec![5, 2], None);
+        batch.changes.finalize(12, 9);
+
+        assert!(batch.changed);
+        assert!(batch.has_topology);
+        assert_eq!(batch.changes.dirty_vertices, [1, 2, 3, 4, 5]);
+        assert_eq!(batch.changes.dirty_faces, [7]);
+        assert!(batch.vertices.is_empty());
+    }
+
+    #[test]
+    fn queued_stroke_context_is_unchanged_by_later_camera_navigation() {
+        let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut camera = Camera::default();
+        let original = SculptInput {
+            camera: camera.frame(viewport).unwrap(),
+            tool: SculptTool::Draw,
+            brush: BrushSettings::default(),
+            adaptive_topology: true,
+            radius_points: 55.0,
+        };
+        let mut sampler =
+            StrokeSampler::begin(Pos2::ZERO, Modifiers::NONE, 10.0, original, Instant::now());
+        sampler.enqueue_pointer(Pos2::new(20.0, 0.0), Modifiers::NONE, 10.0, original);
+
+        camera.orbit(Vec2::new(80.0, 20.0));
+        let navigated = camera.frame(viewport).unwrap();
+        let queued = sampler.next_spatial_dab().unwrap();
+
+        assert_eq!(queued.context, original);
+        assert_ne!(queued.context.camera, navigated);
+    }
+
+    #[test]
+    fn mesh_bounds_update_locally_and_rebuild_when_an_extreme_moves_inward() {
+        let mut mesh = Mesh::new(
+            vec![
+                Vec3::new(-2.0, 0.0, 0.0),
+                Vec3::new(2.0, 0.0, 0.0),
+                Vec3::new(0.0, -1.0, 0.0),
+                Vec3::new(0.0, 1.0, 1.0),
+            ],
+            vec![[0, 2, 3], [1, 3, 2], [0, 3, 1], [0, 1, 2]],
+        )
+        .unwrap();
+        let mut bounds = MeshBounds::from_mesh(&mesh).unwrap();
+
+        mesh.positions[3].z = 3.0;
+        bounds.update(&mesh, &[3]);
+        assert!(bounds.exact);
+        assert_eq!(bounds.maximum.z, 3.0);
+
+        mesh.positions[1].x = 0.5;
+        bounds.update(&mesh, &[1]);
+        assert!(!bounds.exact);
+        bounds = MeshBounds::from_mesh(&mesh).unwrap();
+        assert_eq!(bounds.min_max(), mesh.bounds().unwrap());
     }
 }

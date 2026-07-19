@@ -1,10 +1,15 @@
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 use glam::Vec3;
+use hashbrown::HashMap;
+use smallvec::SmallVec;
 
 use crate::{
     history::{LocalEdit, MaskChange, PositionChange},
-    mesh::{Mesh, MeshChangeSet, MeshEditDelta, MeshEditRecorder, RayHit, RemeshSettings},
+    mesh::{
+        Mesh, MeshChangeSet, MeshEditDelta, MeshEditRecorder, RayHit, RemeshSettings,
+        VertexTraversalScratch,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -188,6 +193,8 @@ pub struct StrokeOutcome {
 pub struct SculptEngine {
     active: Option<StrokeState>,
     symmetry_center: Option<Vec3>,
+    traversal: VertexTraversalScratch,
+    source_positions: HashMap<u32, Vec3>,
     updated_vertices: Vec<u32>,
     mesh_changes: Option<MeshChangeSet>,
     error: Option<String>,
@@ -203,7 +210,9 @@ impl SculptEngine {
     pub fn reset_for_mesh(&mut self, mesh: &Mesh) {
         self.active = None;
         self.symmetry_center = Some(mesh.center().unwrap_or(Vec3::ZERO));
-        self.updated_vertices.clear();
+        self.traversal = VertexTraversalScratch::default();
+        self.source_positions = HashMap::new();
+        self.updated_vertices = Vec::new();
         self.mesh_changes = None;
         self.error = None;
     }
@@ -268,8 +277,13 @@ impl SculptEngine {
 
         let symmetry_center = stroke.symmetry_center;
         let cached_mirrored_seed = stroke.mirrored_seed;
-        let mut passes = Vec::with_capacity(2);
-        passes.push(PreparedPass::new(mesh, sample, settings.radius));
+        let mut passes = SmallVec::<[PreparedPass; 2]>::new();
+        passes.push(PreparedPass::new(
+            mesh,
+            sample,
+            settings.radius,
+            &mut self.traversal,
+        ));
 
         if let Some(axis) = settings.symmetry
             && axis.distance_to_plane(sample.center, symmetry_center) > settings.radius * 1.0e-4
@@ -280,25 +294,39 @@ impl SculptEngine {
                 .or_else(|| mesh.nearest_triangle(mirrored_center));
             if let Some(seed_triangle) = seed_triangle {
                 let mirrored = sample.reflected(axis, symmetry_center, seed_triangle);
-                passes.push(PreparedPass::new(mesh, mirrored, settings.radius));
+                passes.push(PreparedPass::new(
+                    mesh,
+                    mirrored,
+                    settings.radius,
+                    &mut self.traversal,
+                ));
                 if let Some(stroke) = self.active.as_mut() {
                     stroke.mirrored_seed = Some(seed_triangle);
                 }
             }
         }
 
-        let source_positions = capture_source_positions(mesh, tool, &passes);
-        let mut sample_recorder = MeshEditRecorder::new(mesh);
+        capture_source_positions(mesh, tool, &passes, &mut self.source_positions);
+        let adaptive =
+            tool != SculptTool::Mask && settings.detail.is_finite() && settings.detail > 0.0;
+        let mut sample_recorder = adaptive.then(|| MeshEditRecorder::new(mesh));
         let mut changed = false;
         let mut affected = Vec::new();
         if let Some(stroke) = self.active.as_mut() {
             let mut edits = SampleEdits {
                 affected: &mut affected,
                 original: &mut stroke.original,
-                recorder: &mut sample_recorder,
+                recorder: sample_recorder.as_mut(),
             };
             for pass in &passes {
-                changed |= apply_pass(mesh, tool, settings, pass, &source_positions, &mut edits);
+                changed |= apply_pass(
+                    mesh,
+                    tool,
+                    settings,
+                    pass,
+                    &self.source_positions,
+                    &mut edits,
+                );
             }
         }
 
@@ -306,18 +334,47 @@ impl SculptEngine {
             affected.sort_unstable();
             affected.dedup();
 
+            let fixed_deformation_faces = if tool != SculptTool::Mask && !adaptive {
+                let Some(faces) = mesh.validated_deformation_faces(&affected) else {
+                    for &vertex in &affected {
+                        if let Some(&position) = self.source_positions.get(&vertex)
+                            && let Some(target) = mesh.positions.get_mut(vertex as usize)
+                        {
+                            *target = position;
+                        }
+                    }
+                    self.error = Some(
+                        "Sculpt sample rejected an invalid local mesh update; the latest brush sample was rolled back"
+                            .to_owned(),
+                    );
+                    return false;
+                };
+                Some(faces)
+            } else {
+                None
+            };
+
             if tool != SculptTool::Mask {
-                self.updated_vertices = mesh.update_deformed_vertices(&affected);
+                self.updated_vertices = match fixed_deformation_faces {
+                    Some(faces) => mesh.update_deformed_faces(&faces),
+                    None => mesh.update_deformed_vertices(&affected),
+                };
                 self.updated_vertices.extend(affected.iter().copied());
                 self.updated_vertices.sort_unstable();
                 self.updated_vertices.dedup();
 
-                if settings.detail.is_finite() && settings.detail > 0.0 {
+                if adaptive {
                     let target_edge_length = settings.radius * settings.detail.clamp(0.01, 1.0);
                     let mut remesh = RemeshSettings::new(target_edge_length);
                     remesh.iterations = 1;
                     remesh.relaxation = 0.0;
-                    let mut outcome = mesh.remesh_region(&affected, remesh, &mut sample_recorder);
+                    let mut outcome = mesh.remesh_region(
+                        &affected,
+                        remesh,
+                        sample_recorder
+                            .as_mut()
+                            .expect("adaptive samples have a rollback recorder"),
+                    );
                     outcome
                         .changes
                         .dirty_vertices
@@ -334,34 +391,30 @@ impl SculptEngine {
                 self.updated_vertices.clone_from(&affected);
             }
 
-            let mut validation = self.mesh_changes.clone().unwrap_or_else(|| MeshChangeSet {
-                dirty_vertices: self.updated_vertices.clone(),
-                vertex_count: mesh.positions.len(),
-                face_count: mesh.triangles.len(),
-                ..MeshChangeSet::default()
-            });
-            for &vertex in &validation.dirty_vertices {
-                if let Some(faces) = mesh.topology.vertex_triangles.get(vertex as usize) {
-                    validation.dirty_faces.extend(faces.iter().copied());
-                }
-            }
-            validation.dirty_faces.sort_unstable();
-            validation.dirty_faces.dedup();
-
-            let sample_delta = sample_recorder.finish(mesh);
-            if mesh.local_changes_are_valid(&validation) {
-                if let Some(stroke) = self.active.as_mut() {
-                    stroke.recorder.absorb(&sample_delta);
-                }
-            } else {
-                sample_delta.apply_before(mesh);
-                self.updated_vertices.clear();
-                self.mesh_changes = None;
-                self.error = Some(
-                    "Adaptive topology rejected an invalid local mesh update; the latest brush sample was rolled back"
-                        .to_owned(),
+            if adaptive {
+                let valid = mesh.local_changes_are_valid(
+                    self.mesh_changes
+                        .as_ref()
+                        .expect("adaptive samples produce a mesh change set"),
                 );
-                changed = false;
+                let sample_recorder = sample_recorder
+                    .take()
+                    .expect("adaptive samples have a rollback recorder");
+                if valid {
+                    if let Some(stroke) = self.active.as_mut() {
+                        stroke.recorder.absorb_recorder(sample_recorder, mesh);
+                    }
+                } else {
+                    let sample_delta = sample_recorder.finish(mesh);
+                    sample_delta.apply_before(mesh);
+                    self.updated_vertices.clear();
+                    self.mesh_changes = None;
+                    self.error = Some(
+                        "Adaptive topology rejected an invalid local mesh update; the latest brush sample was rolled back"
+                            .to_owned(),
+                    );
+                    changed = false;
+                }
             }
         }
 
@@ -419,20 +472,26 @@ struct PreparedPass {
 struct SampleEdits<'a> {
     affected: &'a mut Vec<u32>,
     original: &'a mut StrokeOriginals,
-    recorder: &'a mut MeshEditRecorder,
+    recorder: Option<&'a mut MeshEditRecorder>,
 }
 
 impl PreparedPass {
-    fn new(mesh: &Mesh, sample: BrushSample, radius: f32) -> Self {
-        Self {
-            vertices: mesh.connected_front_facing_vertices(
-                sample.seed_triangle,
-                sample.center,
-                radius,
-                sample.view_direction,
-            ),
-            sample,
-        }
+    fn new(
+        mesh: &Mesh,
+        sample: BrushSample,
+        radius: f32,
+        traversal: &mut VertexTraversalScratch,
+    ) -> Self {
+        let mut vertices = Vec::new();
+        mesh.connected_front_facing_vertices(
+            sample.seed_triangle,
+            sample.center,
+            radius,
+            sample.view_direction,
+            traversal,
+            &mut vertices,
+        );
+        Self { sample, vertices }
     }
 }
 
@@ -473,7 +532,9 @@ fn apply_pass(
             };
             let next = (before + direction * strength * weight).clamp(0.0, 1.0);
             if next != before {
-                edits.recorder.record_vertex(mesh, vertex);
+                if let Some(recorder) = edits.recorder.as_deref_mut() {
+                    recorder.record_vertex(mesh, vertex);
+                }
                 edits.original.masks.entry(vertex).or_insert(before);
                 mesh.mask[index] = next;
                 edits.affected.push(vertex);
@@ -488,19 +549,21 @@ fn apply_pass(
             continue;
         }
 
-        let mut normal = mesh
-            .normals
-            .get(index)
-            .copied()
-            .unwrap_or(brush_normal)
-            .normalize_or_zero();
-        if normal.dot(brush_normal) < 0.0 {
-            normal = -normal;
-        }
         let displacement = match tool {
             SculptTool::Grab => pass.sample.drag_delta * influence,
             SculptTool::Draw => brush_normal * (direction * radius * 0.15 * influence),
-            SculptTool::Inflate => normal * (direction * radius * 0.15 * influence),
+            SculptTool::Inflate => {
+                let mut normal = mesh
+                    .normals
+                    .get(index)
+                    .copied()
+                    .unwrap_or(brush_normal)
+                    .normalize_or_zero();
+                if normal.dot(brush_normal) < 0.0 {
+                    normal = -normal;
+                }
+                normal * (direction * radius * 0.15 * influence)
+            }
             SculptTool::Smooth => {
                 let Some(neighbors) = mesh.topology.vertex_neighbors.get(index) else {
                     continue;
@@ -533,7 +596,9 @@ fn apply_pass(
         }
         let next = position + displacement;
         if next != mesh.positions[index] {
-            edits.recorder.record_vertex(mesh, vertex);
+            if let Some(recorder) = edits.recorder.as_deref_mut() {
+                recorder.record_vertex(mesh, vertex);
+            }
             edits
                 .original
                 .positions
@@ -571,9 +636,11 @@ fn capture_source_positions(
     mesh: &Mesh,
     tool: SculptTool,
     passes: &[PreparedPass],
-) -> HashMap<u32, Vec3> {
+    source: &mut HashMap<u32, Vec3>,
+) {
     let selected_count = passes.iter().map(|pass| pass.vertices.len()).sum();
-    let mut source = HashMap::with_capacity(selected_count);
+    source.clear();
+    source.reserve(selected_count);
     for pass in passes {
         for &vertex in &pass.vertices {
             if let Some(&position) = mesh.positions.get(vertex as usize) {
@@ -590,7 +657,6 @@ fn capture_source_positions(
             }
         }
     }
-    source
 }
 
 fn triangle_is_near(mesh: &Mesh, triangle: u32, point: Vec3, radius: f32) -> bool {
@@ -607,6 +673,7 @@ fn triangle_is_near(mesh: &Mesh, triangle: u32, point: Vec3, radius: f32) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn grid() -> Mesh {
         let positions = vec![
@@ -866,5 +933,86 @@ mod tests {
             assert_eq!(change.before, before[change.vertex as usize]);
             assert_eq!(change.after, mesh.positions[change.vertex as usize]);
         }
+    }
+
+    #[test]
+    fn fixed_topology_rejects_a_degenerate_position_edit_before_refreshing_derived_data() {
+        let mut mesh = grid();
+        let before_positions = mesh.positions.clone();
+        let before_normals = mesh.normals.clone();
+        let mut settings = test_settings();
+        settings.falloff = 1.0;
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        assert!(!engine.apply_sample(
+            &mut mesh,
+            SculptTool::Pinch,
+            &settings,
+            sample(Vec3::ZERO, 0),
+        ));
+
+        assert_eq!(mesh.positions, before_positions);
+        assert_eq!(mesh.normals, before_normals);
+        assert!(engine.take_updated_vertices().is_empty());
+        assert!(engine.take_mesh_changes().is_none());
+        assert!(engine.take_error().is_some());
+        assert!(engine.end_stroke(&mesh).edit.is_empty());
+    }
+
+    #[test]
+    #[ignore = "release-mode performance envelope"]
+    fn million_face_fixed_and_adaptive_sculpt_samples() {
+        const CELLS: usize = 708;
+        let row = CELLS + 1;
+        let mut positions = Vec::with_capacity(row * row);
+        for y in 0..=CELLS {
+            for x in 0..=CELLS {
+                positions.push(Vec3::new(x as f32, y as f32, 0.0));
+            }
+        }
+        let mut triangles = Vec::with_capacity(CELLS * CELLS * 2);
+        for y in 0..CELLS {
+            for x in 0..CELLS {
+                let a = (y * row + x) as u32;
+                let b = a + 1;
+                let c = a + row as u32;
+                let d = c + 1;
+                triangles.push([a, b, d]);
+                triangles.push([a, d, c]);
+            }
+        }
+        let mut mesh = Mesh::new(positions, triangles).unwrap();
+        let center = Vec3::new(CELLS as f32 * 0.5, CELLS as f32 * 0.5, 0.0);
+        let seed = mesh.nearest_triangle(center).unwrap();
+        let mut settings = BrushSettings {
+            radius: 10.0,
+            strength: 0.1,
+            falloff: 0.15,
+            detail: 0.0,
+            invert: false,
+            symmetry: None,
+        };
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        let fixed_started = Instant::now();
+        assert!(engine.apply_sample(&mut mesh, SculptTool::Draw, &settings, sample(center, seed),));
+        let fixed_elapsed = fixed_started.elapsed();
+        let _ = engine.take_updated_vertices();
+        let _ = engine.end_stroke(&mesh);
+
+        settings.detail = 0.09;
+        let seed = mesh.nearest_triangle(center).unwrap();
+        engine.begin_stroke(&mesh);
+        let adaptive_started = Instant::now();
+        assert!(engine.apply_sample(&mut mesh, SculptTool::Draw, &settings, sample(center, seed),));
+        let adaptive_elapsed = adaptive_started.elapsed();
+        assert!(engine.take_mesh_changes().is_some());
+        let _ = engine.end_stroke(&mesh);
+
+        eprintln!(
+            "million-face sculpt sample: fixed={fixed_elapsed:?}, adaptive={adaptive_elapsed:?}"
+        );
     }
 }

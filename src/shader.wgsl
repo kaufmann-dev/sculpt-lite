@@ -22,6 +22,10 @@ struct VertexOutput {
     @location(2) mask: f32,
 };
 
+struct WireVertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+};
+
 fn safe_normalize(value: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
     let squared_length = dot(value, value);
     // Comparisons against NaN are false, so this also rejects invalid STL
@@ -44,6 +48,13 @@ fn vertex_common(input: VertexInput) -> VertexOutput {
 @vertex
 fn vs_mesh(input: VertexInput) -> VertexOutput {
     return vertex_common(input);
+}
+
+@vertex
+fn vs_wire(input: VertexInput) -> WireVertexOutput {
+    var output: WireVertexOutput;
+    output.clip_position = camera.view_projection * vec4<f32>(input.position, 1.0);
+    return output;
 }
 
 @fragment
@@ -69,8 +80,8 @@ fn fs_solid(input: VertexOutput) -> @location(0) vec4<f32> {
         normal = -normal;
     }
 
-    let camera_right = safe_normalize(camera.camera_right.xyz, vec3<f32>(1.0, 0.0, 0.0));
-    let camera_up = safe_normalize(camera.camera_up.xyz, vec3<f32>(0.0, 1.0, 0.0));
+    let camera_right = camera.camera_right.xyz;
+    let camera_up = camera.camera_up.xyz;
 
     // A camera-relative studio rig keeps the sculpt legible while it rotates:
     // a soft upper-left key, a weaker lower-right fill, and hemispheric fill.
@@ -115,6 +126,6 @@ fn fs_solid(input: VertexOutput) -> @location(0) vec4<f32> {
 }
 
 @fragment
-fn fs_wire(_input: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_wire() -> @location(0) vec4<f32> {
     return vec4<f32>(0.055, 0.065, 0.082, 1.0);
 }

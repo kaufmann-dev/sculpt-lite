@@ -1,6 +1,6 @@
 # SculptLite
 
-SculptLite is a native Linux desktop application for importing, sculpting, and exporting STL meshes. It provides distance-spaced sculpting brushes with optional Airbrush buildup, symmetry, optional adaptive topology, undo and redo, a wireframe overlay, and STL export.
+SculptLite is a native Linux desktop application for importing, sculpting, and exporting STL meshes. It provides responsive distance-spaced sculpting brushes, time-budgeted path processing that preserves captured input, optional Airbrush buildup, symmetry, local adaptive topology, undo and redo, a wireframe overlay, and STL export.
 
 ## Run from source
 
@@ -69,6 +69,14 @@ For a release-binary window smoke check, run:
 ```sh
 cargo build --release
 packaging/linux/smoke-x11.sh target/release/sculpt-lite
+```
+
+Large-mesh performance probes are ignored by the normal test suite. Run them individually in release mode so parallel tests do not distort their timings:
+
+```sh
+cargo test --release --bin sculpt-lite million_face_fixed_and_adaptive_sculpt_samples -- --ignored --nocapture --test-threads=1
+cargo test --release --bin sculpt-lite million_face_mesh_build_pick_and_local_remesh -- --ignored --nocapture --test-threads=1
+cargo test --release --bin sculpt-lite half_million_vertex_deformation_pack -- --ignored --nocapture --test-threads=1
 ```
 
 ## Packages
