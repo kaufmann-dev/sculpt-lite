@@ -1295,7 +1295,8 @@ impl Mesh {
 
     pub(crate) fn faces_have_self_intersections(&self, faces: &[u32]) -> bool {
         let mut candidates = Vec::new();
-        let mut tested = HashSet::new();
+        let mut traversal = Vec::new();
+        let changed = faces.iter().copied().collect::<HashSet<_>>();
         for &face in faces {
             let Some(&triangle) = self.triangles.get(face as usize) else {
                 continue;
@@ -1304,9 +1305,9 @@ impl Mesh {
             candidates.clear();
             self.topology
                 .bvh
-                .faces_overlapping_aabb(min, max, &mut candidates);
+                .faces_overlapping_aabb(min, max, &mut traversal, &mut candidates);
             for &candidate in &candidates {
-                if candidate == face || !tested.insert(edge_key(face, candidate)) {
+                if candidate == face || (candidate < face && changed.contains(&candidate)) {
                     continue;
                 }
                 let Some(&other) = self.triangles.get(candidate as usize) else {
@@ -1337,9 +1338,10 @@ impl Mesh {
         let min = positions[0].min(positions[1]).min(positions[2]);
         let max = positions[0].max(positions[1]).max(positions[2]);
         let mut candidates = Vec::new();
+        let mut traversal = Vec::new();
         self.topology
             .bvh
-            .faces_overlapping_aabb(min, max, &mut candidates);
+            .faces_overlapping_aabb(min, max, &mut traversal, &mut candidates);
         candidates.into_iter().any(|face| {
             if excluded_faces.contains(&face) {
                 return false;
@@ -1825,6 +1827,7 @@ impl Mesh {
 
         let mut blocked = HashSet::new();
         let mut selected = Vec::new();
+        let mut replacement_faces = Vec::<([u32; 3], [Vec3; 3])>::new();
         for ((keep, remove), _) in candidates {
             if selected.len() == limit {
                 break;
@@ -1835,7 +1838,26 @@ impl Mesh {
             {
                 continue;
             }
+            let candidate_replacements = self.collapse_replacement_faces(keep, remove);
+            let intersects_replacement =
+                candidate_replacements
+                    .iter()
+                    .any(|(candidate, candidate_positions)| {
+                        replacement_faces
+                            .iter()
+                            .any(|(replacement, replacement_positions)| {
+                                !candidate.iter().any(|vertex| replacement.contains(vertex))
+                                    && triangles_intersect(
+                                        *candidate_positions,
+                                        *replacement_positions,
+                                    )
+                            })
+                    });
+            if intersects_replacement {
+                continue;
+            }
             selected.push((keep, remove));
+            replacement_faces.extend(candidate_replacements);
             blocked.insert(keep);
             blocked.insert(remove);
             for &neighbor in self.topology.vertex_neighbors[keep as usize]
@@ -1894,6 +1916,44 @@ impl Mesh {
         }
         self.finish_local_changes(changes);
         selected.len()
+    }
+
+    fn collapse_replacement_faces(&self, keep: u32, remove: u32) -> Vec<([u32; 3], [Vec3; 3])> {
+        let merged_position =
+            self.positions[keep as usize].midpoint(self.positions[remove as usize]);
+        let mut incident = self.topology.vertex_triangles[keep as usize].clone();
+        incident.extend(
+            self.topology.vertex_triangles[remove as usize]
+                .iter()
+                .copied(),
+        );
+        incident.sort_unstable();
+        incident.dedup();
+        incident
+            .into_iter()
+            .filter_map(|face| {
+                let mut replacement = self.triangles[face as usize];
+                for vertex in &mut replacement {
+                    if *vertex == remove {
+                        *vertex = keep;
+                    }
+                }
+                if replacement[0] == replacement[1]
+                    || replacement[1] == replacement[2]
+                    || replacement[2] == replacement[0]
+                {
+                    return None;
+                }
+                let positions = replacement.map(|vertex| {
+                    if vertex == keep {
+                        merged_position
+                    } else {
+                        self.positions[vertex as usize]
+                    }
+                });
+                Some((replacement, positions))
+            })
+            .collect()
     }
 
     fn collapse_candidate_is_safe(&self, keep: u32, remove: u32) -> bool {
@@ -2036,22 +2096,24 @@ impl Mesh {
                     .min(triangle_quality(&self.positions, second));
                 let (new_first, new_second) = flipped_triangles(first, second, a, b, c, d)?;
                 let excluded_faces = HashSet::from([faces[0], faces[1]]);
+                let preserves_surface =
+                    coplanar_flip_preserves_surface(&self.positions, a, b, c, d);
                 let new_quality = triangle_quality(&self.positions, new_first)
                     .min(triangle_quality(&self.positions, new_second));
                 let improvement = new_quality - old_quality;
                 if improvement <= 1.0e-4
                     || !triangle_is_valid(&self.positions, new_first)
                     || !triangle_is_valid(&self.positions, new_second)
-                    || self.replacement_triangle_intersects_mesh(
-                        new_first,
-                        new_first.map(|vertex| self.positions[vertex as usize]),
-                        &excluded_faces,
-                    )
-                    || self.replacement_triangle_intersects_mesh(
-                        new_second,
-                        new_second.map(|vertex| self.positions[vertex as usize]),
-                        &excluded_faces,
-                    )
+                    || (!preserves_surface
+                        && (self.replacement_triangle_intersects_mesh(
+                            new_first,
+                            new_first.map(|vertex| self.positions[vertex as usize]),
+                            &excluded_faces,
+                        ) || self.replacement_triangle_intersects_mesh(
+                            new_second,
+                            new_second.map(|vertex| self.positions[vertex as usize]),
+                            &excluded_faces,
+                        )))
                 {
                     return None;
                 }
@@ -2670,12 +2732,19 @@ impl MeshBvh {
         best_triangle
     }
 
-    fn faces_overlapping_aabb(&self, min: Vec3, max: Vec3, result: &mut Vec<u32>) {
+    fn faces_overlapping_aabb(
+        &self,
+        min: Vec3,
+        max: Vec3,
+        traversal: &mut Vec<u32>,
+        result: &mut Vec<u32>,
+    ) {
         if self.root == u32::MAX {
             return;
         }
-        let mut stack = Vec::from([self.root]);
-        while let Some(node_index) = stack.pop() {
+        traversal.clear();
+        traversal.push(self.root);
+        while let Some(node_index) = traversal.pop() {
             let node = self.nodes[node_index as usize];
             if !aabbs_overlap(min, max, node.min, node.max) {
                 continue;
@@ -2683,8 +2752,8 @@ impl MeshBvh {
             if node.is_leaf() {
                 result.extend(self.leaf_faces[node.leaf as usize].iter().copied());
             } else {
-                stack.push(node.left);
-                stack.push(node.right);
+                traversal.push(node.left);
+                traversal.push(node.right);
             }
         }
     }
@@ -2912,6 +2981,27 @@ fn flipped_triangles(
         }
     }
     None
+}
+
+fn coplanar_flip_preserves_surface(positions: &[Vec3], a: u32, b: u32, c: u32, d: u32) -> bool {
+    let [a, b, c, d] = [a, b, c, d].map(|vertex| positions[vertex as usize]);
+    let normal = (b - a).cross(c - a);
+    let scale = a
+        .distance(b)
+        .max(a.distance(c))
+        .max(a.distance(d))
+        .max(b.distance(c))
+        .max(b.distance(d))
+        .max(c.distance(d));
+    let epsilon = normal.length() * scale * 1.0e-5;
+    if epsilon <= f32::EPSILON || normal.dot(d - a).abs() > epsilon {
+        return false;
+    }
+    let c_side = normal.dot((b - a).cross(c - a));
+    let d_side = normal.dot((b - a).cross(d - a));
+    let a_side = normal.dot((d - c).cross(a - c));
+    let b_side = normal.dot((d - c).cross(b - c));
+    c_side * d_side < 0.0 && a_side * b_side < 0.0
 }
 
 fn triangle_quality(positions: &[Vec3], triangle: [u32; 3]) -> f32 {
@@ -3763,6 +3853,23 @@ mod tests {
         );
         assert!(stats.flips > 0);
         mesh.validate().unwrap();
+    }
+
+    #[test]
+    fn only_coplanar_convex_flips_skip_remote_collision_queries() {
+        let mut positions = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ];
+        assert!(coplanar_flip_preserves_surface(&positions, 0, 1, 2, 3));
+
+        positions[3].z = 0.1;
+        assert!(!coplanar_flip_preserves_surface(&positions, 0, 1, 2, 3));
+
+        positions[3] = Vec3::new(0.75, 0.25, 0.0);
+        assert!(!coplanar_flip_preserves_surface(&positions, 0, 1, 2, 3));
     }
 
     #[test]

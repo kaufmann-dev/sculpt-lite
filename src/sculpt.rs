@@ -14,6 +14,8 @@ use crate::{
 
 const MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB: usize = 512;
 const MAX_ADAPTIVE_REMESH_ITERATIONS: u32 = 8;
+const ADAPTIVE_SPLIT_THRESHOLD: f32 = 2.0;
+const ADAPTIVE_COLLAPSE_THRESHOLD: f32 = 0.5;
 const SAFE_DEFORMATION_SEARCH_STEPS: usize = 6;
 const MIN_SAFE_DEFORMATION_FACTOR: f32 = 1.0 / 64.0;
 
@@ -312,29 +314,51 @@ impl SculptEngine {
             .remesh_target_edge_length
             .filter(|target| target.is_finite() && *target > 0.0);
         let adaptive = tool != SculptTool::Mask && target_edge_length.is_some();
+        let mut initial_passes = SmallVec::<[PreparedPass; 2]>::new();
+        if adaptive {
+            for &brush_sample in &samples {
+                initial_passes.push(PreparedPass::new(
+                    mesh,
+                    brush_sample,
+                    settings.radius,
+                    &mut self.traversal,
+                ));
+            }
+        }
         let mut topology_recorder = adaptive.then(|| MeshEditRecorder::new(mesh));
         let mut topology_changes = MeshChangeSet::default();
         let mut topology_edits = 0;
 
         if let (Some(target), Some(recorder)) = (target_edge_length, topology_recorder.as_mut()) {
-            for brush_sample in &samples {
-                let seed = mesh
-                    .nearest_triangle(brush_sample.center)
-                    .unwrap_or(brush_sample.seed_triangle);
-                let active = mesh.brush_remesh_vertices(
-                    seed,
-                    brush_sample.center,
-                    settings.radius,
-                    target,
-                    brush_sample.view_direction,
-                );
+            for (brush_sample, initial_pass) in samples.iter().zip(&initial_passes) {
+                let needs_support = initial_pass.vertices.is_empty();
+                let active = if needs_support {
+                    let seed = mesh
+                        .nearest_triangle(brush_sample.center)
+                        .unwrap_or(brush_sample.seed_triangle);
+                    mesh.brush_remesh_vertices(
+                        seed,
+                        brush_sample.center,
+                        settings.radius,
+                        target,
+                        brush_sample.view_direction,
+                    )
+                } else {
+                    initial_pass.vertices.clone()
+                };
                 let remaining = MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB.saturating_sub(topology_edits);
                 if active.is_empty() || remaining == 0 {
                     continue;
                 }
                 let mut remesh = RemeshSettings::new(target);
-                remesh.iterations = MAX_ADAPTIVE_REMESH_ITERATIONS;
+                remesh.iterations = if needs_support {
+                    MAX_ADAPTIVE_REMESH_ITERATIONS
+                } else {
+                    1
+                };
                 remesh.max_topology_edits = remaining;
+                remesh.split_threshold = ADAPTIVE_SPLIT_THRESHOLD;
+                remesh.collapse_threshold = ADAPTIVE_COLLAPSE_THRESHOLD;
                 remesh.relaxation = 0.0;
                 let outcome = mesh.remesh_region(&active, remesh, recorder);
                 topology_edits +=
@@ -343,9 +367,7 @@ impl SculptEngine {
             }
 
             let topology_valid = mesh.local_changes_are_valid(&topology_changes);
-            let topology_intersects =
-                mesh.faces_have_self_intersections(&topology_changes.dirty_faces);
-            if !topology_valid || topology_intersects {
+            if !topology_valid {
                 topology_recorder
                     .take()
                     .expect("adaptive samples have a topology recorder")
@@ -1161,6 +1183,45 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_topology_keeps_edges_that_are_already_usable() {
+        let mut mesh = Mesh::new(
+            vec![
+                Vec3::X,
+                Vec3::Y,
+                Vec3::NEG_X,
+                Vec3::NEG_Y,
+                Vec3::Z,
+                Vec3::NEG_Z,
+            ],
+            vec![
+                [4, 0, 1],
+                [4, 1, 2],
+                [4, 2, 3],
+                [4, 3, 0],
+                [5, 1, 0],
+                [5, 2, 1],
+                [5, 3, 2],
+                [5, 0, 3],
+            ],
+        )
+        .unwrap();
+        let mut settings = test_settings();
+        settings.radius = 2.0;
+        settings.remesh_target_edge_length = Some(0.8);
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &settings,
+            sample(Vec3::splat(1.0 / 3.0), 0),
+        ));
+        assert_eq!(mesh.positions.len(), 6);
+        assert_eq!(mesh.triangles.len(), 8);
+    }
+
+    #[test]
     fn stroke_records_each_original_vertex_once_across_samples() {
         let mut mesh = grid();
         let before = mesh.positions.clone();
@@ -1297,6 +1358,10 @@ mod tests {
         let adaptive_started = Instant::now();
         assert!(engine.apply_sample(&mut mesh, SculptTool::Draw, &settings, sample(center, seed),));
         let adaptive_elapsed = adaptive_started.elapsed();
+        assert!(
+            adaptive_elapsed < std::time::Duration::from_millis(8),
+            "million-face adaptive sample exceeded one frame: {adaptive_elapsed:?}"
+        );
         assert!(engine.take_mesh_changes().is_some());
         let _ = engine.end_stroke(&mesh);
 
