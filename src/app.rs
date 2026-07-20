@@ -37,6 +37,7 @@ struct SculptInput {
     tool: SculptTool,
     brush: BrushSettings,
     adaptive_topology: bool,
+    adaptive_detail: f32,
     radius_points: f32,
 }
 
@@ -79,7 +80,12 @@ const DEFAULT_AIRBRUSH_DABS_PER_SECOND: f32 = 10.0;
 const MIN_AIRBRUSH_DABS_PER_SECOND: f32 = 2.0;
 const MAX_AIRBRUSH_DABS_PER_SECOND: f32 = 30.0;
 const BRUSH_SPACING_RADIUS_FRACTION: f32 = 0.15;
+const DEFAULT_ADAPTIVE_DETAIL: f32 = 0.12;
 const SCULPT_FRAME_BUDGET: Duration = Duration::from_millis(8);
+
+fn adaptive_target_edge_length(radius: f32, detail: f32, units_per_point: f32) -> f32 {
+    (radius * detail.clamp(0.03, 0.35)).max(units_per_point)
+}
 
 struct MeshDocument {
     mesh: Option<Mesh>,
@@ -336,6 +342,7 @@ pub struct SculptLiteApp {
     tool: SculptTool,
     brush: BrushSettings,
     adaptive_topology: bool,
+    adaptive_detail: f32,
     airbrush: bool,
     airbrush_dabs_per_second: f32,
     brush_radius_points: f32,
@@ -385,6 +392,7 @@ impl SculptLiteApp {
             tool: SculptTool::default(),
             brush: BrushSettings::default(),
             adaptive_topology: false,
+            adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             airbrush: false,
             airbrush_dabs_per_second: DEFAULT_AIRBRUSH_DABS_PER_SECOND,
             brush_radius_points: INITIAL_BRUSH_RADIUS_POINTS,
@@ -1084,7 +1092,7 @@ impl SculptLiteApp {
                             ui.small("Updates topology continuously inside the brush region.");
                             ui.label("Detail");
                             ui.add(
-                                egui::Slider::new(&mut self.brush.detail, 0.03..=0.35)
+                                egui::Slider::new(&mut self.adaptive_detail, 0.03..=0.35)
                                     .logarithmic(true),
                             );
                         }
@@ -1425,6 +1433,7 @@ impl SculptLiteApp {
             tool: self.tool,
             brush: self.brush,
             adaptive_topology: self.adaptive_topology,
+            adaptive_detail: self.adaptive_detail,
             radius_points: self.brush_radius_points,
         }
     }
@@ -1536,7 +1545,13 @@ impl SculptLiteApp {
         let mut settings = input.brush;
         settings.radius = input.radius_points * units_per_point;
         if effective_tool == SculptTool::Mask || !input.adaptive_topology {
-            settings.detail = 0.0;
+            settings.remesh_target_edge_length = None;
+        } else {
+            settings.remesh_target_edge_length = Some(adaptive_target_edge_length(
+                settings.radius,
+                input.adaptive_detail,
+                units_per_point,
+            ));
         }
         let sample = BrushSample::from_hit(
             &hit,
@@ -1556,6 +1571,9 @@ impl SculptLiteApp {
         let mesh_changes = self.sculpt.take_mesh_changes();
         if let Some(error) = self.sculpt.take_error() {
             self.error = Some(error);
+        }
+        if let Some(warning) = self.sculpt.take_warning() {
+            self.status = warning;
         }
         if changed {
             if let Some(document) = self.document.as_mut() {
@@ -1718,6 +1736,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn adaptive_target_never_creates_subpoint_edges() {
+        let units_per_point = 0.25;
+        let radius = MIN_BRUSH_RADIUS_POINTS * units_per_point;
+
+        assert_eq!(
+            adaptive_target_edge_length(radius, 0.03, units_per_point),
+            units_per_point
+        );
+        assert_eq!(
+            adaptive_target_edge_length(radius * 100.0, 0.12, units_per_point),
+            radius * 12.0
+        );
+    }
+
+    #[test]
     fn grouped_formats_face_counts() {
         assert_eq!(grouped(0), "0");
         assert_eq!(grouped(999), "999");
@@ -1775,6 +1808,7 @@ mod tests {
             tool: SculptTool::Draw,
             brush: BrushSettings::default(),
             adaptive_topology: true,
+            adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             radius_points: 55.0,
         };
         let mut sampler =

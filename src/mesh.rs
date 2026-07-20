@@ -64,6 +64,7 @@ pub struct RayHit {
 pub struct RemeshSettings {
     pub target_edge_length: f32,
     pub iterations: u32,
+    pub max_topology_edits: usize,
     pub split_threshold: f32,
     pub collapse_threshold: f32,
     pub enable_flips: bool,
@@ -84,6 +85,7 @@ impl Default for RemeshSettings {
         Self {
             target_edge_length: 1.0,
             iterations: 1,
+            max_topology_edits: usize::MAX,
             split_threshold: 4.0 / 3.0,
             collapse_threshold: 0.7,
             enable_flips: true,
@@ -1291,6 +1293,71 @@ impl Mesh {
                 .all(|edge| !self.topology.edge_faces.contains_key(edge))
     }
 
+    pub(crate) fn faces_have_self_intersections(&self, faces: &[u32]) -> bool {
+        let mut candidates = Vec::new();
+        let mut tested = HashSet::new();
+        for &face in faces {
+            let Some(&triangle) = self.triangles.get(face as usize) else {
+                continue;
+            };
+            let (min, max) = triangle_bounds(&self.positions, triangle);
+            candidates.clear();
+            self.topology
+                .bvh
+                .faces_overlapping_aabb(min, max, &mut candidates);
+            for &candidate in &candidates {
+                if candidate == face || !tested.insert(edge_key(face, candidate)) {
+                    continue;
+                }
+                let Some(&other) = self.triangles.get(candidate as usize) else {
+                    continue;
+                };
+                if triangle
+                    .iter()
+                    .any(|vertex| other.iter().any(|other_vertex| other_vertex == vertex))
+                {
+                    continue;
+                }
+                let first = triangle.map(|vertex| self.positions[vertex as usize]);
+                let second = other.map(|vertex| self.positions[vertex as usize]);
+                if triangles_intersect(first, second) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn replacement_triangle_intersects_mesh(
+        &self,
+        triangle: [u32; 3],
+        positions: [Vec3; 3],
+        excluded_faces: &HashSet<u32>,
+    ) -> bool {
+        let min = positions[0].min(positions[1]).min(positions[2]);
+        let max = positions[0].max(positions[1]).max(positions[2]);
+        let mut candidates = Vec::new();
+        self.topology
+            .bvh
+            .faces_overlapping_aabb(min, max, &mut candidates);
+        candidates.into_iter().any(|face| {
+            if excluded_faces.contains(&face) {
+                return false;
+            }
+            let other = self.triangles[face as usize];
+            if triangle
+                .iter()
+                .any(|vertex| other.iter().any(|other_vertex| other_vertex == vertex))
+            {
+                return false;
+            }
+            triangles_intersect(
+                positions,
+                other.map(|vertex| self.positions[vertex as usize]),
+            )
+        })
+    }
+
     fn classify_vertex(&self, vertex: u32) -> (bool, bool) {
         let index = vertex as usize;
         let incident = &self.topology.vertex_triangles[index];
@@ -1459,6 +1526,75 @@ impl Mesh {
         }
     }
 
+    pub(crate) fn brush_remesh_vertices(
+        &self,
+        seed_triangle: u32,
+        center: Vec3,
+        radius: f32,
+        target_edge_length: f32,
+        view_direction: Vec3,
+    ) -> Vec<u32> {
+        let Some(&seed) = self.triangles.get(seed_triangle as usize) else {
+            return Vec::new();
+        };
+        if !center.is_finite()
+            || !radius.is_finite()
+            || radius <= 0.0
+            || !target_edge_length.is_finite()
+            || target_edge_length <= 0.0
+        {
+            return Vec::new();
+        }
+
+        let view = view_direction.try_normalize();
+        let seed_cross = triangle_cross(&self.positions, seed);
+        let seed_faces_toward_view = view.is_some_and(|direction| seed_cross.dot(direction) > 0.0);
+        let reach_squared = (radius + target_edge_length * 2.0).powi(2);
+        let mut queued = HashSet::new();
+        queued.insert(seed_triangle);
+        let mut queue = VecDeque::from([seed_triangle]);
+        let mut vertices = HashSet::new();
+
+        while let Some(face) = queue.pop_front() {
+            let Some(&triangle) = self.triangles.get(face as usize) else {
+                continue;
+            };
+            let positions = triangle.map(|vertex| self.positions[vertex as usize]);
+            if face != seed_triangle
+                && point_triangle_distance_squared(center, positions) > reach_squared
+            {
+                continue;
+            }
+            let cross = (positions[1] - positions[0]).cross(positions[2] - positions[0]);
+            let front_facing = view.is_none_or(|direction| {
+                if seed_faces_toward_view {
+                    cross.dot(direction) >= 0.0
+                } else {
+                    cross.dot(direction) <= 0.0
+                }
+            });
+            if !front_facing {
+                continue;
+            }
+
+            vertices.extend(triangle);
+            for edge_index in 0..3 {
+                let edge = edge_key(triangle[edge_index], triangle[(edge_index + 1) % 3]);
+                if let Some(adjacent) = self.topology.edge_faces.get(&edge) {
+                    for &neighbor in adjacent {
+                        if queued.insert(neighbor) {
+                            queue.push_back(neighbor);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut vertices = vertices.into_iter().collect::<Vec<_>>();
+        vertices.sort_unstable();
+        vertices
+    }
+
     pub fn remesh_region(
         &mut self,
         vertices: &[u32],
@@ -1500,20 +1636,31 @@ impl Mesh {
         let mut changes = MeshChangeSet::default();
 
         for _ in 0..settings.iterations {
+            if stats.splits + stats.collapses + stats.flips >= settings.max_topology_edits {
+                break;
+            }
             stats.iterations += 1;
             let mut phase_changes = MeshChangeSet::default();
+            let remaining = settings
+                .max_topology_edits
+                .saturating_sub(stats.splits + stats.collapses + stats.flips);
             stats.splits += self.split_active_edges_batch(
                 &mut active,
                 split_length,
+                remaining,
                 recorder,
                 &mut phase_changes,
             );
             changes.merge(phase_changes);
 
             let mut phase_changes = MeshChangeSet::default();
+            let remaining = settings
+                .max_topology_edits
+                .saturating_sub(stats.splits + stats.collapses + stats.flips);
             stats.collapses += self.collapse_active_edges_batch(
                 &mut active,
                 collapse_length,
+                remaining,
                 recorder,
                 &mut phase_changes,
             );
@@ -1521,7 +1668,11 @@ impl Mesh {
 
             if settings.enable_flips {
                 let mut phase_changes = MeshChangeSet::default();
-                stats.flips += self.flip_active_edges_batch(&active, recorder, &mut phase_changes);
+                let remaining = settings
+                    .max_topology_edits
+                    .saturating_sub(stats.splits + stats.collapses + stats.flips);
+                stats.flips +=
+                    self.flip_active_edges_batch(&active, remaining, recorder, &mut phase_changes);
                 changes.merge(phase_changes);
             }
 
@@ -1549,6 +1700,7 @@ impl Mesh {
         &mut self,
         active: &mut HashSet<u32>,
         threshold: f32,
+        limit: usize,
         recorder: &mut MeshEditRecorder,
         changes: &mut MeshChangeSet,
     ) -> usize {
@@ -1584,6 +1736,9 @@ impl Mesh {
         let mut used_faces = HashSet::new();
         let mut selected = Vec::new();
         for (edge, faces, _) in candidates {
+            if selected.len() == limit {
+                break;
+            }
             if faces.iter().any(|face| used_faces.contains(face)) {
                 continue;
             }
@@ -1640,6 +1795,7 @@ impl Mesh {
         &mut self,
         active: &mut HashSet<u32>,
         threshold: f32,
+        limit: usize,
         recorder: &mut MeshEditRecorder,
         changes: &mut MeshChangeSet,
     ) -> usize {
@@ -1670,6 +1826,9 @@ impl Mesh {
         let mut blocked = HashSet::new();
         let mut selected = Vec::new();
         for ((keep, remove), _) in candidates {
+            if selected.len() == limit {
+                break;
+            }
             if blocked.contains(&keep)
                 || blocked.contains(&remove)
                 || !self.collapse_candidate_is_safe(keep, remove)
@@ -1796,6 +1955,7 @@ impl Mesh {
         );
         incident.sort_unstable();
         incident.dedup();
+        let excluded_faces = incident.iter().copied().collect::<HashSet<_>>();
         for face in incident {
             let triangle = self.triangles[face as usize];
             let old_positions = triangle.map(|index| self.positions[index as usize]);
@@ -1828,6 +1988,13 @@ impl Mesh {
             if old_normal.dot(new_normal) <= 0.0 {
                 return false;
             }
+            if self.replacement_triangle_intersects_mesh(
+                replacement,
+                new_positions,
+                &excluded_faces,
+            ) {
+                return false;
+            }
         }
         true
     }
@@ -1836,6 +2003,7 @@ impl Mesh {
     fn flip_active_edges_batch(
         &mut self,
         active: &HashSet<u32>,
+        limit: usize,
         recorder: &mut MeshEditRecorder,
         changes: &mut MeshChangeSet,
     ) -> usize {
@@ -1867,12 +2035,23 @@ impl Mesh {
                 let old_quality = triangle_quality(&self.positions, first)
                     .min(triangle_quality(&self.positions, second));
                 let (new_first, new_second) = flipped_triangles(first, second, a, b, c, d)?;
+                let excluded_faces = HashSet::from([faces[0], faces[1]]);
                 let new_quality = triangle_quality(&self.positions, new_first)
                     .min(triangle_quality(&self.positions, new_second));
                 let improvement = new_quality - old_quality;
                 if improvement <= 1.0e-4
                     || !triangle_is_valid(&self.positions, new_first)
                     || !triangle_is_valid(&self.positions, new_second)
+                    || self.replacement_triangle_intersects_mesh(
+                        new_first,
+                        new_first.map(|vertex| self.positions[vertex as usize]),
+                        &excluded_faces,
+                    )
+                    || self.replacement_triangle_intersects_mesh(
+                        new_second,
+                        new_second.map(|vertex| self.positions[vertex as usize]),
+                        &excluded_faces,
+                    )
                 {
                     return None;
                 }
@@ -1898,15 +2077,32 @@ impl Mesh {
 
         let mut used_faces = HashSet::new();
         let mut new_edges = HashSet::new();
+        let mut replacement_faces = Vec::<[u32; 3]>::new();
         let mut flip_count = 0;
         for (faces, new_edge, first, second, _) in candidates {
-            if faces.iter().any(|face| used_faces.contains(face)) || !new_edges.insert(new_edge) {
+            if flip_count == limit {
+                break;
+            }
+            let intersects_replacement = [first, second].into_iter().any(|candidate| {
+                replacement_faces.iter().any(|replacement| {
+                    !candidate.iter().any(|vertex| replacement.contains(vertex))
+                        && triangles_intersect(
+                            candidate.map(|vertex| self.positions[vertex as usize]),
+                            replacement.map(|vertex| self.positions[vertex as usize]),
+                        )
+                })
+            });
+            if faces.iter().any(|face| used_faces.contains(face))
+                || !new_edges.insert(new_edge)
+                || intersects_replacement
+            {
                 continue;
             }
             used_faces.insert(faces[0]);
             used_faces.insert(faces[1]);
             self.replace_face_local(faces[0], first, recorder, changes);
             self.replace_face_local(faces[1], second, recorder, changes);
+            replacement_faces.extend([first, second]);
             flip_count += 1;
         }
         if flip_count != 0 {
@@ -2473,6 +2669,25 @@ impl MeshBvh {
         }
         best_triangle
     }
+
+    fn faces_overlapping_aabb(&self, min: Vec3, max: Vec3, result: &mut Vec<u32>) {
+        if self.root == u32::MAX {
+            return;
+        }
+        let mut stack = Vec::from([self.root]);
+        while let Some(node_index) = stack.pop() {
+            let node = self.nodes[node_index as usize];
+            if !aabbs_overlap(min, max, node.min, node.max) {
+                continue;
+            }
+            if node.is_leaf() {
+                result.extend(self.leaf_faces[node.leaf as usize].iter().copied());
+            } else {
+                stack.push(node.left);
+                stack.push(node.right);
+            }
+        }
+    }
 }
 
 fn editing_capacity(len: usize) -> usize {
@@ -2718,6 +2933,152 @@ fn triangle_centroid(positions: &[Vec3], triangle: [u32; 3]) -> Vec3 {
 fn triangle_bounds(positions: &[Vec3], triangle: [u32; 3]) -> (Vec3, Vec3) {
     let [a, b, c] = triangle.map(|index| positions[index as usize]);
     (a.min(b).min(c), a.max(b).max(c))
+}
+
+fn aabbs_overlap(first_min: Vec3, first_max: Vec3, second_min: Vec3, second_max: Vec3) -> bool {
+    first_min.cmple(second_max).all() && second_min.cmple(first_max).all()
+}
+
+fn triangles_intersect(first: [Vec3; 3], second: [Vec3; 3]) -> bool {
+    let first_normal = (first[1] - first[0]).cross(first[2] - first[0]);
+    let second_normal = (second[1] - second[0]).cross(second[2] - second[0]);
+    let min = first
+        .into_iter()
+        .chain(second)
+        .fold(Vec3::splat(f32::INFINITY), Vec3::min);
+    let max = first
+        .into_iter()
+        .chain(second)
+        .fold(Vec3::splat(f32::NEG_INFINITY), Vec3::max);
+    let epsilon = (max - min).max_element().max(f32::EPSILON) * 1.0e-6;
+    let normals_cross = first_normal.cross(second_normal).length_squared();
+    let parallel_limit = first_normal.length_squared() * second_normal.length_squared() * 1.0e-10;
+    if normals_cross <= parallel_limit {
+        let first_length = first_normal.length();
+        if first_length <= epsilon
+            || second
+                .iter()
+                .any(|point| first_normal.dot(*point - first[0]).abs() > epsilon * first_length)
+        {
+            return false;
+        }
+        return coplanar_triangles_intersect(first, second, first_normal, epsilon);
+    }
+
+    for index in 0..3 {
+        if segment_intersects_triangle(first[index], first[(index + 1) % 3], second, epsilon)
+            || segment_intersects_triangle(second[index], second[(index + 1) % 3], first, epsilon)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn segment_intersects_triangle(start: Vec3, end: Vec3, triangle: [Vec3; 3], epsilon: f32) -> bool {
+    let direction = end - start;
+    let edge_a = triangle[1] - triangle[0];
+    let edge_b = triangle[2] - triangle[0];
+    let cross = direction.cross(edge_b);
+    let determinant = edge_a.dot(cross);
+    let determinant_epsilon = direction.length() * edge_a.length() * edge_b.length() * 1.0e-6;
+    if determinant.abs() <= determinant_epsilon {
+        return false;
+    }
+    let inverse = determinant.recip();
+    let offset = start - triangle[0];
+    let u = offset.dot(cross) * inverse;
+    if !(-1.0e-6..=1.0 + 1.0e-6).contains(&u) {
+        return false;
+    }
+    let cross = offset.cross(edge_a);
+    let v = direction.dot(cross) * inverse;
+    if v < -1.0e-6 || u + v > 1.0 + 1.0e-6 {
+        return false;
+    }
+    let distance = edge_b.dot(cross) * inverse;
+    let parameter_epsilon = epsilon / direction.length().max(epsilon);
+    distance >= -parameter_epsilon && distance <= 1.0 + parameter_epsilon
+}
+
+fn coplanar_triangles_intersect(
+    first: [Vec3; 3],
+    second: [Vec3; 3],
+    normal: Vec3,
+    epsilon: f32,
+) -> bool {
+    let axis = {
+        let absolute = normal.abs();
+        if absolute.x >= absolute.y && absolute.x >= absolute.z {
+            0
+        } else if absolute.y >= absolute.z {
+            1
+        } else {
+            2
+        }
+    };
+    let project = |point: Vec3| match axis {
+        0 => glam::Vec2::new(point.y, point.z),
+        1 => glam::Vec2::new(point.x, point.z),
+        _ => glam::Vec2::new(point.x, point.y),
+    };
+    let first = first.map(project);
+    let second = second.map(project);
+    for first_edge in 0..3 {
+        for second_edge in 0..3 {
+            if segments_intersect_2d(
+                first[first_edge],
+                first[(first_edge + 1) % 3],
+                second[second_edge],
+                second[(second_edge + 1) % 3],
+                epsilon,
+            ) {
+                return true;
+            }
+        }
+    }
+    point_in_triangle_2d(first[0], second, epsilon)
+        || point_in_triangle_2d(second[0], first, epsilon)
+}
+
+fn cross_2d(left: glam::Vec2, right: glam::Vec2) -> f32 {
+    left.x * right.y - left.y * right.x
+}
+
+fn segments_intersect_2d(
+    first_a: glam::Vec2,
+    first_b: glam::Vec2,
+    second_a: glam::Vec2,
+    second_b: glam::Vec2,
+    epsilon: f32,
+) -> bool {
+    let first_direction = first_b - first_a;
+    let second_direction = second_b - second_a;
+    let denominator = cross_2d(first_direction, second_direction);
+    let offset = second_a - first_a;
+    if denominator.abs() <= epsilon {
+        if cross_2d(offset, first_direction).abs() > epsilon {
+            return false;
+        }
+        let denominator = first_direction.length_squared();
+        if denominator <= epsilon * epsilon {
+            return first_a.distance_squared(second_a) <= epsilon * epsilon;
+        }
+        let first = offset.dot(first_direction) / denominator;
+        let second = (second_b - first_a).dot(first_direction) / denominator;
+        return first.min(second) <= 1.0 + epsilon && first.max(second) >= -epsilon;
+    }
+    let first = cross_2d(offset, second_direction) / denominator;
+    let second = cross_2d(offset, first_direction) / denominator;
+    first >= -epsilon && first <= 1.0 + epsilon && second >= -epsilon && second <= 1.0 + epsilon
+}
+
+fn point_in_triangle_2d(point: glam::Vec2, triangle: [glam::Vec2; 3], epsilon: f32) -> bool {
+    let first = cross_2d(triangle[1] - triangle[0], point - triangle[0]);
+    let second = cross_2d(triangle[2] - triangle[1], point - triangle[1]);
+    let third = cross_2d(triangle[0] - triangle[2], point - triangle[2]);
+    (first >= -epsilon && second >= -epsilon && third >= -epsilon)
+        || (first <= epsilon && second <= epsilon && third <= epsilon)
 }
 
 fn aabb_area(min: Vec3, max: Vec3) -> f32 {
@@ -3227,6 +3588,55 @@ mod tests {
     }
 
     #[test]
+    fn remesh_respects_the_topology_edit_budget() {
+        let mut mesh = octahedron();
+        let active = (0..mesh.positions.len() as u32).collect::<Vec<_>>();
+        let stats = remesh(
+            &mut mesh,
+            &active,
+            RemeshSettings {
+                target_edge_length: 0.1,
+                iterations: 8,
+                max_topology_edits: 5,
+                enable_flips: true,
+                relaxation: 0.0,
+                ..RemeshSettings::default()
+            },
+        );
+
+        let edits = stats.splits + stats.collapses + stats.flips;
+        assert!(edits > 0);
+        assert!(edits <= 5);
+        mesh.validate().unwrap();
+    }
+
+    #[test]
+    fn local_intersection_query_detects_crossing_disconnected_faces() {
+        let mesh = Mesh::new(
+            vec![
+                Vec3::new(-1.0, 0.0, 0.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, -0.5, -1.0),
+                Vec3::new(0.0, 0.5, 1.0),
+                Vec3::new(0.0, 0.5, -1.0),
+            ],
+            vec![[0, 1, 2], [3, 4, 5]],
+        )
+        .unwrap();
+
+        assert!(mesh.faces_have_self_intersections(&[0]));
+        assert!(!triangles_intersect(
+            [Vec3::ZERO, Vec3::X, Vec3::Y],
+            [
+                Vec3::new(3.0, 0.0, 0.0),
+                Vec3::new(4.0, 0.0, 0.0),
+                Vec3::new(3.0, 1.0, 0.0),
+            ],
+        ));
+    }
+
+    #[test]
     fn first_closed_mesh_split_uses_preallocated_topology_maps() {
         let mut mesh = octahedron();
         let edge_capacity = mesh.topology.edge_faces.capacity();
@@ -3344,6 +3754,7 @@ mod tests {
             RemeshSettings {
                 target_edge_length: 1.0,
                 iterations: 1,
+                max_topology_edits: usize::MAX,
                 split_threshold: 10.0,
                 collapse_threshold: 0.01,
                 enable_flips: true,
@@ -3426,6 +3837,7 @@ mod tests {
             RemeshSettings {
                 target_edge_length: 1.0,
                 iterations: 1,
+                max_topology_edits: usize::MAX,
                 split_threshold: 10.0,
                 collapse_threshold: 0.01,
                 enable_flips: false,
