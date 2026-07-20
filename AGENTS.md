@@ -1,8 +1,8 @@
 # Repository Instructions
 
-## Required local installation
+## Local user installation
 
-After **every** repository change, rebuild and replace the user-local application before handing off work:
+After successfully verifying changes that affect the runtime executable or compile-time assets, replace the current user installation:
 
 ```sh
 cargo install --locked --force --path . --root "$HOME/.local"
@@ -10,6 +10,7 @@ test -x "$HOME/.local/bin/sculpt-lite"
 ```
 
 The installed binary must remain user-local at `~/.local/bin/sculpt-lite`; do not install it system-wide. If `assets/` or `packaging/linux/` changes, also rerun the launcher-install block in `README.md`.
+Skip local installation for documentation-only and test-only changes.
 
 ## Build and verification
 
