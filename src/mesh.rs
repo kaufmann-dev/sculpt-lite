@@ -109,7 +109,8 @@ impl RemeshRegion {
     }
 
     fn intersects_edge(self, a: Vec3, b: Vec3) -> bool {
-        self.edge_distance_squared(a, b) <= self.radius_squared
+        let interior_limit = self.radius_squared * (1.0 - 1.0e-5);
+        self.edge_distance_squared(a, b) < interior_limit
     }
 
     fn edge_distance_squared(self, a: Vec3, b: Vec3) -> f32 {
@@ -3341,18 +3342,24 @@ fn triangles_intersect(first: [Vec3; 3], second: [Vec3; 3]) -> bool {
         .chain(second)
         .fold(Vec3::splat(f32::NEG_INFINITY), Vec3::max);
     let epsilon = (max - min).max_element().max(f32::EPSILON) * 1.0e-6;
+    let first_length = first_normal.length();
+    let second_length = second_normal.length();
+    if first_length <= epsilon || second_length <= epsilon {
+        return false;
+    }
+    let mutually_coplanar = second
+        .iter()
+        .all(|point| first_normal.dot(*point - first[0]).abs() <= epsilon * first_length)
+        && first
+            .iter()
+            .all(|point| second_normal.dot(*point - second[0]).abs() <= epsilon * second_length);
+    if mutually_coplanar {
+        return coplanar_triangles_intersect(first, second, first_normal, epsilon);
+    }
     let normals_cross = first_normal.cross(second_normal).length_squared();
     let parallel_limit = first_normal.length_squared() * second_normal.length_squared() * 1.0e-10;
     if normals_cross <= parallel_limit {
-        let first_length = first_normal.length();
-        if first_length <= epsilon
-            || second
-                .iter()
-                .any(|point| first_normal.dot(*point - first[0]).abs() > epsilon * first_length)
-        {
-            return false;
-        }
-        return coplanar_triangles_intersect(first, second, first_normal, epsilon);
+        return false;
     }
 
     for index in 0..3 {
@@ -3446,8 +3453,11 @@ fn segments_intersect_2d(
     let second_direction = second_b - second_a;
     let denominator = cross_2d(first_direction, second_direction);
     let offset = second_a - first_a;
-    if denominator.abs() <= epsilon {
-        if cross_2d(offset, first_direction).abs() > epsilon {
+    let first_length = first_direction.length();
+    let second_length = second_direction.length();
+    let cross_epsilon = epsilon * first_length.max(second_length).max(epsilon);
+    if denominator.abs() <= cross_epsilon {
+        if cross_2d(offset, first_direction).abs() > epsilon * first_length.max(epsilon) {
             return false;
         }
         let denominator = first_direction.length_squared();
@@ -3456,19 +3466,39 @@ fn segments_intersect_2d(
         }
         let first = offset.dot(first_direction) / denominator;
         let second = (second_b - first_a).dot(first_direction) / denominator;
-        return first.min(second) <= 1.0 + epsilon && first.max(second) >= -epsilon;
+        let parameter_epsilon = epsilon / first_length.max(epsilon);
+        return first.min(second) <= 1.0 + parameter_epsilon
+            && first.max(second) >= -parameter_epsilon;
     }
     let first = cross_2d(offset, second_direction) / denominator;
     let second = cross_2d(offset, first_direction) / denominator;
-    first >= -epsilon && first <= 1.0 + epsilon && second >= -epsilon && second <= 1.0 + epsilon
+    let parameter_epsilon = epsilon / first_length.min(second_length).max(epsilon);
+    first >= -parameter_epsilon
+        && first <= 1.0 + parameter_epsilon
+        && second >= -parameter_epsilon
+        && second <= 1.0 + parameter_epsilon
 }
 
 fn point_in_triangle_2d(point: glam::Vec2, triangle: [glam::Vec2; 3], epsilon: f32) -> bool {
-    let first = cross_2d(triangle[1] - triangle[0], point - triangle[0]);
-    let second = cross_2d(triangle[2] - triangle[1], point - triangle[1]);
-    let third = cross_2d(triangle[0] - triangle[2], point - triangle[2]);
-    (first >= -epsilon && second >= -epsilon && third >= -epsilon)
-        || (first <= epsilon && second <= epsilon && third <= epsilon)
+    let edges = [
+        triangle[1] - triangle[0],
+        triangle[2] - triangle[1],
+        triangle[0] - triangle[2],
+    ];
+    let crosses = [
+        cross_2d(edges[0], point - triangle[0]),
+        cross_2d(edges[1], point - triangle[1]),
+        cross_2d(edges[2], point - triangle[2]),
+    ];
+    let tolerances = edges.map(|edge| epsilon * edge.length().max(epsilon));
+    crosses
+        .iter()
+        .zip(tolerances)
+        .all(|(&cross, tolerance)| cross >= -tolerance)
+        || crosses
+            .iter()
+            .zip(tolerances)
+            .all(|(&cross, tolerance)| cross <= tolerance)
 }
 
 fn aabb_area(min: Vec3, max: Vec3) -> f32 {
@@ -3642,6 +3672,15 @@ mod tests {
     fn remesh(mesh: &mut Mesh, vertices: &[u32], settings: RemeshSettings) -> RemeshOutcome {
         let mut recorder = MeshEditRecorder::new(mesh);
         mesh.remesh_region(vertices, settings, &mut recorder)
+    }
+
+    #[test]
+    fn remesh_region_excludes_edges_that_only_touch_the_brush_boundary() {
+        let region = RemeshRegion::new(Vec3::ZERO, 1.0).unwrap();
+
+        assert!(!region.intersects_edge(Vec3::X, Vec3::X * 2.0));
+        assert!(region.intersects_edge(Vec3::X * -2.0, Vec3::X * 2.0));
+        assert!(region.intersects_edge(Vec3::ZERO, Vec3::X));
     }
 
     fn assert_edge_faces_match(left: &MeshTopology, right: &MeshTopology) {
@@ -4036,6 +4075,30 @@ mod tests {
                 Vec3::new(3.0, 0.0, 0.0),
                 Vec3::new(4.0, 0.0, 0.0),
                 Vec3::new(3.0, 1.0, 0.0),
+            ],
+        ));
+    }
+
+    #[test]
+    fn near_coplanar_skinny_triangles_do_not_report_a_false_intersection() {
+        let first = [
+            Vec3::new(0.333_280_18, 0.312_947_5, 0.353_772_28),
+            Vec3::new(0.353_639_42, 0.312_974_1, 0.333_386_45),
+            Vec3::new(0.333_120_7, 0.313_027_23, 0.353_852_03),
+        ];
+        let second = [
+            Vec3::new(0.333_306_76, 0.312_894_34, 0.353_798_87),
+            Vec3::new(0.312_920_93, 0.312_920_93, 0.374_158_1),
+            Vec3::new(0.333_227_04, 0.312_814_62, 0.353_958_3),
+        ];
+
+        assert!(!triangles_intersect(first, second));
+        assert!(triangles_intersect(
+            [Vec3::ZERO, Vec3::X, Vec3::Y],
+            [
+                Vec3::new(0.25, 0.25, 0.0),
+                Vec3::new(0.75, 0.25, 0.0),
+                Vec3::new(0.25, 0.75, 0.0),
             ],
         ));
     }

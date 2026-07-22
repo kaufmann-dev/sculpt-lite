@@ -1403,7 +1403,9 @@ impl SculptLiteApp {
                     }
 
                     let finished = self.stroke_sampler.as_ref().is_some_and(|sampler| {
-                        sampler.is_released() && !sampler.has_pending_path()
+                        sampler.is_released()
+                            && !sampler.has_pending_path()
+                            && !self.sculpt.has_pending_sample()
                     });
                     if finished {
                         self.finish_pointer_stroke();
@@ -1444,6 +1446,12 @@ impl SculptLiteApp {
 
     fn apply_spatial_dabs(&mut self) {
         let started = Instant::now();
+        if self.sculpt.has_pending_sample() {
+            self.continue_pending_sculpt_sample();
+            if self.sculpt.has_pending_sample() || started.elapsed() >= SCULPT_FRAME_BUDGET {
+                return;
+            }
+        }
         let mut processed = 0;
         while processed < MAX_DABS_PER_FRAME {
             let dab = self
@@ -1455,7 +1463,7 @@ impl SculptLiteApp {
             };
             self.apply_pointer_sample(dab.context, dab.position, Vec2::ZERO, dab.modifiers, None);
             processed += 1;
-            if started.elapsed() >= SCULPT_FRAME_BUDGET {
+            if self.sculpt.has_pending_sample() || started.elapsed() >= SCULPT_FRAME_BUDGET {
                 break;
             }
         }
@@ -1467,7 +1475,7 @@ impl SculptLiteApp {
     }
 
     fn apply_airbrush_dab(&mut self) {
-        if !self.airbrush || self.tool == SculptTool::Grab {
+        if !self.airbrush || self.tool == SculptTool::Grab || self.sculpt.has_pending_sample() {
             return;
         }
         let interval = self.airbrush_interval();
@@ -1567,6 +1575,21 @@ impl SculptLiteApp {
                     .apply_sample(mesh, effective_tool, &settings, sample)
             })
         });
+        self.consume_sculpt_step(changed, effective_tool != SculptTool::Mask);
+    }
+
+    fn continue_pending_sculpt_sample(&mut self) {
+        let changed = self.document.as_mut().is_some_and(|document| {
+            document
+                .mesh
+                .as_mut()
+                .is_some_and(|mesh| self.sculpt.continue_pending_sample(mesh))
+        });
+        self.consume_sculpt_step(changed, true);
+    }
+
+    fn consume_sculpt_step(&mut self, changed: bool, geometry_changed: bool) {
+        let committed = self.sculpt.take_sample_committed();
         let updated_vertices = self.sculpt.take_updated_vertices();
         let mesh_changes = self.sculpt.take_mesh_changes();
         if let Some(error) = self.sculpt.take_error() {
@@ -1575,11 +1598,11 @@ impl SculptLiteApp {
         if let Some(warning) = self.sculpt.take_warning() {
             self.status = warning;
         }
+        if committed && let Some(document) = self.document.as_mut() {
+            document.dirty = true;
+        }
         if changed {
-            if let Some(document) = self.document.as_mut() {
-                document.dirty = true;
-            }
-            if effective_tool != SculptTool::Mask {
+            if geometry_changed {
                 self.update_document_bounds(&updated_vertices);
             }
             self.queue_frame_render_update(updated_vertices, mesh_changes);
@@ -1697,7 +1720,7 @@ impl eframe::App for SculptLiteApp {
         }
 
         if let Some(sampler) = &self.stroke_sampler {
-            if sampler.has_pending_path() {
+            if sampler.has_pending_path() || self.sculpt.has_pending_sample() {
                 context.request_repaint();
             } else if self.airbrush && self.tool != SculptTool::Grab && !sampler.is_released() {
                 context.request_repaint_after(sampler.airbrush_wait(self.airbrush_interval()));

@@ -12,9 +12,10 @@ use crate::{
     },
 };
 
-// The compact undersized-brush patch needs more than 64 edits to retain bounded
-// support across repeated dabs, while 96 avoids spending a full frame over-refining it.
-const MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB: usize = 96;
+// Keep each adaptive-topology step bounded. A brush sample may use multiple
+// steps, but deformation is deferred until the local mesh has enough support.
+const MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_STEP: usize = 96;
+const MAX_ADAPTIVE_TOPOLOGY_STEPS: usize = 32;
 const ADAPTIVE_SPLIT_THRESHOLD: f32 = 2.0;
 const ADAPTIVE_COLLAPSE_THRESHOLD: f32 = 0.5;
 const MIN_ADAPTIVE_SUPPORT_INFLUENCE: f32 = 0.05;
@@ -190,6 +191,17 @@ struct StrokeOriginals {
     masks: HashMap<u32, f32>,
 }
 
+#[derive(Clone, Debug)]
+struct PendingAdaptiveSample {
+    tool: SculptTool,
+    settings: BrushSettings,
+    samples: SmallVec<[BrushSample; 2]>,
+    recorder: MeshEditRecorder,
+    steps: usize,
+    topology_edit_limit: usize,
+    topology_changed: bool,
+}
+
 /// The editable result of a completed stroke. Adaptive topology is already
 /// applied while sampling; `topology` stores its exact whole-stroke history.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -201,6 +213,7 @@ pub struct StrokeOutcome {
 #[derive(Default, Debug)]
 pub struct SculptEngine {
     active: Option<StrokeState>,
+    pending_sample: Option<PendingAdaptiveSample>,
     symmetry_center: Option<Vec3>,
     traversal: VertexTraversalScratch,
     source_positions: HashMap<u32, Vec3>,
@@ -208,6 +221,7 @@ pub struct SculptEngine {
     mesh_changes: Option<MeshChangeSet>,
     warning: Option<String>,
     error: Option<String>,
+    sample_committed: bool,
 }
 
 impl SculptEngine {
@@ -216,9 +230,15 @@ impl SculptEngine {
         self.active.is_some()
     }
 
+    #[must_use]
+    pub fn has_pending_sample(&self) -> bool {
+        self.pending_sample.is_some()
+    }
+
     /// Resets per-document state after importing or replacing a mesh.
     pub fn reset_for_mesh(&mut self, mesh: &Mesh) {
         self.active = None;
+        self.pending_sample = None;
         self.symmetry_center = Some(mesh.center().unwrap_or(Vec3::ZERO));
         self.traversal = VertexTraversalScratch::default();
         self.source_positions = HashMap::new();
@@ -226,6 +246,7 @@ impl SculptEngine {
         self.mesh_changes = None;
         self.warning = None;
         self.error = None;
+        self.sample_committed = false;
     }
 
     pub fn begin_stroke(&mut self, mesh: &Mesh) {
@@ -238,10 +259,12 @@ impl SculptEngine {
             original: StrokeOriginals::default(),
             recorder: MeshEditRecorder::new(mesh),
         });
+        self.pending_sample = None;
         self.updated_vertices.clear();
         self.mesh_changes = None;
         self.warning = None;
         self.error = None;
+        self.sample_committed = false;
     }
 
     /// Takes the deduplicated vertex IDs changed by the latest brush sample.
@@ -268,6 +291,13 @@ impl SculptEngine {
         self.warning.take()
     }
 
+    /// Returns whether the latest completed sample committed an editable change.
+    /// Intermediate topology preparation and a subsequent rollback both return false.
+    #[must_use]
+    pub fn take_sample_committed(&mut self) -> bool {
+        std::mem::take(&mut self.sample_committed)
+    }
+
     /// Applies one brush sample and returns whether it changed the mesh.
     pub fn apply_sample(
         &mut self,
@@ -276,10 +306,10 @@ impl SculptEngine {
         settings: &BrushSettings,
         sample: BrushSample,
     ) -> bool {
-        self.updated_vertices.clear();
-        self.mesh_changes = None;
-        self.warning = None;
-        self.error = None;
+        self.clear_step_outputs();
+        if self.pending_sample.is_some() {
+            return false;
+        }
         let Some(stroke) = self.active.as_ref() else {
             return false;
         };
@@ -317,85 +347,17 @@ impl SculptEngine {
             .remesh_target_edge_length
             .filter(|target| target.is_finite() && *target > 0.0);
         let adaptive = tool != SculptTool::Mask && target_edge_length.is_some();
-        let mut initial_passes = SmallVec::<[PreparedPass; 2]>::new();
         if adaptive {
-            for &brush_sample in &samples {
-                initial_passes.push(PreparedPass::new(
-                    mesh,
-                    brush_sample,
-                    settings.radius,
-                    &mut self.traversal,
-                ));
-            }
-        }
-        let mut topology_recorder = adaptive.then(|| MeshEditRecorder::new(mesh));
-        let mut topology_changes = MeshChangeSet::default();
-        let mut topology_edits = 0;
-
-        if let (Some(target), Some(recorder)) = (target_edge_length, topology_recorder.as_mut()) {
-            for (brush_sample, initial_pass) in samples.iter().zip(&initial_passes) {
-                let needs_support = initial_pass.vertices.is_empty();
-                let seed = mesh
-                    .nearest_triangle(brush_sample.center)
-                    .unwrap_or(brush_sample.seed_triangle);
-                if needs_support
-                    && topology_edits < MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB
-                    && let Some((added_vertices, changes)) = mesh.insert_brush_support_patch(
-                        seed,
-                        brush_sample.center,
-                        settings.radius,
-                        target,
-                        recorder,
-                    )
-                {
-                    topology_changes.merge(changes);
-                    topology_edits += added_vertices;
-                }
-                if needs_support {
-                    continue;
-                }
-                let active = mesh.brush_remesh_vertices(
-                    seed,
-                    brush_sample.center,
-                    settings.radius,
-                    target,
-                    brush_sample.view_direction,
-                );
-                let remaining = MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB.saturating_sub(topology_edits);
-                if active.is_empty() || remaining == 0 {
-                    continue;
-                }
-                let mut remesh = RemeshSettings::new(target);
-                remesh.iterations = 4;
-                remesh.max_topology_edits = remaining;
-                remesh.split_threshold = ADAPTIVE_SPLIT_THRESHOLD;
-                remesh.collapse_threshold = ADAPTIVE_COLLAPSE_THRESHOLD;
-                remesh.relaxation = 0.0;
-                let outcome = mesh.remesh_brush_region(
-                    &active,
-                    brush_sample.center,
-                    settings.radius,
-                    remesh,
-                    recorder,
-                );
-                topology_edits +=
-                    outcome.stats.splits + outcome.stats.collapses + outcome.stats.flips;
-                topology_changes.merge(outcome.changes);
-            }
-
-            let topology_valid = mesh.local_changes_are_valid(&topology_changes);
-            if !topology_valid {
-                topology_recorder
-                    .take()
-                    .expect("adaptive samples have a topology recorder")
-                    .finish(mesh)
-                    .apply_before(mesh);
-                self.error = Some(
-                    "Adaptive topology rejected an invalid local mesh update; the latest brush sample was rolled back"
-                        .to_owned(),
-                );
-                return false;
-            }
+            self.pending_sample = Some(PendingAdaptiveSample {
+                tool,
+                settings: *settings,
+                samples,
+                recorder: MeshEditRecorder::new(mesh),
+                steps: 0,
+                topology_edit_limit: MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_STEP,
+                topology_changed: false,
+            });
+            return self.continue_pending_sample(mesh);
         }
         for brush_sample in &mut samples {
             if let Some(seed) = mesh.nearest_triangle(brush_sample.center) {
@@ -412,190 +374,7 @@ impl SculptEngine {
             ));
         }
 
-        if adaptive && passes.iter().all(|pass| pass.vertices.is_empty()) {
-            topology_recorder
-                .take()
-                .expect("adaptive samples have a topology recorder")
-                .finish(mesh)
-                .apply_before(mesh);
-            self.warning = Some("Mesh resolution too low for this brush".to_owned());
-            return false;
-        }
-        if let Some(target) = target_edge_length
-            && passes
-                .iter()
-                .zip(&initial_passes)
-                .any(|(pass, initial_pass)| {
-                    initial_pass.vertices.is_empty()
-                        && !pass.has_remesh_support(
-                            mesh,
-                            settings.radius,
-                            settings.strength,
-                            settings.falloff,
-                            target * ADAPTIVE_SPLIT_THRESHOLD,
-                        )
-                })
-        {
-            topology_recorder
-                .take()
-                .expect("adaptive samples have a topology recorder")
-                .finish(mesh)
-                .apply_before(mesh);
-            self.warning = Some("Mesh resolution too low for this brush".to_owned());
-            return false;
-        }
-
         capture_source_positions(mesh, tool, &passes, &mut self.source_positions);
-        let baseline_faces = if adaptive {
-            capture_face_crosses(mesh, &passes)
-        } else {
-            HashMap::new()
-        };
-
-        if adaptive {
-            let mut deformation_recorder = Some(MeshEditRecorder::new(mesh));
-            let (mut changed, mut affected) = apply_passes(
-                mesh,
-                tool,
-                settings,
-                &passes,
-                &self.source_positions,
-                &mut self
-                    .active
-                    .as_mut()
-                    .expect("active stroke checked above")
-                    .original,
-                deformation_recorder.as_mut(),
-            );
-            let mut safe = false;
-            if changed {
-                safe = refresh_and_validate_deformation(
-                    mesh,
-                    &mut affected,
-                    &baseline_faces,
-                    &mut self.updated_vertices,
-                );
-            }
-
-            if changed && !safe {
-                restore_deformation(mesh, &affected, &self.source_positions, &baseline_faces);
-                deformation_recorder = None;
-                let mut low = 0.0_f32;
-                let mut high = 1.0_f32;
-                for _ in 0..SAFE_DEFORMATION_SEARCH_STEPS {
-                    let factor = (low + high) * 0.5;
-                    let mut scaled = *settings;
-                    scaled.strength *= factor;
-                    let (trial_changed, mut trial_affected) = apply_passes(
-                        mesh,
-                        tool,
-                        &scaled,
-                        &passes,
-                        &self.source_positions,
-                        &mut self
-                            .active
-                            .as_mut()
-                            .expect("active stroke checked above")
-                            .original,
-                        None,
-                    );
-                    let trial_safe = trial_changed
-                        && refresh_and_validate_deformation(
-                            mesh,
-                            &mut trial_affected,
-                            &baseline_faces,
-                            &mut Vec::new(),
-                        );
-                    restore_deformation(
-                        mesh,
-                        &trial_affected,
-                        &self.source_positions,
-                        &baseline_faces,
-                    );
-                    if trial_safe {
-                        low = factor;
-                    } else {
-                        high = factor;
-                    }
-                }
-
-                changed = false;
-                affected.clear();
-                self.updated_vertices.clear();
-                if low >= MIN_SAFE_DEFORMATION_FACTOR {
-                    let mut scaled = *settings;
-                    scaled.strength *= low;
-                    deformation_recorder = Some(MeshEditRecorder::new(mesh));
-                    (changed, affected) = apply_passes(
-                        mesh,
-                        tool,
-                        &scaled,
-                        &passes,
-                        &self.source_positions,
-                        &mut self
-                            .active
-                            .as_mut()
-                            .expect("active stroke checked above")
-                            .original,
-                        deformation_recorder.as_mut(),
-                    );
-                    safe = changed
-                        && refresh_and_validate_deformation(
-                            mesh,
-                            &mut affected,
-                            &baseline_faces,
-                            &mut self.updated_vertices,
-                        );
-                    if !safe {
-                        restore_deformation(
-                            mesh,
-                            &affected,
-                            &self.source_positions,
-                            &baseline_faces,
-                        );
-                        deformation_recorder = None;
-                        changed = false;
-                        self.updated_vertices.clear();
-                    }
-                }
-                self.warning =
-                    Some("Brush movement limited to prevent self-intersection".to_owned());
-            }
-
-            if changed {
-                topology_recorder
-                    .as_mut()
-                    .expect("adaptive samples have a topology recorder")
-                    .absorb_recorder(
-                        deformation_recorder
-                            .take()
-                            .expect("successful deformation has a recorder"),
-                        mesh,
-                    );
-            }
-            topology_changes
-                .dirty_vertices
-                .extend(self.updated_vertices.iter().copied());
-            topology_changes.finalize(mesh.positions.len(), mesh.triangles.len());
-            self.updated_vertices
-                .extend(topology_changes.dirty_vertices.iter().copied());
-            self.updated_vertices.sort_unstable();
-            self.updated_vertices.dedup();
-
-            let sample_changed = changed || topology_edits != 0;
-            if sample_changed {
-                self.mesh_changes = Some(topology_changes);
-                if let Some(stroke) = self.active.as_mut() {
-                    stroke.recorder.absorb_recorder(
-                        topology_recorder
-                            .take()
-                            .expect("adaptive samples have a topology recorder"),
-                        mesh,
-                    );
-                }
-            }
-            return sample_changed;
-        }
 
         let (changed, mut affected) = apply_passes(
             mesh,
@@ -617,6 +396,7 @@ impl SculptEngine {
         affected.dedup();
         if tool == SculptTool::Mask {
             self.updated_vertices = affected;
+            self.sample_committed = true;
             return true;
         }
         let Some(faces) = mesh.validated_deformation_faces(&affected) else {
@@ -637,7 +417,323 @@ impl SculptEngine {
         self.updated_vertices.extend(affected);
         self.updated_vertices.sort_unstable();
         self.updated_vertices.dedup();
+        self.sample_committed = true;
         true
+    }
+
+    /// Continues a quality-gated adaptive sample for one bounded topology step.
+    /// Returns whether this step changed the visible mesh.
+    pub fn continue_pending_sample(&mut self, mesh: &mut Mesh) -> bool {
+        self.clear_step_outputs();
+        let Some(mut pending) = self.pending_sample.take() else {
+            return false;
+        };
+        if self.active.is_none() {
+            return self.rollback_pending_sample(
+                mesh,
+                pending,
+                "Adaptive topology lost its active stroke; the brush sample was rolled back",
+                true,
+            );
+        }
+
+        pending.steps += 1;
+        let target = pending
+            .settings
+            .remesh_target_edge_length
+            .expect("pending adaptive samples have a remesh target");
+        let maximum_edge_length = target * ADAPTIVE_SPLIT_THRESHOLD;
+        let pass_budget = (pending.topology_edit_limit / pending.samples.len()).max(1);
+        let mut topology_changes = MeshChangeSet::default();
+        let mut topology_edits = 0;
+        let mut step_recorder = MeshEditRecorder::new(mesh);
+
+        for brush_sample in &pending.samples {
+            let pass = PreparedPass::new(
+                mesh,
+                *brush_sample,
+                pending.settings.radius,
+                &mut self.traversal,
+            );
+            let seed = mesh
+                .nearest_triangle(brush_sample.center)
+                .unwrap_or(brush_sample.seed_triangle);
+            if pass.vertices.is_empty() {
+                // The support patch is a small, bounded atomic topology operation.
+                // Splitting it across frames would expose a hole in the surface.
+                if let Some((added_vertices, changes)) = mesh.insert_brush_support_patch(
+                    seed,
+                    brush_sample.center,
+                    pending.settings.radius,
+                    target,
+                    &mut step_recorder,
+                ) {
+                    topology_edits += added_vertices;
+                    topology_changes.merge(changes);
+                }
+                continue;
+            }
+            if pass.has_remesh_support(
+                mesh,
+                pending.settings.radius,
+                pending.settings.strength,
+                pending.settings.falloff,
+                maximum_edge_length,
+            ) {
+                continue;
+            }
+
+            let active = mesh.brush_remesh_vertices(
+                seed,
+                brush_sample.center,
+                pending.settings.radius,
+                target,
+                brush_sample.view_direction,
+            );
+            if active.is_empty() {
+                continue;
+            }
+            let mut remesh = RemeshSettings::new(target);
+            remesh.iterations = 4;
+            remesh.max_topology_edits = pass_budget;
+            remesh.split_threshold = ADAPTIVE_SPLIT_THRESHOLD;
+            remesh.collapse_threshold = ADAPTIVE_COLLAPSE_THRESHOLD;
+            remesh.relaxation = 0.0;
+            let outcome = mesh.remesh_brush_region(
+                &active,
+                brush_sample.center,
+                pending.settings.radius,
+                remesh,
+                &mut step_recorder,
+            );
+            topology_edits += outcome.stats.splits + outcome.stats.collapses + outcome.stats.flips;
+            topology_changes.merge(outcome.changes);
+        }
+
+        if topology_edits != 0 {
+            let local_valid = mesh.local_changes_are_valid(&topology_changes);
+            let intersection_free =
+                local_valid && !mesh.faces_have_self_intersections(&topology_changes.dirty_faces);
+            if !intersection_free {
+                step_recorder.finish(mesh).apply_before(mesh);
+                if pending.topology_edit_limit == 1 || pending.steps >= MAX_ADAPTIVE_TOPOLOGY_STEPS
+                {
+                    return self.rollback_pending_sample(
+                        mesh,
+                        pending,
+                        "Adaptive topology could not produce an intersection-free support mesh; the brush sample was rolled back",
+                        true,
+                    );
+                }
+                pending.topology_edit_limit = (pending.topology_edit_limit / 2).max(1);
+                self.warning = Some("Preparing intersection-free mesh detail".to_owned());
+                self.pending_sample = Some(pending);
+                return false;
+            }
+            pending.recorder.absorb_recorder(step_recorder, mesh);
+        }
+        pending.topology_changed |= topology_edits != 0;
+        for brush_sample in &mut pending.samples {
+            if let Some(seed) = mesh.nearest_triangle(brush_sample.center) {
+                brush_sample.seed_triangle = seed;
+            }
+        }
+        let mut passes = SmallVec::<[PreparedPass; 2]>::new();
+        for &brush_sample in &pending.samples {
+            passes.push(PreparedPass::new(
+                mesh,
+                brush_sample,
+                pending.settings.radius,
+                &mut self.traversal,
+            ));
+        }
+
+        let support_ready = !passes.iter().any(|pass| pass.vertices.is_empty())
+            && passes.iter().all(|pass| {
+                pass.has_remesh_support(
+                    mesh,
+                    pending.settings.radius,
+                    pending.settings.strength,
+                    pending.settings.falloff,
+                    maximum_edge_length,
+                )
+            });
+        if !support_ready {
+            if topology_edits == 0 || pending.steps >= MAX_ADAPTIVE_TOPOLOGY_STEPS {
+                return self.rollback_pending_sample(
+                    mesh,
+                    pending,
+                    "Mesh resolution could not safely support this brush; the brush sample was rolled back",
+                    false,
+                );
+            }
+            self.publish_adaptive_changes(mesh, topology_changes, &[]);
+            self.warning = Some("Preparing mesh detail for this brush".to_owned());
+            self.pending_sample = Some(pending);
+            return true;
+        }
+
+        capture_source_positions(mesh, pending.tool, &passes, &mut self.source_positions);
+        let baseline_faces = capture_face_crosses(mesh, &passes);
+        let (mut changed, mut affected) = apply_passes(
+            mesh,
+            pending.tool,
+            &pending.settings,
+            &passes,
+            &self.source_positions,
+            &mut self
+                .active
+                .as_mut()
+                .expect("active stroke checked above")
+                .original,
+            Some(&mut pending.recorder),
+        );
+        let mut safe = false;
+        if changed {
+            safe = refresh_and_validate_deformation(
+                mesh,
+                &mut affected,
+                &baseline_faces,
+                &mut self.updated_vertices,
+            );
+        }
+
+        if changed && !safe {
+            restore_deformation(mesh, &affected, &self.source_positions, &baseline_faces);
+            let mut low = 0.0_f32;
+            let mut high = 1.0_f32;
+            for _ in 0..SAFE_DEFORMATION_SEARCH_STEPS {
+                let factor = (low + high) * 0.5;
+                let mut scaled = pending.settings;
+                scaled.strength *= factor;
+                let (trial_changed, mut trial_affected) = apply_passes(
+                    mesh,
+                    pending.tool,
+                    &scaled,
+                    &passes,
+                    &self.source_positions,
+                    &mut self
+                        .active
+                        .as_mut()
+                        .expect("active stroke checked above")
+                        .original,
+                    None,
+                );
+                let trial_safe = trial_changed
+                    && refresh_and_validate_deformation(
+                        mesh,
+                        &mut trial_affected,
+                        &baseline_faces,
+                        &mut Vec::new(),
+                    );
+                restore_deformation(
+                    mesh,
+                    &trial_affected,
+                    &self.source_positions,
+                    &baseline_faces,
+                );
+                if trial_safe {
+                    low = factor;
+                } else {
+                    high = factor;
+                }
+            }
+
+            changed = false;
+            affected.clear();
+            self.updated_vertices.clear();
+            if low >= MIN_SAFE_DEFORMATION_FACTOR {
+                let mut scaled = pending.settings;
+                scaled.strength *= low;
+                (changed, affected) = apply_passes(
+                    mesh,
+                    pending.tool,
+                    &scaled,
+                    &passes,
+                    &self.source_positions,
+                    &mut self
+                        .active
+                        .as_mut()
+                        .expect("active stroke checked above")
+                        .original,
+                    Some(&mut pending.recorder),
+                );
+                safe = changed
+                    && refresh_and_validate_deformation(
+                        mesh,
+                        &mut affected,
+                        &baseline_faces,
+                        &mut self.updated_vertices,
+                    );
+                if !safe {
+                    restore_deformation(mesh, &affected, &self.source_positions, &baseline_faces);
+                    changed = false;
+                    self.updated_vertices.clear();
+                }
+            }
+            self.warning = Some("Brush movement limited to prevent self-intersection".to_owned());
+        }
+
+        let step_changed = topology_edits != 0 || changed;
+        let sample_changed = pending.topology_changed || changed;
+        if sample_changed {
+            self.active
+                .as_mut()
+                .expect("active stroke checked above")
+                .recorder
+                .absorb_recorder(pending.recorder, mesh);
+            self.sample_committed = true;
+        }
+        if step_changed {
+            let updated_vertices = std::mem::take(&mut self.updated_vertices);
+            self.publish_adaptive_changes(mesh, topology_changes, &updated_vertices);
+        }
+        step_changed
+    }
+
+    fn clear_step_outputs(&mut self) {
+        self.updated_vertices.clear();
+        self.mesh_changes = None;
+        self.warning = None;
+        self.error = None;
+        self.sample_committed = false;
+    }
+
+    fn publish_adaptive_changes(
+        &mut self,
+        mesh: &Mesh,
+        mut changes: MeshChangeSet,
+        updated_vertices: &[u32],
+    ) {
+        changes.include_vertices(updated_vertices.iter().copied());
+        changes.finalize(mesh.positions.len(), mesh.triangles.len());
+        self.updated_vertices
+            .extend(changes.dirty_vertices.iter().copied());
+        self.updated_vertices.sort_unstable();
+        self.updated_vertices.dedup();
+        self.mesh_changes = Some(changes);
+    }
+
+    fn rollback_pending_sample(
+        &mut self,
+        mesh: &mut Mesh,
+        pending: PendingAdaptiveSample,
+        message: &str,
+        is_error: bool,
+    ) -> bool {
+        let delta = pending.recorder.finish(mesh);
+        let changed = !delta.is_empty();
+        if changed {
+            let changes = delta.apply_before(mesh);
+            self.updated_vertices = changes.dirty_vertices.clone();
+            self.mesh_changes = Some(changes);
+        }
+        if is_error {
+            self.error = Some(message.to_owned());
+        } else {
+            self.warning = Some(message.to_owned());
+        }
+        changed
     }
 
     /// Ends the active stroke and returns any deferred topology work.
@@ -832,9 +928,28 @@ impl PreparedPass {
                                 neighbor_position.distance(self.sample.center) / radius,
                                 falloff,
                             );
-                            position.distance_squared(neighbor_position) <= maximum_edge_squared
-                                || (weight - neighbor_weight).abs()
+                            let neighbor_influence = neighbor_weight
+                                * strength.abs()
+                                * self.sample.pressure.clamp(0.0, 1.0);
+                            let edge_is_short = position.distance_squared(neighbor_position)
+                                <= maximum_edge_squared;
+                            let midpoint_weight = brush_falloff(
+                                position
+                                    .midpoint(neighbor_position)
+                                    .distance(self.sample.center)
+                                    / radius,
+                                falloff,
+                            );
+                            let midpoint_influence = midpoint_weight
+                                * strength.abs()
+                                * self.sample.pressure.clamp(0.0, 1.0);
+                            edge_is_short
+                                || ((influence - neighbor_influence).abs()
                                     <= MAX_ADAPTIVE_SUPPORT_INFLUENCE_STEP
+                                    && (midpoint_influence
+                                        - (influence + neighbor_influence) * 0.5)
+                                        .abs()
+                                        <= MAX_ADAPTIVE_SUPPORT_INFLUENCE_STEP)
                         })
                 })
         })
@@ -1069,6 +1184,21 @@ mod tests {
         }
     }
 
+    fn drain_pending_sample(engine: &mut SculptEngine, mesh: &mut Mesh) -> usize {
+        let mut steps = 0;
+        while engine.has_pending_sample() {
+            assert!(
+                steps < MAX_ADAPTIVE_TOPOLOGY_STEPS,
+                "adaptive sample did not terminate"
+            );
+            engine.continue_pending_sample(mesh);
+            let error = engine.take_error();
+            assert!(error.is_none(), "adaptive continuation failed: {error:?}");
+            steps += 1;
+        }
+        steps
+    }
+
     #[test]
     fn falloff_has_stable_center_and_edge_values() {
         assert_eq!(brush_falloff(0.0, 0.0), 1.0);
@@ -1217,6 +1347,12 @@ mod tests {
             .expect("adaptive sample produces renderer changes");
         assert!(!changes.dirty_faces.is_empty());
         assert_ne!(mesh.triangles, original_triangles);
+        while engine.has_pending_sample() {
+            engine.continue_pending_sample(&mut mesh);
+            assert!(engine.take_error().is_none());
+            let _ = engine.take_updated_vertices();
+            let _ = engine.take_mesh_changes();
+        }
 
         let center = Vec3::splat(1.0 / 3.0);
         let seed_triangle = mesh.nearest_triangle(center).unwrap();
@@ -1226,7 +1362,13 @@ mod tests {
             &settings,
             sample(center, seed_triangle),
         ));
-        let second_sample_vertices = engine.take_updated_vertices();
+        let mut second_sample_vertices = engine.take_updated_vertices();
+        while engine.has_pending_sample() {
+            engine.continue_pending_sample(&mut mesh);
+            assert!(engine.take_error().is_none());
+            second_sample_vertices.extend(engine.take_updated_vertices());
+            let _ = engine.take_mesh_changes();
+        }
         assert!(
             second_sample_vertices
                 .iter()
@@ -1272,6 +1414,7 @@ mod tests {
         let center = Vec3::splat(1.0 / 3.0);
         let mut settings = test_settings();
         settings.radius = 0.1;
+        settings.strength = 0.2;
         settings.remesh_target_edge_length = Some(settings.radius * 0.2);
         let original_vertex_count = mesh.positions.len();
         let mut engine = SculptEngine::default();
@@ -1281,18 +1424,30 @@ mod tests {
         for dab in 0..5 {
             let seed = mesh.nearest_triangle(center).unwrap();
             let dab_started = Instant::now();
-            assert!(engine.apply_sample(
-                &mut mesh,
-                SculptTool::Draw,
-                &settings,
-                sample(center, seed),
-            ));
+            let changed =
+                engine.apply_sample(&mut mesh, SculptTool::Draw, &settings, sample(center, seed));
             longest_dab = longest_dab.max(dab_started.elapsed());
             assert!(engine.take_error().is_none());
             let warning = engine.take_warning();
             if dab == 0 {
-                assert!(warning.is_none());
+                assert!(changed);
+                assert!(
+                    warning.is_none()
+                        || warning.as_deref() == Some("Preparing mesh detail for this brush")
+                );
                 assert!(mesh.positions.len() - original_vertex_count <= 24);
+            } else if !changed {
+                assert_eq!(
+                    warning.as_deref(),
+                    Some("Brush movement limited to prevent self-intersection")
+                );
+            }
+            while engine.has_pending_sample() {
+                let step_started = Instant::now();
+                engine.continue_pending_sample(&mut mesh);
+                longest_dab = longest_dab.max(step_started.elapsed());
+                assert!(engine.take_error().is_none());
+                let _ = engine.take_warning();
             }
         }
 
@@ -1328,6 +1483,107 @@ mod tests {
         assert_eq!(mesh.positions, before.positions);
         assert_eq!(mesh.triangles, before.triangles);
         assert_eq!(mesh.mask, before.mask);
+    }
+
+    #[test]
+    fn adaptive_deformation_waits_for_quality_support_across_steps() {
+        let mut mesh = Mesh::new(
+            vec![
+                Vec3::X,
+                Vec3::Y,
+                Vec3::NEG_X,
+                Vec3::NEG_Y,
+                Vec3::Z,
+                Vec3::NEG_Z,
+            ],
+            vec![
+                [4, 0, 1],
+                [4, 1, 2],
+                [4, 2, 3],
+                [4, 3, 0],
+                [5, 1, 0],
+                [5, 2, 1],
+                [5, 3, 2],
+                [5, 0, 3],
+            ],
+        )
+        .unwrap();
+        let before = mesh.clone();
+        let original_vertex_count = mesh.positions.len();
+        let center = Vec3::splat(1.0 / 3.0);
+        let mut settings = test_settings();
+        settings.radius = 0.1;
+        settings.remesh_target_edge_length = Some(settings.radius * 0.2);
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        assert!(engine.apply_sample(&mut mesh, SculptTool::Draw, &settings, sample(center, 0),));
+        assert!(engine.has_pending_sample());
+        assert!(!engine.take_sample_committed());
+        assert_eq!(&mesh.positions[..original_vertex_count], &before.positions);
+        assert!(
+            mesh.positions[original_vertex_count..]
+                .iter()
+                .all(|position| (position.element_sum() - 1.0).abs() < 1.0e-5)
+        );
+
+        let continuation_steps = drain_pending_sample(&mut engine, &mut mesh);
+        assert!(continuation_steps < MAX_ADAPTIVE_TOPOLOGY_STEPS);
+        assert!(engine.take_sample_committed());
+        assert!(
+            mesh.positions[original_vertex_count..]
+                .iter()
+                .any(|position| position.element_sum() > 1.0 + 1.0e-5)
+        );
+        mesh.validate().unwrap();
+        let faces = (0..mesh.triangles.len() as u32).collect::<Vec<_>>();
+        assert!(!mesh.faces_have_self_intersections(&faces));
+
+        let topology = engine
+            .end_stroke(&mesh)
+            .topology
+            .expect("completed adaptive sample records exact rollback data");
+        topology.apply_before(&mut mesh);
+        assert_eq!(mesh.positions, before.positions);
+        assert_eq!(mesh.triangles, before.triangles);
+        assert_eq!(mesh.mask, before.mask);
+    }
+
+    #[test]
+    fn adaptive_sample_does_not_deform_when_boundary_topology_cannot_add_support() {
+        let mut mesh = Mesh::new(
+            vec![
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+            ],
+            vec![[0, 1, 2]],
+        )
+        .unwrap();
+        let before = mesh.clone();
+        let mut settings = test_settings();
+        settings.radius = 0.2;
+        settings.remesh_target_edge_length = Some(0.01);
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        assert!(!engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &settings,
+            sample(before.positions[0], 0),
+        ));
+        assert!(!engine.has_pending_sample());
+        assert!(!engine.take_sample_committed());
+        assert_eq!(
+            engine.take_warning().as_deref(),
+            Some(
+                "Mesh resolution could not safely support this brush; the brush sample was rolled back"
+            )
+        );
+        assert_eq!(mesh.positions, before.positions);
+        assert_eq!(mesh.triangles, before.triangles);
+        assert!(engine.end_stroke(&mesh).edit.is_empty());
     }
 
     #[test]
