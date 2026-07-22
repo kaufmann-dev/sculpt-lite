@@ -528,7 +528,7 @@ fn viewport_sense() -> Sense {
 
 fn fly_movement_mode_label(mode: FlyMovementMode) -> &'static str {
     match mode {
-        FlyMovementMode::Level => "Level (Minecraft)",
+        FlyMovementMode::Level => "Level",
         FlyMovementMode::Free => "Free flight",
     }
 }
@@ -2779,11 +2779,8 @@ mod tests {
     }
 
     #[test]
-    fn fly_movement_mode_labels_identify_level_as_the_minecraft_style() {
-        assert_eq!(
-            fly_movement_mode_label(FlyMovementMode::Level),
-            "Level (Minecraft)"
-        );
+    fn fly_movement_mode_labels_are_concise() {
+        assert_eq!(fly_movement_mode_label(FlyMovementMode::Level), "Level");
         assert_eq!(
             fly_movement_mode_label(FlyMovementMode::Free),
             "Free flight"
