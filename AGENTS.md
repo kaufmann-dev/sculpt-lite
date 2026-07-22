@@ -1,17 +1,5 @@
 # Repository Instructions
 
-## Local user installation
-
-After successfully verifying changes that affect the runtime executable or compile-time assets, replace the current user installation:
-
-```sh
-./install
-test -x "$HOME/.local/bin/sculpt-lite"
-```
-
-The installer refreshes the executable and desktop integration under `~/.local`; do not install them system-wide.
-Skip local installation for documentation-only and test-only changes.
-
 ## Build and verification
 
 Use Rust 1.96.0 from `rust-toolchain.toml`. Run the smallest relevant check after each change, then install the local application:
