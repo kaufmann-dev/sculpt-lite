@@ -201,8 +201,12 @@ impl FlyCamera {
         .normalize_or_zero()
     }
 
+    fn planar_forward(&self) -> Vec3 {
+        Vec3::new(self.yaw.cos(), self.yaw.sin(), 0.0)
+    }
+
     fn right(&self) -> Vec3 {
-        self.forward().cross(Vec3::Z).normalize_or_zero()
+        self.planar_forward().cross(Vec3::Z)
     }
 }
 
@@ -326,7 +330,7 @@ impl Camera {
                 0.0
             }
         };
-        let direction = self.fly.forward() * finite_axis(movement.forward)
+        let direction = self.fly.planar_forward() * finite_axis(movement.forward)
             + self.fly.right() * finite_axis(movement.right)
             + Vec3::Z * finite_axis(movement.up);
         let direction = direction.normalize_or_zero();
@@ -662,6 +666,39 @@ mod tests {
         let straight_distance = straight.fly.position.distance(start);
         let diagonal_distance = diagonal.fly.position.distance(diagonal_start);
         assert!((straight_distance - diagonal_distance).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn fly_horizontal_movement_ignores_look_pitch() {
+        let mut camera = Camera::default();
+        camera.set_mode(CameraMode::Fly);
+        camera.fly.pitch = 1.0;
+        let start = camera.fly.position;
+
+        camera.fly_move(
+            FlyMovement {
+                forward: 1.0,
+                right: 1.0,
+                ..FlyMovement::default()
+            },
+            0.1,
+        );
+
+        let displacement = camera.fly.position - start;
+        assert!(displacement.truncate().length() > 0.0);
+        assert!(displacement.z.abs() < 1.0e-6);
+
+        let horizontal_position = camera.fly.position;
+        camera.fly_move(
+            FlyMovement {
+                up: 1.0,
+                ..FlyMovement::default()
+            },
+            0.1,
+        );
+        let vertical_displacement = camera.fly.position - horizontal_position;
+        assert!(vertical_displacement.truncate().length() < 1.0e-6);
+        assert!(vertical_displacement.z > 0.0);
     }
 
     #[test]

@@ -534,7 +534,7 @@ fn quick_controls_copy(mode: CameraMode) -> (&'static str, &'static str) {
         ),
         CameraMode::Fly => (
             "LMB drag · Shift smooth · Ctrl invert",
-            "Hold RMB · Mouse look · WASD move · Shift/Space down/up · Wheel speed · Esc release",
+            "Hold RMB · Mouse look · WASD horizontal · Shift/Space down/up · Wheel speed · Esc release",
         ),
     }
 }
@@ -1888,7 +1888,7 @@ impl SculptLiteApp {
                         }
                         CameraMode::Fly => {
                             ui.small(
-                                "Hold RMB: look/fly · WASD + Shift/Space: move · Wheel: speed",
+                                "Hold RMB: look/fly · WASD: horizontal · Shift/Space: height · Wheel: speed",
                             );
                         }
                     }
@@ -2727,6 +2727,7 @@ mod tests {
         let (fly_sculpt, fly_view) = quick_controls_copy(CameraMode::Fly);
         assert_eq!(fly_sculpt, orbit_sculpt);
         assert!(fly_view.contains("Hold RMB"));
+        assert!(fly_view.contains("WASD horizontal"));
         assert!(fly_view.contains("Shift/Space down/up"));
     }
 
