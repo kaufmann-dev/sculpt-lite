@@ -110,6 +110,13 @@ impl SymmetryAxis {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Accumulation {
+    #[default]
+    Capped,
+    Accumulate,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BrushSettings {
     /// Brush radius in mesh/world coordinates.
@@ -120,6 +127,7 @@ pub struct BrushSettings {
     pub falloff: f32,
     pub invert: bool,
     pub symmetry: Option<SymmetryAxis>,
+    pub accumulation: Accumulation,
 }
 
 impl Default for BrushSettings {
@@ -130,6 +138,7 @@ impl Default for BrushSettings {
             falloff: 0.15,
             invert: false,
             symmetry: None,
+            accumulation: Accumulation::Capped,
         }
     }
 }
@@ -152,7 +161,7 @@ pub struct BrushSample {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DabKind {
     Spatial,
-    Airbrush,
+    Timed,
 }
 
 impl BrushSample {
@@ -370,7 +379,8 @@ impl SculptEngine {
 
         capture_source_positions(mesh, tool, &passes, &mut self.source_positions);
 
-        let channel = (dab_kind == DabKind::Spatial)
+        let channel = (dab_kind == DabKind::Spatial
+            && settings.accumulation == Accumulation::Capped)
             .then(|| CoverageChannel::for_sample(tool, settings.invert ^ sample.invert_modifier))
             .flatten();
         let mut staged_coverage = CoverageMap::new();
@@ -893,6 +903,7 @@ mod tests {
             falloff: 0.0,
             invert: false,
             symmetry: None,
+            accumulation: Accumulation::Capped,
         }
     }
 
@@ -910,6 +921,7 @@ mod tests {
             falloff: 0.95,
             invert: false,
             symmetry: None,
+            accumulation: Accumulation::Capped,
         }
     }
 
@@ -972,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn airbrush_dab_tools_keep_accumulating() {
+    fn accumulating_spatial_and_timed_dabs_keep_building_up() {
         for tool in [
             SculptTool::Draw,
             SculptTool::Clay,
@@ -984,7 +996,8 @@ mod tests {
             SculptTool::Mask,
         ] {
             let mut mesh = coverage_mesh();
-            let settings = coverage_settings();
+            let mut settings = coverage_settings();
+            settings.accumulation = Accumulation::Accumulate;
             let brush_sample = sample(mesh.positions[4], 0);
             let mut engine = SculptEngine::default();
             engine.begin_stroke(&mesh);
@@ -994,14 +1007,61 @@ mod tests {
                 tool,
                 &settings,
                 brush_sample,
-                DabKind::Airbrush,
+                DabKind::Spatial,
             ));
             let after_first = editable_state(&mesh);
             assert!(
-                engine.apply_sample(&mut mesh, tool, &settings, brush_sample, DabKind::Airbrush,),
-                "{tool} second airbrush dab"
+                engine.apply_sample(&mut mesh, tool, &settings, brush_sample, DabKind::Spatial,),
+                "{tool} second accumulating spatial dab"
             );
-            assert_ne!(editable_state(&mesh), after_first, "{tool} airbrush");
+            assert_ne!(editable_state(&mesh), after_first, "{tool} accumulation");
+
+            let after_spatial = editable_state(&mesh);
+            assert!(
+                engine.apply_sample(&mut mesh, tool, &settings, brush_sample, DabKind::Timed,),
+                "{tool} timed dab"
+            );
+            assert_ne!(editable_state(&mesh), after_spatial, "{tool} timed buildup");
+        }
+    }
+
+    #[test]
+    fn accumulating_spatial_and_timed_samples_have_identical_effects() {
+        for tool in [
+            SculptTool::Draw,
+            SculptTool::Clay,
+            SculptTool::Crease,
+            SculptTool::Inflate,
+            SculptTool::Smooth,
+            SculptTool::Pinch,
+            SculptTool::Flatten,
+            SculptTool::Mask,
+        ] {
+            let mut spatial = coverage_mesh();
+            let mut timed = spatial.clone();
+            let mut settings = coverage_settings();
+            settings.accumulation = Accumulation::Accumulate;
+            let brush_sample = sample(spatial.positions[4], 0);
+            let mut spatial_engine = SculptEngine::default();
+            let mut timed_engine = SculptEngine::default();
+            spatial_engine.begin_stroke(&spatial);
+            timed_engine.begin_stroke(&timed);
+
+            assert!(spatial_engine.apply_sample(
+                &mut spatial,
+                tool,
+                &settings,
+                brush_sample,
+                DabKind::Spatial,
+            ));
+            assert!(timed_engine.apply_sample(
+                &mut timed,
+                tool,
+                &settings,
+                brush_sample,
+                DabKind::Timed,
+            ));
+            assert_eq!(editable_state(&spatial), editable_state(&timed), "{tool}");
         }
     }
 
@@ -1147,28 +1207,32 @@ mod tests {
     }
 
     #[test]
-    fn one_spatial_click_records_one_history_entry() {
-        let mut mesh = grid();
-        let before = mesh.clone();
-        let mut engine = SculptEngine::default();
-        engine.begin_stroke(&mesh);
-        assert!(engine.apply_sample(
-            &mut mesh,
-            SculptTool::Draw,
-            &coverage_settings(),
-            sample(Vec3::ZERO, 0),
-            DabKind::Spatial,
-        ));
-        let outcome = engine.end_stroke(&mesh);
-        let mut history = History::default();
-        assert!(history.record(HistoryEntry::Local(outcome.edit)));
+    fn one_spatial_click_records_one_history_entry_in_each_accumulation_mode() {
+        for accumulation in [Accumulation::Capped, Accumulation::Accumulate] {
+            let mut mesh = grid();
+            let before = mesh.clone();
+            let mut engine = SculptEngine::default();
+            let mut settings = coverage_settings();
+            settings.accumulation = accumulation;
+            engine.begin_stroke(&mesh);
+            assert!(engine.apply_sample(
+                &mut mesh,
+                SculptTool::Draw,
+                &settings,
+                sample(Vec3::ZERO, 0),
+                DabKind::Spatial,
+            ));
+            let outcome = engine.end_stroke(&mesh);
+            let mut history = History::default();
+            assert!(history.record(HistoryEntry::Local(outcome.edit)));
 
-        assert!(matches!(
-            history.undo(&mut mesh),
-            HistoryAction::Local { .. }
-        ));
-        assert_editable_mesh_eq(&mesh, &before);
-        assert!(matches!(history.undo(&mut mesh), HistoryAction::Empty));
+            assert!(matches!(
+                history.undo(&mut mesh),
+                HistoryAction::Local { .. }
+            ));
+            assert_editable_mesh_eq(&mesh, &before);
+            assert!(matches!(history.undo(&mut mesh), HistoryAction::Empty));
+        }
     }
 
     #[test]
@@ -1648,6 +1712,7 @@ mod tests {
             falloff: 0.15,
             invert: false,
             symmetry: None,
+            accumulation: Accumulation::Capped,
         };
         let mut engine = SculptEngine::default();
         engine.begin_stroke(&mesh);

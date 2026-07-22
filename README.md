@@ -1,12 +1,12 @@
 # SculptLite
 
-SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes including Clay and Crease, non-accumulating distance-spaced strokes, time-budgeted path processing that preserves captured input, optional accumulating Airbrush buildup, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
+SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes including Clay and Crease, configurable capped, accumulating, and Airbrush strokes, time-budgeted path processing that preserves captured input, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
 
 ## Viewport controls
 
 Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle modes. In Orbit, right-drag pans, middle-drag orbits, and the wheel zooms. Fly defaults to **Level** movement, where `W`/`S` and `A`/`D` stay horizontal regardless of look pitch; choose **Free flight** beside the Fly button to make `W`/`S` follow the look direction instead. In either Fly style, hold RMB to capture the pointer, look with the mouse, move down with Shift, move up with Space, and use the wheel to adjust flight speed. Release RMB or press Escape to release the pointer. Press `F` to frame the mesh and return to Orbit.
 
-With the pointer released, a left click applies one dab and left-drag sculpts from either viewpoint. Spatial dabs only apply newly increased brush influence while the button remains held, so retracing the same area does not keep building it up; release the button to begin a fresh stroke. Enable Airbrush when intentional timed buildup is desired. The usual Shift-to-Smooth and Ctrl-to-Invert modifiers work throughout a stroke.
+With the pointer released, a left click applies one dab and left-drag sculpts from either viewpoint. Choose **Capped** to apply only newly increased brush influence until the button is released, **Accumulate** to build up with every distance-spaced dab while moving, or **Airbrush** to add the same spatial buildup plus timed dabs while held still. Press `A` to cycle these choices. The choice is remembered separately for each sculpt tool and captured when a stroke begins; Grab remains movement-driven. The usual Shift-to-Smooth and Ctrl-to-Invert modifiers work throughout a stroke.
 
 ## Voxel remeshing
 

@@ -23,7 +23,9 @@ use crate::{
     },
     mesh::{Mesh, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
-    sculpt::{BrushSample, BrushSettings, DabKind, SculptEngine, SculptTool, SymmetryAxis},
+    sculpt::{
+        Accumulation, BrushSample, BrushSettings, DabKind, SculptEngine, SculptTool, SymmetryAxis,
+    },
     stl::{ImportReport, load_stl, save_stl_atomic},
     stroke::{MAX_DABS_PER_FRAME, StrokeSampler},
     voxel_remesh::{
@@ -54,6 +56,108 @@ struct SculptInput {
     tool: SculptTool,
     brush: BrushSettings,
     radius_points: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrokeMethod {
+    Spaced,
+    Airbrush,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StrokeBehavior {
+    method: StrokeMethod,
+    accumulation: Accumulation,
+}
+
+impl StrokeBehavior {
+    const CAPPED: Self = Self {
+        method: StrokeMethod::Spaced,
+        accumulation: Accumulation::Capped,
+    };
+    const ACCUMULATE: Self = Self {
+        method: StrokeMethod::Spaced,
+        accumulation: Accumulation::Accumulate,
+    };
+    const AIRBRUSH: Self = Self {
+        method: StrokeMethod::Airbrush,
+        accumulation: Accumulation::Accumulate,
+    };
+    const ALL: [Self; 3] = [Self::CAPPED, Self::ACCUMULATE, Self::AIRBRUSH];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CAPPED => "Capped",
+            Self::ACCUMULATE => "Accumulate",
+            Self::AIRBRUSH => "Airbrush",
+            _ => unreachable!(),
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::CAPPED => {
+                "Limit each vertex to the strongest influence reached during one held stroke."
+            }
+            Self::ACCUMULATE => "Build up the effect with every distance-spaced dab while moving.",
+            Self::AIRBRUSH => {
+                "Build up while moving and emit timed dabs while the pointer is held still."
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::CAPPED => Self::ACCUMULATE,
+            Self::ACCUMULATE => Self::AIRBRUSH,
+            Self::AIRBRUSH => Self::CAPPED,
+            _ => Self::CAPPED,
+        }
+    }
+}
+
+impl Default for StrokeBehavior {
+    fn default() -> Self {
+        Self::CAPPED
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ToolStrokeBehaviors {
+    values: [StrokeBehavior; 9],
+}
+
+impl ToolStrokeBehaviors {
+    fn get(&self, tool: SculptTool) -> StrokeBehavior {
+        self.values[Self::index(tool)]
+    }
+
+    fn set(&mut self, tool: SculptTool, behavior: StrokeBehavior) {
+        self.values[Self::index(tool)] = behavior;
+    }
+
+    const fn index(tool: SculptTool) -> usize {
+        match tool {
+            SculptTool::Grab => 0,
+            SculptTool::Draw => 1,
+            SculptTool::Clay => 2,
+            SculptTool::Crease => 3,
+            SculptTool::Inflate => 4,
+            SculptTool::Smooth => 5,
+            SculptTool::Pinch => 6,
+            SculptTool::Flatten => 7,
+            SculptTool::Mask => 8,
+        }
+    }
+}
+
+impl Default for ToolStrokeBehaviors {
+    fn default() -> Self {
+        Self {
+            values: [StrokeBehavior::CAPPED; 9],
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -106,7 +210,7 @@ enum ShortcutAction {
     AdjustRadius(ShortcutDirection),
     AdjustStrength(ShortcutDirection),
     AdjustHardness(ShortcutDirection),
-    ToggleAirbrush,
+    CycleStrokeApplication,
     ToggleBrushInvert,
     SetSymmetry(Option<SymmetryAxis>),
     ClearMask,
@@ -222,7 +326,11 @@ const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
         Key::Period,
         ShortcutAction::AdjustHardness(ShortcutDirection::Increase),
     ),
-    shortcut(Modifiers::NONE, Key::A, ShortcutAction::ToggleAirbrush),
+    shortcut(
+        Modifiers::NONE,
+        Key::A,
+        ShortcutAction::CycleStrokeApplication,
+    ),
     shortcut(Modifiers::NONE, Key::I, ShortcutAction::ToggleBrushInvert),
     shortcut(
         Modifiers::NONE,
@@ -272,7 +380,7 @@ fn shortcut_is_enabled(action: ShortcutAction, availability: ShortcutAvailabilit
         | ShortcutAction::SetSymmetry(_)
         | ShortcutAction::ClearMask
         | ShortcutAction::InvertMask => availability.mesh_ready,
-        ShortcutAction::ToggleAirbrush => {
+        ShortcutAction::CycleStrokeApplication => {
             availability.mesh_ready && availability.tool != SculptTool::Grab
         }
     }
@@ -603,6 +711,27 @@ fn effective_tool(tool: SculptTool, modifiers: Modifiers) -> SculptTool {
     } else {
         tool
     }
+}
+
+fn stroke_behavior_for_press(
+    behaviors: &ToolStrokeBehaviors,
+    tool: SculptTool,
+    modifiers: Modifiers,
+) -> StrokeBehavior {
+    let effective = effective_tool(tool, modifiers);
+    if effective == SculptTool::Grab {
+        StrokeBehavior::CAPPED
+    } else {
+        behaviors.get(effective)
+    }
+}
+
+fn timed_dabs_enabled(
+    behavior: StrokeBehavior,
+    effective_tool: SculptTool,
+    released: bool,
+) -> bool {
+    behavior.method == StrokeMethod::Airbrush && effective_tool != SculptTool::Grab && !released
 }
 
 fn active_tool_text(tool: SculptTool, brush_invert: bool, modifiers: Modifiers) -> String {
@@ -1018,7 +1147,8 @@ pub struct SculptLiteApp {
     sculpt: SculptEngine,
     tool: SculptTool,
     brush: BrushSettings,
-    airbrush: bool,
+    stroke_behaviors: ToolStrokeBehaviors,
+    active_stroke_behavior: Option<StrokeBehavior>,
     airbrush_dabs_per_second: f32,
     brush_radius_points: f32,
     voxel_remesh_settings: VoxelRemeshSettings,
@@ -1069,7 +1199,8 @@ impl SculptLiteApp {
             sculpt: SculptEngine::default(),
             tool: SculptTool::default(),
             brush: BrushSettings::default(),
-            airbrush: false,
+            stroke_behaviors: ToolStrokeBehaviors::default(),
+            active_stroke_behavior: None,
             airbrush_dabs_per_second: DEFAULT_AIRBRUSH_DABS_PER_SECOND,
             brush_radius_points: INITIAL_BRUSH_RADIUS_POINTS,
             voxel_remesh_settings: VoxelRemeshSettings::default(),
@@ -1258,6 +1389,7 @@ impl SculptLiteApp {
             dirty: false,
         });
         self.stroke_sampler = None;
+        self.active_stroke_behavior = None;
         self.frame_render = FrameRenderBatch::default();
     }
 
@@ -1282,6 +1414,7 @@ impl SculptLiteApp {
             document.dirty = dirty;
         }
         self.stroke_sampler = None;
+        self.active_stroke_behavior = None;
         self.frame_render = FrameRenderBatch::default();
     }
 
@@ -2129,7 +2262,11 @@ impl SculptLiteApp {
             ShortcutAction::AdjustHardness(direction) => {
                 self.brush.falloff = adjusted_brush_value(self.brush.falloff, direction, 0.0, 0.95);
             }
-            ShortcutAction::ToggleAirbrush => self.airbrush = !self.airbrush,
+            ShortcutAction::CycleStrokeApplication => {
+                let behavior = self.stroke_behaviors.get(self.tool).next();
+                self.stroke_behaviors.set(self.tool, behavior);
+                self.status = format!("{} stroke: {}", self.tool.label(), behavior.label());
+            }
             ShortcutAction::ToggleBrushInvert => self.brush.invert = !self.brush.invert,
             ShortcutAction::SetSymmetry(symmetry) => self.brush.symmetry = symmetry,
             ShortcutAction::ClearMask => self.edit_mask(false),
@@ -2399,19 +2536,46 @@ impl SculptLiteApp {
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.add_enabled_ui(mesh_ready, |ui| {
-                                    let supports_airbrush = self.tool != SculptTool::Grab;
-                                    ui.add_enabled_ui(supports_airbrush, |ui| {
-                                        let label = shortcut_label(
-                                            ui.ctx(),
-                                            "Airbrush",
-                                            &[ShortcutAction::ToggleAirbrush],
-                                        );
-                                        ui.checkbox(&mut self.airbrush, label)
-                                            .on_hover_text("Build up the brush effect while the pointer is held still.");
+                                    let supports_application = self.tool != SculptTool::Grab;
+                                    let current = self.stroke_behaviors.get(self.tool);
+                                    let mut selected = current;
+                                    ui.label(shortcut_label(
+                                        ui.ctx(),
+                                        "Application",
+                                        &[ShortcutAction::CycleStrokeApplication],
+                                    ));
+                                    ui.add_enabled_ui(supports_application, |ui| {
+                                        egui::ComboBox::from_id_salt("stroke_application")
+                                            .width(ui.available_width())
+                                            .selected_text(selected.label())
+                                            .show_ui(ui, |ui| {
+                                                for behavior in StrokeBehavior::ALL {
+                                                    ui.selectable_value(
+                                                        &mut selected,
+                                                        behavior,
+                                                        behavior.label(),
+                                                    )
+                                                    .on_hover_text(behavior.description());
+                                                }
+                                            });
                                     });
+                                    if supports_application && selected != current {
+                                        self.stroke_behaviors.set(self.tool, selected);
+                                        self.status = format!(
+                                            "{} stroke: {}",
+                                            self.tool.label(),
+                                            selected.label()
+                                        );
+                                    }
+                                    if !supports_application {
+                                        ui.small("Grab is movement-driven.");
+                                    } else {
+                                        ui.small(selected.description());
+                                    }
                                     ui.label("Rate");
                                     ui.add_enabled(
-                                        supports_airbrush && self.airbrush,
+                                        supports_application
+                                            && selected.method == StrokeMethod::Airbrush,
                                         egui::Slider::new(
                                             &mut self.airbrush_dabs_per_second,
                                             MIN_AIRBRUSH_DABS_PER_SECOND
@@ -2929,6 +3093,12 @@ impl SculptLiteApp {
                     && let Some(mesh) = document.mesh.as_ref()
                 {
                     self.sculpt.begin_stroke(mesh);
+                    let effective_tool = effective_tool(self.tool, modifiers);
+                    self.active_stroke_behavior = Some(stroke_behavior_for_press(
+                        &self.stroke_behaviors,
+                        self.tool,
+                        modifiers,
+                    ));
                     let sculpt_input = self.sculpt_input(camera_frame);
                     self.stroke_sampler = Some(StrokeSampler::begin(
                         position,
@@ -2938,7 +3108,6 @@ impl SculptLiteApp {
                         sculpt_input,
                         Instant::now(),
                     ));
-                    let effective_tool = effective_tool(sculpt_input.tool, modifiers);
                     if effective_tool != SculptTool::Grab {
                         let initial_dab = self
                             .stroke_sampler
@@ -3037,10 +3206,15 @@ impl SculptLiteApp {
     }
 
     fn sculpt_input(&self, camera: CameraFrame) -> SculptInput {
+        let mut brush = self.brush;
+        brush.accumulation = self
+            .active_stroke_behavior
+            .unwrap_or_else(|| self.stroke_behaviors.get(self.tool))
+            .accumulation;
         SculptInput {
             camera,
             tool: self.tool,
-            brush: self.brush,
+            brush,
             radius_points: self.brush_radius_points,
         }
     }
@@ -3084,12 +3258,16 @@ impl SculptLiteApp {
     }
 
     fn apply_airbrush_dab(&mut self) {
-        if !self.airbrush || self.tool == SculptTool::Grab {
-            return;
-        }
+        let behavior = self.active_stroke_behavior.unwrap_or_default();
         let interval = self.airbrush_interval();
         let dab = self.stroke_sampler.as_ref().and_then(|sampler| {
-            (!sampler.is_released() && sampler.airbrush_due(interval)).then_some(sampler.pointer())
+            let pointer = sampler.pointer();
+            (timed_dabs_enabled(
+                behavior,
+                effective_tool(pointer.context.tool, pointer.modifiers),
+                sampler.is_released(),
+            ) && sampler.airbrush_due(interval))
+            .then_some(pointer)
         });
         let Some(dab) = dab else {
             return;
@@ -3102,7 +3280,7 @@ impl SculptLiteApp {
                 pressure: dab.pressure,
                 modifiers: dab.modifiers,
                 hit: None,
-                kind: DabKind::Airbrush,
+                kind: DabKind::Timed,
             },
         );
         if let Some(sampler) = self.stroke_sampler.as_mut() {
@@ -3144,6 +3322,7 @@ impl SculptLiteApp {
             self.refresh_document_bounds();
         }
         self.stroke_sampler = None;
+        self.active_stroke_behavior = None;
     }
 
     fn apply_pointer_sample(&mut self, input: SculptInput, dab: PointerDab) {
@@ -3313,7 +3492,11 @@ impl eframe::App for SculptLiteApp {
         if let Some(sampler) = &self.stroke_sampler {
             if sampler.has_pending_path() {
                 context.request_repaint();
-            } else if self.airbrush && self.tool != SculptTool::Grab && !sampler.is_released() {
+            } else if timed_dabs_enabled(
+                self.active_stroke_behavior.unwrap_or_default(),
+                effective_tool(sampler.pointer().context.tool, sampler.pointer().modifiers),
+                sampler.is_released(),
+            ) {
                 context.request_repaint_after(sampler.airbrush_wait(self.airbrush_interval()));
             }
         }
@@ -3762,6 +3945,68 @@ mod tests {
     }
 
     #[test]
+    fn stroke_application_cycles_and_is_remembered_per_effective_tool() {
+        assert_eq!(StrokeBehavior::CAPPED.next(), StrokeBehavior::ACCUMULATE);
+        assert_eq!(StrokeBehavior::ACCUMULATE.next(), StrokeBehavior::AIRBRUSH);
+        assert_eq!(StrokeBehavior::AIRBRUSH.next(), StrokeBehavior::CAPPED);
+
+        let mut behaviors = ToolStrokeBehaviors::default();
+        behaviors.set(SculptTool::Draw, StrokeBehavior::ACCUMULATE);
+        behaviors.set(SculptTool::Smooth, StrokeBehavior::AIRBRUSH);
+
+        let captured = stroke_behavior_for_press(&behaviors, SculptTool::Draw, Modifiers::NONE);
+        behaviors.set(SculptTool::Draw, StrokeBehavior::AIRBRUSH);
+        assert_eq!(captured, StrokeBehavior::ACCUMULATE);
+        behaviors.set(SculptTool::Draw, StrokeBehavior::ACCUMULATE);
+
+        assert_eq!(
+            stroke_behavior_for_press(&behaviors, SculptTool::Draw, Modifiers::NONE),
+            StrokeBehavior::ACCUMULATE
+        );
+        assert_eq!(
+            stroke_behavior_for_press(&behaviors, SculptTool::Draw, Modifiers::SHIFT),
+            StrokeBehavior::AIRBRUSH
+        );
+        assert_eq!(
+            stroke_behavior_for_press(&behaviors, SculptTool::Clay, Modifiers::NONE),
+            StrokeBehavior::CAPPED
+        );
+        assert_eq!(
+            stroke_behavior_for_press(&behaviors, SculptTool::Grab, Modifiers::NONE),
+            StrokeBehavior::CAPPED
+        );
+    }
+
+    #[test]
+    fn only_active_airbrush_strokes_schedule_timed_dabs() {
+        assert!(!timed_dabs_enabled(
+            StrokeBehavior::CAPPED,
+            SculptTool::Draw,
+            false
+        ));
+        assert!(!timed_dabs_enabled(
+            StrokeBehavior::ACCUMULATE,
+            SculptTool::Draw,
+            false
+        ));
+        assert!(timed_dabs_enabled(
+            StrokeBehavior::AIRBRUSH,
+            SculptTool::Draw,
+            false
+        ));
+        assert!(!timed_dabs_enabled(
+            StrokeBehavior::AIRBRUSH,
+            SculptTool::Grab,
+            false
+        ));
+        assert!(!timed_dabs_enabled(
+            StrokeBehavior::AIRBRUSH,
+            SculptTool::Draw,
+            true
+        ));
+    }
+
+    #[test]
     fn cursor_color_tracks_temporary_brush_behavior() {
         let normal = brush_cursor_color(SculptTool::Clay, false, Modifiers::NONE);
         let smooth = brush_cursor_color(SculptTool::Clay, false, Modifiers::SHIFT);
@@ -3887,6 +4132,10 @@ mod tests {
             shortcuts_for(ShortcutAction::ToggleCameraMode).collect::<Vec<_>>(),
             [KeyboardShortcut::new(Modifiers::NONE, Key::V)]
         );
+        assert_eq!(
+            shortcuts_for(ShortcutAction::CycleStrokeApplication).collect::<Vec<_>>(),
+            [KeyboardShortcut::new(Modifiers::NONE, Key::A)]
+        );
     }
 
     #[test]
@@ -3901,10 +4150,13 @@ mod tests {
         assert!(shortcut_is_enabled(ShortcutAction::Open, ready));
         assert!(shortcut_is_enabled(ShortcutAction::Undo, ready));
         assert!(!shortcut_is_enabled(ShortcutAction::Redo, ready));
-        assert!(shortcut_is_enabled(ShortcutAction::ToggleAirbrush, ready));
+        assert!(shortcut_is_enabled(
+            ShortcutAction::CycleStrokeApplication,
+            ready
+        ));
 
         assert!(!shortcut_is_enabled(
-            ShortcutAction::ToggleAirbrush,
+            ShortcutAction::CycleStrokeApplication,
             ShortcutAvailability {
                 tool: SculptTool::Grab,
                 ..ready
