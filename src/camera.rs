@@ -311,7 +311,7 @@ impl Camera {
         if !delta_points.is_finite() {
             return;
         }
-        self.fly.yaw = (self.fly.yaw + delta_points.x * FLY_RADIANS_PER_POINT).rem_euclid(TAU);
+        self.fly.yaw = (self.fly.yaw - delta_points.x * FLY_RADIANS_PER_POINT).rem_euclid(TAU);
         self.fly.pitch = (self.fly.pitch - delta_points.y * FLY_RADIANS_PER_POINT)
             .clamp(-FRAC_PI_2 + MIN_PITCH_MARGIN, FRAC_PI_2 - MIN_PITCH_MARGIN);
     }
@@ -760,6 +760,21 @@ mod tests {
         camera.fly_look(Vec2::new(-2_000_000.0, -2_000_000.0));
         assert!((0.0..TAU).contains(&camera.fly.yaw));
         assert!(camera.fly.pitch < FRAC_PI_2);
+    }
+
+    #[test]
+    fn fly_horizontal_look_tracks_mouse_direction() {
+        let mut rightward = Camera::default();
+        rightward.set_mode(CameraMode::Fly);
+        let right = rightward.fly.right();
+        rightward.fly_look(Vec2::new(40.0, 0.0));
+        assert!(rightward.fly.forward().dot(right) > 0.0);
+
+        let mut leftward = Camera::default();
+        leftward.set_mode(CameraMode::Fly);
+        let right = leftward.fly.right();
+        leftward.fly_look(Vec2::new(-40.0, 0.0));
+        assert!(leftward.fly.forward().dot(right) < 0.0);
     }
 
     #[test]
