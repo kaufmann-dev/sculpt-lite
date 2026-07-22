@@ -332,7 +332,6 @@ struct MeshDocument {
     mesh: Option<Mesh>,
     bounds: Option<MeshBounds>,
     source_path: PathBuf,
-    report: ImportReport,
     dirty: bool,
 }
 
@@ -525,6 +524,19 @@ fn fly_capture_should_release(
 
 fn viewport_sense() -> Sense {
     Sense::drag()
+}
+
+fn quick_controls_copy(mode: CameraMode) -> (&'static str, &'static str) {
+    match mode {
+        CameraMode::Orbit => (
+            "LMB drag · Shift smooth · Ctrl invert",
+            "RMB drag pan · MMB drag orbit · Wheel zoom",
+        ),
+        CameraMode::Fly => (
+            "LMB drag · Shift smooth · Ctrl invert",
+            "Hold RMB · Mouse look · WASD move · Shift/Space down/up · Wheel speed · Esc release",
+        ),
+    }
 }
 
 fn sculpting_allowed(fly_captured: bool) -> bool {
@@ -934,7 +946,6 @@ impl SculptLiteApp {
             mesh: Some(mesh),
             bounds,
             source_path: path,
-            report,
             dirty: false,
         });
         self.stroke_sampler = None;
@@ -1856,51 +1867,6 @@ impl SculptLiteApp {
                                     } else {
                                         ui.label("Mesh operation in progress");
                                     }
-                                    egui::CollapsingHeader::new("Import details")
-                                        .default_open(false)
-                                        .show(ui, |ui| {
-                                            let report = document.report;
-                                            let removed = report.removed_invalid_faces
-                                                + report.removed_degenerate_faces
-                                                + report.removed_duplicate_faces;
-                                            let topology = if report.boundary_edges == 0
-                                                && report.non_manifold_edges == 0
-                                            {
-                                                "Closed · manifold".to_owned()
-                                            } else {
-                                                format!(
-                                                    "{} boundary · {} non-manifold",
-                                                    grouped(report.boundary_edges),
-                                                    grouped(report.non_manifold_edges)
-                                                )
-                                            };
-                                            egui::Grid::new("import_details_grid")
-                                                .num_columns(2)
-                                                .spacing([10.0, 3.0])
-                                                .show(ui, |ui| {
-                                                    ui.small("Source");
-                                                    ui.small(format!(
-                                                        "{} triangles",
-                                                        grouped(report.source_triangles)
-                                                    ));
-                                                    ui.end_row();
-                                                    ui.small("Welded");
-                                                    ui.small(format!(
-                                                        "{} vertices",
-                                                        grouped(report.welded_vertices)
-                                                    ));
-                                                    ui.end_row();
-                                                    ui.small("Removed");
-                                                    ui.small(format!(
-                                                        "{} faces",
-                                                        grouped(removed)
-                                                    ));
-                                                    ui.end_row();
-                                                    ui.small("Topology");
-                                                    ui.small(topology);
-                                                    ui.end_row();
-                                                });
-                                        });
                                 } else {
                                     ui.label("Import an STL mesh to begin sculpting.");
                                 }
@@ -1957,42 +1923,6 @@ impl SculptLiteApp {
                     .document
                     .as_ref()
                     .is_some_and(|document| document.mesh.is_some());
-                if self.show_quick_controls && has_mesh {
-                    let mut dismiss = false;
-                    egui::Frame::group(ui.style())
-                        .fill(Color32::from_rgb(35, 39, 47))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.vertical(|ui| {
-                                    ui.label(RichText::new("Quick controls").strong());
-                                    ui.small("Left drag: sculpt · Shift: smooth · Ctrl: invert");
-                                    match self.camera.mode() {
-                                        CameraMode::Orbit => {
-                                            ui.small(
-                                                "Right drag: pan · Middle drag: orbit · Wheel: zoom",
-                                            );
-                                        }
-                                        CameraMode::Fly => {
-                                            ui.small(
-                                                "Hold RMB: look · W/S: forward/back · A/D: strafe",
-                                            );
-                                            ui.small(
-                                                "Shift/Space: down/up · Wheel: adjust speed · Esc: release",
-                                            );
-                                        }
-                                    }
-                                });
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    dismiss = ui.small_button("Dismiss").clicked();
-                                });
-                            });
-                        });
-                    if dismiss {
-                        self.show_quick_controls = false;
-                    }
-                    ui.add_space(6.0);
-                }
-
                 let rect = ui.available_rect_before_wrap();
                 let response = ui.allocate_rect(rect, viewport_sense());
                 if let Some(sampler) = self.stroke_sampler.as_mut() {
@@ -2071,15 +2001,14 @@ impl SculptLiteApp {
                                 has_mesh,
                                 stroke_active: self.sculpt.is_stroking(),
                                 mesh_job_active: self.background_task.is_some(),
-                                modal_active: self.pending_action.is_some()
-                                    || self.error.is_some(),
+                                modal_active: self.pending_action.is_some() || self.error.is_some(),
                             })
                         {
                             self.capture_fly(context);
                         }
                         if self.fly_captured {
-                            let (look_delta, movement, wheel_points, delta_seconds) =
-                                context.input(|input| {
+                            let (look_delta, movement, wheel_points, delta_seconds) = context
+                                .input(|input| {
                                     let keys = FlyKeyState {
                                         w: input.key_down(Key::W),
                                         s: input.key_down(Key::S),
@@ -2128,6 +2057,64 @@ impl SculptLiteApp {
                 } else {
                     ui.painter()
                         .rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 25));
+                }
+
+                if self.show_quick_controls && has_mesh {
+                    let mode = self.camera.mode();
+                    let (sculpt_controls, view_controls) = quick_controls_copy(mode);
+                    let view_label = match mode {
+                        CameraMode::Orbit => "ORBIT",
+                        CameraMode::Fly => "FLY",
+                    };
+                    let overlay_width = (rect.width() - 24.0).clamp(240.0, 720.0);
+                    let mut dismiss = false;
+                    egui::Area::new(egui::Id::new("quick_controls_overlay"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(rect.min + Vec2::splat(12.0))
+                        .constrain_to(rect)
+                        .default_width(overlay_width)
+                        .show(context, |ui| {
+                            egui::Frame::NONE
+                                .fill(Color32::from_black_alpha(210))
+                                .corner_radius(6)
+                                .inner_margin(10)
+                                .show(ui, |ui| {
+                                    ui.set_width(overlay_width);
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new("CONTROLS").strong());
+                                        ui.with_layout(
+                                            Layout::right_to_left(Align::Center),
+                                            |ui| {
+                                                dismiss = ui
+                                                    .small_button("×")
+                                                    .on_hover_text("Hide controls")
+                                                    .clicked();
+                                            },
+                                        );
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new("SCULPT")
+                                                .small()
+                                                .strong()
+                                                .color(Color32::from_rgb(120, 200, 235)),
+                                        );
+                                        ui.small(sculpt_controls);
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            RichText::new(view_label)
+                                                .small()
+                                                .strong()
+                                                .color(Color32::from_rgb(255, 198, 92)),
+                                        );
+                                        ui.small(view_controls);
+                                    });
+                                });
+                        });
+                    if dismiss {
+                        self.show_quick_controls = false;
+                    }
                 }
 
                 let (badge_color, badge_text) = match self.camera.mode() {
@@ -2725,6 +2712,19 @@ mod tests {
             Some(NavigationAction::Orbit)
         );
         assert_eq!(navigation_action(PointerButton::Primary), None);
+    }
+
+    #[test]
+    fn quick_controls_copy_matches_the_active_camera_mode() {
+        let (orbit_sculpt, orbit_view) = quick_controls_copy(CameraMode::Orbit);
+        assert!(orbit_sculpt.contains("LMB drag"));
+        assert!(orbit_view.contains("RMB drag pan"));
+        assert!(orbit_view.contains("MMB drag orbit"));
+
+        let (fly_sculpt, fly_view) = quick_controls_copy(CameraMode::Fly);
+        assert_eq!(fly_sculpt, orbit_sculpt);
+        assert!(fly_view.contains("Hold RMB"));
+        assert!(fly_view.contains("Shift/Space down/up"));
     }
 
     #[test]
