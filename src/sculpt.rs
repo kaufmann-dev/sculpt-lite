@@ -1,7 +1,7 @@
 use std::fmt;
 
 use glam::Vec3;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use smallvec::SmallVec;
 
 use crate::{
@@ -100,14 +100,6 @@ impl SymmetryAxis {
             Self::Z => Vec3::new(vector.x, vector.y, -vector.z),
         }
     }
-
-    fn distance_to_plane(self, point: Vec3, plane_center: Vec3) -> f32 {
-        match self {
-            Self::X => (point.x - plane_center.x).abs(),
-            Self::Y => (point.y - plane_center.y).abs(),
-            Self::Z => (point.z - plane_center.z).abs(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -202,6 +194,42 @@ pub struct StrokeState {
     mirrored_seed: Option<u32>,
     original: StrokeOriginals,
     coverage: CoverageMap,
+    planes: HashMap<PlaneChannel, BrushFrame>,
+    density_checked: bool,
+    warning: Option<String>,
+    grab: Option<GrabState>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GrabVertex {
+    base: Vec3,
+    primary_influence: f32,
+    mirrored_influence: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct GrabState {
+    vertices: HashMap<u32, GrabVertex>,
+    desired_delta: Vec3,
+    symmetry: Option<SymmetryAxis>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PassSide {
+    Primary,
+    Mirrored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PlaneChannel {
+    tool: SculptTool,
+    side: PassSide,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BrushFrame {
+    origin: Vec3,
+    normal: Vec3,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -252,6 +280,7 @@ impl CoverageChannel {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StrokeOutcome {
     pub edit: LocalEdit,
+    pub warning: Option<String>,
 }
 
 #[derive(Default, Debug)]
@@ -291,10 +320,186 @@ impl SculptEngine {
             mirrored_seed: None,
             original: StrokeOriginals::default(),
             coverage: CoverageMap::new(),
+            planes: HashMap::new(),
+            density_checked: false,
+            warning: None,
+            grab: None,
         });
         self.updated_vertices.clear();
         self.error = None;
         self.sample_committed = false;
+    }
+
+    /// Captures the region affected by Grab without deforming it.
+    pub fn anchor_grab(
+        &mut self,
+        mesh: &Mesh,
+        settings: &BrushSettings,
+        sample: BrushSample,
+    ) -> bool {
+        let Some(stroke) = self.active.as_ref() else {
+            return false;
+        };
+        if settings.radius <= f32::EPSILON
+            || !settings.radius.is_finite()
+            || !sample.center.is_finite()
+            || !sample.normal.is_finite()
+            || !sample.view_direction.is_finite()
+        {
+            return false;
+        }
+        let symmetry_center = stroke.symmetry_center;
+        let mut samples = SmallVec::<[(BrushSample, PassSide); 2]>::new();
+        samples.push((sample, PassSide::Primary));
+        if let Some(axis) = settings.symmetry {
+            let center = axis.reflect_point(sample.center, symmetry_center);
+            if let Some(seed) = mesh.nearest_triangle(center) {
+                samples.push((
+                    sample.reflected(axis, symmetry_center, seed),
+                    PassSide::Mirrored,
+                ));
+            }
+        }
+
+        let mut passes = SmallVec::<[PreparedPass; 2]>::new();
+        for (sample, side) in samples {
+            passes.push(PreparedPass::new(
+                mesh,
+                sample,
+                settings.radius,
+                side,
+                &mut self.traversal,
+            ));
+        }
+        let strength = settings.strength.abs() * sample.pressure.clamp(0.0, 1.0);
+        let mut vertices = HashMap::<u32, GrabVertex>::new();
+        for pass in &passes {
+            for &vertex in &pass.vertices {
+                let Some(&position) = mesh.positions.get(vertex as usize) else {
+                    continue;
+                };
+                let falloff = brush_falloff(
+                    position.distance(pass.sample.center) / settings.radius,
+                    settings.falloff,
+                );
+                let unmasked = 1.0
+                    - mesh
+                        .mask
+                        .get(vertex as usize)
+                        .copied()
+                        .unwrap_or(0.0)
+                        .clamp(0.0, 1.0);
+                let influence = (strength * falloff * unmasked).min(1.0);
+                if influence <= f32::EPSILON {
+                    continue;
+                }
+                let entry = vertices.entry(vertex).or_insert(GrabVertex {
+                    base: position,
+                    primary_influence: 0.0,
+                    mirrored_influence: 0.0,
+                });
+                match pass.side {
+                    PassSide::Primary => entry.primary_influence = influence,
+                    PassSide::Mirrored => entry.mirrored_influence = influence,
+                }
+            }
+        }
+        if vertices.is_empty() {
+            return false;
+        }
+        let warning = density_warning(mesh, &passes, settings.radius);
+        let stroke = self.active.as_mut().expect("active stroke checked above");
+        stroke.density_checked = true;
+        stroke.warning = warning;
+        stroke.grab = Some(GrabState {
+            vertices,
+            desired_delta: Vec3::ZERO,
+            symmetry: settings.symmetry,
+        });
+        true
+    }
+
+    /// Moves an anchored Grab selection without requiring another surface hit.
+    pub fn apply_grab_delta(&mut self, mesh: &mut Mesh, drag_delta: Vec3, pressure: f32) -> bool {
+        self.clear_step_outputs();
+        if !drag_delta.is_finite() || !pressure.is_finite() {
+            return false;
+        }
+        let Some(stroke) = self.active.as_mut() else {
+            return false;
+        };
+        let Some(grab) = stroke.grab.as_mut() else {
+            return false;
+        };
+        grab.desired_delta += drag_delta * pressure.clamp(0.0, 1.0);
+        let desired = grab.desired_delta;
+        let mut full = HashMap::with_capacity(grab.vertices.len());
+        for (&vertex, grabbed) in &grab.vertices {
+            let primary = grabbed.primary_influence;
+            let mirrored = grabbed.mirrored_influence;
+            let offset = if primary > 0.0 && mirrored > 0.0 {
+                let reflected = grab
+                    .symmetry
+                    .map_or(desired, |axis| axis.reflect_vector(desired));
+                (desired * primary + reflected * mirrored) / (primary + mirrored)
+                    * primary.max(mirrored)
+            } else if mirrored > 0.0 {
+                grab.symmetry
+                    .map_or(desired, |axis| axis.reflect_vector(desired))
+                    * mirrored
+            } else {
+                desired * primary
+            };
+            let next = grabbed.base + offset;
+            if mesh
+                .positions
+                .get(vertex as usize)
+                .is_some_and(|current| *current != next)
+            {
+                full.insert(vertex, next);
+            }
+        }
+        if full.is_empty() {
+            return false;
+        }
+
+        let mut accepted = None;
+        for scale in [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125] {
+            let candidates = full
+                .iter()
+                .filter_map(|(&vertex, &target)| {
+                    let grabbed = grab.vertices.get(&vertex)?;
+                    Some((vertex, grabbed.base + (target - grabbed.base) * scale))
+                })
+                .collect::<HashMap<_, _>>();
+            if let Some(faces) = mesh.validated_deformation_candidates(&candidates) {
+                accepted = Some((candidates, faces));
+                break;
+            }
+        }
+        let Some((candidates, faces)) = accepted else {
+            self.error = Some(
+                "Grab could not find a safe deformation step; move the pointer back toward the anchored region"
+                    .to_owned(),
+            );
+            return false;
+        };
+        let mut affected = Vec::with_capacity(candidates.len());
+        for (vertex, next) in candidates {
+            let index = vertex as usize;
+            let Some(position) = mesh.positions.get_mut(index) else {
+                continue;
+            };
+            stroke.original.positions.entry(vertex).or_insert(*position);
+            *position = next;
+            affected.push(vertex);
+        }
+        self.updated_vertices = mesh.update_deformed_faces(&faces);
+        self.updated_vertices.extend(affected);
+        self.updated_vertices.sort_unstable();
+        self.updated_vertices.dedup();
+        self.sample_committed = true;
+        true
     }
 
     /// Takes the deduplicated vertex IDs changed by the latest brush sample.
@@ -336,6 +541,8 @@ impl SculptEngine {
             || !settings.strength.is_finite()
             || settings.strength.abs() <= f32::EPSILON
             || !sample.center.is_finite()
+            || !sample.normal.is_finite()
+            || !sample.view_direction.is_finite()
             || !sample.pressure.is_finite()
             || sample.pressure.clamp(0.0, 1.0) <= 0.0
         {
@@ -346,9 +553,7 @@ impl SculptEngine {
         let cached_mirrored_seed = stroke.mirrored_seed;
         let mut samples = SmallVec::<[BrushSample; 2]>::from_slice(&[sample]);
 
-        if let Some(axis) = settings.symmetry
-            && axis.distance_to_plane(sample.center, symmetry_center) > settings.radius * 1.0e-4
-        {
+        if let Some(axis) = settings.symmetry {
             let mirrored_center = axis.reflect_point(sample.center, symmetry_center);
             let seed_triangle = cached_mirrored_seed
                 .filter(|&seed| triangle_is_near(mesh, seed, mirrored_center, settings.radius))
@@ -368,69 +573,141 @@ impl SculptEngine {
             }
         }
         let mut passes = SmallVec::<[PreparedPass; 2]>::new();
-        for brush_sample in samples {
+        for (index, brush_sample) in samples.into_iter().enumerate() {
             passes.push(PreparedPass::new(
                 mesh,
                 brush_sample,
                 settings.radius,
+                if index == 0 {
+                    PassSide::Primary
+                } else {
+                    PassSide::Mirrored
+                },
                 &mut self.traversal,
             ));
         }
 
         capture_source_positions(mesh, tool, &passes, &mut self.source_positions);
 
+        if let Some(stroke) = self.active.as_mut()
+            && !stroke.density_checked
+        {
+            stroke.density_checked = true;
+            stroke.warning = density_warning(mesh, &passes, settings.radius);
+        }
+
+        let (frames, staged_planes) = {
+            let stroke = self.active.as_ref().expect("active stroke checked above");
+            prepare_brush_frames(
+                mesh,
+                tool,
+                settings,
+                &passes,
+                &self.source_positions,
+                &stroke.planes,
+            )
+        };
+
         let channel = (dab_kind == DabKind::Spatial
             && settings.accumulation == Accumulation::Capped)
             .then(|| CoverageChannel::for_sample(tool, settings.invert ^ sample.invert_modifier))
             .flatten();
         let mut staged_coverage = CoverageMap::new();
-        let (changed, mut affected) = {
+        let mut proposals = ProposedEdits::default();
+        {
             let stroke = self.active.as_mut().expect("active stroke checked above");
             let mut coverage = SampleCoverage {
                 channel,
                 committed: &stroke.coverage,
                 staged: &mut staged_coverage,
             };
-            apply_passes(
+            let context = ProposalContext {
                 mesh,
                 tool,
                 settings,
-                &passes,
-                &self.source_positions,
-                &mut stroke.original,
-                &mut coverage,
-            )
-        };
-        if !changed {
-            return false;
+                source_positions: &self.source_positions,
+            };
+            propose_passes(&context, &passes, &frames, &mut coverage, &mut proposals);
         }
-        affected.sort_unstable();
-        affected.dedup();
         if tool == SculptTool::Mask {
+            if proposals.masks.is_empty() {
+                return false;
+            }
+            let stroke = self.active.as_mut().expect("active stroke checked above");
+            let mut affected = Vec::with_capacity(proposals.masks.len());
+            for (vertex, next) in proposals.masks {
+                let index = vertex as usize;
+                let Some(value) = mesh.mask.get_mut(index) else {
+                    continue;
+                };
+                if *value == next {
+                    continue;
+                }
+                stroke.original.masks.entry(vertex).or_insert(*value);
+                *value = next;
+                affected.push(vertex);
+            }
+            if affected.is_empty() {
+                return false;
+            }
             self.commit_coverage(staged_coverage);
+            self.commit_planes(staged_planes);
             self.updated_vertices = affected;
             self.sample_committed = true;
             return true;
         }
-        let Some(faces) = mesh.validated_deformation_faces(&affected) else {
-            for &vertex in &affected {
-                if let Some(&position) = self.source_positions.get(&vertex)
-                    && let Some(target) = mesh.positions.get_mut(vertex as usize)
-                {
-                    *target = position;
-                }
+
+        let candidates = candidate_positions(mesh, &proposals.positions, 1.0);
+        if candidates.is_empty() {
+            return false;
+        }
+        let mut accepted = None;
+        for scale in [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125] {
+            let scaled = if scale == 1.0 {
+                candidates.clone()
+            } else {
+                candidate_positions(mesh, &proposals.positions, scale)
+            };
+            if let Some(faces) = mesh.validated_deformation_candidates(&scaled) {
+                accepted = Some((scale, scaled, faces));
+                break;
             }
+        }
+        let Some((accepted_scale, candidates, faces)) = accepted else {
             self.error = Some(
-                "Sculpt sample rejected an invalid local mesh update; the latest brush sample was rolled back"
+                "Sculpt sample rejected an invalid local mesh update; no safe partial step was available"
                     .to_owned(),
             );
             return false;
         };
+        let stroke = self.active.as_mut().expect("active stroke checked above");
+        let mut affected = Vec::with_capacity(candidates.len());
+        for (vertex, next) in candidates {
+            let index = vertex as usize;
+            let Some(position) = mesh.positions.get_mut(index) else {
+                continue;
+            };
+            if *position == next {
+                continue;
+            }
+            if tool != SculptTool::Grab
+                && let Some(grabbed) = stroke
+                    .grab
+                    .as_mut()
+                    .and_then(|grab| grab.vertices.get_mut(&vertex))
+            {
+                grabbed.base += next - *position;
+            }
+            stroke.original.positions.entry(vertex).or_insert(*position);
+            *position = next;
+            affected.push(vertex);
+        }
         self.updated_vertices = mesh.update_deformed_faces(&faces);
         self.updated_vertices.extend(affected);
         self.updated_vertices.sort_unstable();
         self.updated_vertices.dedup();
-        self.commit_coverage(staged_coverage);
+        self.commit_coverage_scaled(staged_coverage, accepted_scale);
+        self.commit_planes(staged_planes);
         self.sample_committed = true;
         true
     }
@@ -442,6 +719,22 @@ impl SculptEngine {
         for (key, influence) in staged {
             let maximum = stroke.coverage.entry(key).or_default();
             *maximum = maximum.max(influence);
+        }
+    }
+
+    fn commit_coverage_scaled(&mut self, staged: CoverageMap, scale: f32) {
+        let Some(stroke) = self.active.as_mut() else {
+            return;
+        };
+        for (key, requested) in staged {
+            let previous = stroke.coverage.entry(key).or_default();
+            *previous += (requested - *previous).max(0.0) * scale;
+        }
+    }
+
+    fn commit_planes(&mut self, staged: HashMap<PlaneChannel, BrushFrame>) {
+        if let Some(stroke) = self.active.as_mut() {
+            stroke.planes.extend(staged);
         }
     }
 
@@ -483,10 +776,10 @@ impl SculptEngine {
             })
             .collect();
         let edit = LocalEdit::new(positions, masks);
-        if edit.is_empty() {
-            return StrokeOutcome::default();
+        StrokeOutcome {
+            edit,
+            warning: stroke.warning.take(),
         }
-        StrokeOutcome { edit }
     }
 }
 
@@ -494,12 +787,7 @@ impl SculptEngine {
 struct PreparedPass {
     sample: BrushSample,
     vertices: Vec<u32>,
-}
-
-struct SampleEdits<'a, 'coverage> {
-    affected: &'a mut Vec<u32>,
-    original: &'a mut StrokeOriginals,
-    coverage: &'a mut SampleCoverage<'coverage>,
+    side: PassSide,
 }
 
 struct SampleCoverage<'a> {
@@ -526,34 +814,77 @@ impl SampleCoverage<'_> {
         self.staged.insert(key, current);
         current - previous
     }
-
-    fn is_limited(&self) -> bool {
-        self.channel.is_some()
-    }
 }
 
-fn apply_passes(
-    mesh: &mut Mesh,
+#[derive(Clone, Copy, Debug, Default)]
+struct ProposalAccumulator {
+    weighted_unit: Vec3,
+    influence_sum: f32,
+    maximum_influence: f32,
+}
+
+type ProposalMap = HashMap<u32, Vec3>;
+type MaskProposalMap = HashMap<u32, f32>;
+
+struct ProposalContext<'a> {
+    mesh: &'a Mesh,
     tool: SculptTool,
-    settings: &BrushSettings,
+    settings: &'a BrushSettings,
+    source_positions: &'a HashMap<u32, Vec3>,
+}
+
+#[derive(Default)]
+struct ProposedEdits {
+    positions: ProposalMap,
+    masks: MaskProposalMap,
+}
+
+fn propose_passes(
+    context: &ProposalContext<'_>,
     passes: &[PreparedPass],
-    source_positions: &HashMap<u32, Vec3>,
-    original: &mut StrokeOriginals,
+    frames: &[BrushFrame],
     coverage: &mut SampleCoverage<'_>,
-) -> (bool, Vec<u32>) {
-    let mut affected = Vec::new();
-    let mut edits = SampleEdits {
-        affected: &mut affected,
-        original,
-        coverage,
-    };
-    let mut changed = false;
-    for pass in passes {
-        changed |= apply_pass(mesh, tool, settings, pass, source_positions, &mut edits);
+    output: &mut ProposedEdits,
+) {
+    let mut accumulated = HashMap::<u32, ProposalAccumulator>::new();
+    let mut mask_influence = HashMap::<u32, f32>::new();
+    for (pass, frame) in passes.iter().zip(frames) {
+        propose_pass(context, pass, *frame, &mut accumulated, &mut mask_influence);
     }
-    affected.sort_unstable();
-    affected.dedup();
-    (changed, affected)
+
+    let inverted = context.settings.invert
+        ^ passes
+            .first()
+            .is_some_and(|pass| pass.sample.invert_modifier);
+    let direction = if inverted { -1.0 } else { 1.0 };
+    if context.tool == SculptTool::Mask {
+        for (vertex, maximum) in mask_influence {
+            let influence = coverage.limited_influence(vertex, maximum);
+            let Some(&before) = context.mesh.mask.get(vertex as usize) else {
+                continue;
+            };
+            let next = (before + direction * influence).clamp(0.0, 1.0);
+            if next != before {
+                output.masks.insert(vertex, next);
+            }
+        }
+        return;
+    }
+
+    for (vertex, accumulated) in accumulated {
+        if accumulated.influence_sum <= f32::EPSILON {
+            continue;
+        }
+        let influence = coverage.limited_influence(vertex, accumulated.maximum_influence);
+        if influence <= f32::EPSILON {
+            continue;
+        }
+        let unit = accumulated.weighted_unit / accumulated.influence_sum;
+        let displacement = unit * influence.min(1.0);
+        if displacement.is_finite() && displacement.length_squared() > f32::EPSILON.powi(2) {
+            output.positions.insert(vertex, displacement);
+        }
+    }
 }
 
 impl PreparedPass {
@@ -561,6 +892,7 @@ impl PreparedPass {
         mesh: &Mesh,
         sample: BrushSample,
         radius: f32,
+        side: PassSide,
         traversal: &mut VertexTraversalScratch,
     ) -> Self {
         let mut vertices = Vec::new();
@@ -572,42 +904,37 @@ impl PreparedPass {
             traversal,
             &mut vertices,
         );
-        Self { sample, vertices }
+        Self {
+            sample,
+            vertices,
+            side,
+        }
     }
 }
 
-fn apply_pass(
-    mesh: &mut Mesh,
-    tool: SculptTool,
-    settings: &BrushSettings,
+fn propose_pass(
+    context: &ProposalContext<'_>,
     pass: &PreparedPass,
-    source_positions: &HashMap<u32, Vec3>,
-    edits: &mut SampleEdits<'_, '_>,
-) -> bool {
+    frame: BrushFrame,
+    proposals: &mut HashMap<u32, ProposalAccumulator>,
+    mask_influence: &mut HashMap<u32, f32>,
+) {
+    let mesh = context.mesh;
+    let tool = context.tool;
+    let settings = context.settings;
+    let source_positions = context.source_positions;
     let radius = settings.radius;
     let pressure = pass.sample.pressure.clamp(0.0, 1.0);
     let strength = settings.strength.abs() * pressure;
     if strength <= f32::EPSILON {
-        return false;
+        return;
     }
 
     let inverted = settings.invert ^ pass.sample.invert_modifier;
     let direction = if inverted { -1.0 } else { 1.0 };
-    let brush_normal = pass.sample.normal.normalize_or_zero();
-    let clay_plane = if tool == SculptTool::Clay {
-        clay_surface_plane(
-            mesh,
-            settings,
-            pass,
-            source_positions,
-            brush_normal,
-            direction,
-        )
-    } else {
-        None
-    };
-    let mut changed = false;
-
+    let brush_normal = frame.normal;
+    let smooth_units =
+        (tool == SculptTool::Smooth).then(|| taubin_smooth_units(mesh, pass, source_positions));
     for &vertex in &pass.vertices {
         let index = vertex as usize;
         let Some(&position) = source_positions.get(&vertex) else {
@@ -620,46 +947,31 @@ fn apply_pass(
         }
 
         if tool == SculptTool::Mask {
-            let Some(before) = mesh.mask.get(index).copied() else {
-                continue;
-            };
-            let influence = edits.coverage.limited_influence(vertex, strength * weight);
-            if influence <= f32::EPSILON {
-                continue;
-            }
-            let next = (before + direction * influence).clamp(0.0, 1.0);
-            if next != before {
-                edits.original.masks.entry(vertex).or_insert(before);
-                mesh.mask[index] = next;
-                edits.affected.push(vertex);
-                changed = true;
-            }
+            let maximum = mask_influence.entry(vertex).or_default();
+            *maximum = maximum.max(strength * weight);
             continue;
         }
 
         let unmasked = 1.0 - mesh.mask.get(index).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        let influence = edits
-            .coverage
-            .limited_influence(vertex, strength * weight * unmasked);
+        let influence = strength * weight * unmasked;
         if influence <= f32::EPSILON {
             continue;
         }
 
-        let displacement = match tool {
-            SculptTool::Grab => pass.sample.drag_delta * influence,
-            SculptTool::Draw => brush_normal * (direction * radius * 0.15 * influence),
+        let unit_displacement = match tool {
+            SculptTool::Grab => pass.sample.drag_delta,
+            SculptTool::Draw => brush_normal * (direction * radius * 0.15),
             SculptTool::Clay => {
-                let Some((plane_point, plane_normal)) = clay_plane else {
-                    continue;
-                };
+                let plane_normal = frame.normal;
+                let plane_point =
+                    frame.origin + plane_normal * (direction * settings.radius * 0.15);
                 let signed_plane_distance = (plane_point - position).dot(plane_normal);
-                plane_normal * signed_plane_distance * influence.min(1.0)
+                plane_normal * signed_plane_distance
             }
             SculptTool::Crease => {
                 let to_center = pass.sample.center - position;
                 let tangent = to_center - brush_normal * to_center.dot(brush_normal);
-                brush_normal * (direction * radius * 0.15 * influence)
-                    + tangent * ((2.0 / 3.0) * influence.min(1.0))
+                brush_normal * (direction * radius * 0.15) + tangent * (2.0 / 3.0)
             }
             SculptTool::Inflate => {
                 let mut normal = mesh
@@ -671,67 +983,92 @@ fn apply_pass(
                 if normal.dot(brush_normal) < 0.0 {
                     normal = -normal;
                 }
-                normal * (direction * radius * 0.15 * influence)
+                normal * (direction * radius * 0.15)
             }
             SculptTool::Smooth => {
-                let Some(neighbors) = mesh.topology.vertex_neighbors.get(index) else {
+                let Some(unit) = smooth_units.as_ref().and_then(|units| units.get(&vertex)) else {
                     continue;
                 };
-                if neighbors.is_empty() {
-                    continue;
-                }
-                let average = neighbors
-                    .iter()
-                    .filter_map(|neighbor| source_positions.get(neighbor))
-                    .copied()
-                    .sum::<Vec3>()
-                    / neighbors.len() as f32;
-                (average - position) * influence.min(1.0)
+                *unit
             }
             SculptTool::Pinch => {
                 let to_center = pass.sample.center - position;
                 let tangent = to_center - brush_normal * to_center.dot(brush_normal);
-                tangent * (direction * influence.min(1.0))
+                tangent * direction
             }
             SculptTool::Flatten => {
-                let signed_plane_distance = (pass.sample.center - position).dot(brush_normal);
-                brush_normal * (direction * signed_plane_distance * influence.min(1.0))
+                let signed_plane_distance = (frame.origin - position).dot(brush_normal);
+                brush_normal * (direction * signed_plane_distance)
             }
             SculptTool::Mask => unreachable!("mask is handled before geometry brushes"),
         };
 
-        if !displacement.is_finite() || displacement.length_squared() <= f32::EPSILON.powi(2) {
+        if !unit_displacement.is_finite()
+            || unit_displacement.length_squared() <= f32::EPSILON.powi(2)
+        {
             continue;
         }
-        let base = if edits.coverage.is_limited() {
-            mesh.positions[index]
-        } else {
-            position
-        };
-        let next = base + displacement;
-        if next != mesh.positions[index] {
-            edits
-                .original
-                .positions
-                .entry(vertex)
-                .or_insert(mesh.positions[index]);
-            mesh.positions[index] = next;
-            edits.affected.push(vertex);
-            changed = true;
-        }
+        let proposal = proposals.entry(vertex).or_default();
+        proposal.weighted_unit += unit_displacement * influence;
+        proposal.influence_sum += influence;
+        proposal.maximum_influence = proposal.maximum_influence.max(influence);
     }
-
-    changed
 }
 
-fn clay_surface_plane(
+fn candidate_positions(mesh: &Mesh, proposals: &ProposalMap, scale: f32) -> HashMap<u32, Vec3> {
+    proposals
+        .iter()
+        .filter_map(|(&vertex, &displacement)| {
+            let before = mesh.positions.get(vertex as usize).copied()?;
+            let next = before + displacement * scale;
+            (next != before).then_some((vertex, next))
+        })
+        .collect()
+}
+
+fn prepare_brush_frames(
+    mesh: &Mesh,
+    tool: SculptTool,
+    settings: &BrushSettings,
+    passes: &[PreparedPass],
+    source_positions: &HashMap<u32, Vec3>,
+    committed: &HashMap<PlaneChannel, BrushFrame>,
+) -> (Vec<BrushFrame>, HashMap<PlaneChannel, BrushFrame>) {
+    let mut frames = Vec::with_capacity(passes.len());
+    let mut staged = HashMap::new();
+    for pass in passes {
+        let raw = area_weighted_brush_frame(mesh, settings, pass, source_positions);
+        if matches!(tool, SculptTool::Clay | SculptTool::Flatten) {
+            let channel = PlaneChannel {
+                tool,
+                side: pass.side,
+            };
+            let stable = committed.get(&channel).map_or(raw, |previous| {
+                let mut normal = raw.normal;
+                if normal.dot(previous.normal) < 0.0 {
+                    normal = -normal;
+                }
+                BrushFrame {
+                    origin: previous.origin.lerp(raw.origin, 0.35),
+                    normal: (previous.normal * 0.65 + normal * 0.35).normalize_or_zero(),
+                }
+            });
+            staged.insert(channel, stable);
+            frames.push(stable);
+        } else {
+            frames.push(raw);
+        }
+    }
+    (frames, staged)
+}
+
+fn area_weighted_brush_frame(
     mesh: &Mesh,
     settings: &BrushSettings,
     pass: &PreparedPass,
     source_positions: &HashMap<u32, Vec3>,
-    brush_normal: Vec3,
-    direction: f32,
-) -> Option<(Vec3, Vec3)> {
+) -> BrushFrame {
+    let fallback_normal = pass.sample.normal.normalize_or_zero();
     let mut weighted_position = Vec3::ZERO;
     let mut weighted_normal = Vec3::ZERO;
     let mut weight_sum = 0.0;
@@ -740,20 +1077,22 @@ fn clay_surface_plane(
         let Some(&position) = source_positions.get(&vertex) else {
             continue;
         };
-        let weight = brush_falloff(
+        let falloff = brush_falloff(
             position.distance(pass.sample.center) / settings.radius,
             settings.falloff,
         );
-        if weight <= f32::EPSILON {
+        if falloff <= f32::EPSILON {
             continue;
         }
+        let area = vertex_surface_area(mesh, vertex, source_positions);
+        let weight = falloff * area.max(f32::EPSILON);
         let mut normal = mesh
             .normals
             .get(index)
             .copied()
-            .unwrap_or(brush_normal)
+            .unwrap_or(fallback_normal)
             .normalize_or_zero();
-        if normal.dot(brush_normal) < 0.0 {
+        if normal.dot(fallback_normal) < 0.0 {
             normal = -normal;
         }
         weighted_position += position * weight;
@@ -761,15 +1100,175 @@ fn clay_surface_plane(
         weight_sum += weight;
     }
     if weight_sum <= f32::EPSILON {
-        return None;
+        return BrushFrame {
+            origin: pass.sample.center,
+            normal: fallback_normal,
+        };
     }
     let plane_normal = weighted_normal.normalize_or_zero();
-    if plane_normal == Vec3::ZERO {
+    BrushFrame {
+        origin: weighted_position / weight_sum,
+        normal: if plane_normal == Vec3::ZERO {
+            fallback_normal
+        } else {
+            plane_normal
+        },
+    }
+}
+
+fn source_position(
+    mesh: &Mesh,
+    source_positions: &HashMap<u32, Vec3>,
+    vertex: u32,
+) -> Option<Vec3> {
+    source_positions
+        .get(&vertex)
+        .copied()
+        .or_else(|| mesh.positions.get(vertex as usize).copied())
+}
+
+fn vertex_surface_area(mesh: &Mesh, vertex: u32, source_positions: &HashMap<u32, Vec3>) -> f32 {
+    mesh.topology
+        .vertex_triangles
+        .get(vertex as usize)
+        .into_iter()
+        .flatten()
+        .filter_map(|&face| mesh.triangles.get(face as usize))
+        .filter_map(|triangle| {
+            let [a, b, c] = triangle.map(|index| source_position(mesh, source_positions, index));
+            Some((b? - a?).cross(c? - a?).length() / 6.0)
+        })
+        .sum()
+}
+
+fn taubin_smooth_units(
+    mesh: &Mesh,
+    pass: &PreparedPass,
+    source_positions: &HashMap<u32, Vec3>,
+) -> HashMap<u32, Vec3> {
+    const LAMBDA: f32 = 0.5;
+    const MU: f32 = -0.53;
+
+    let mut first_pass = HashMap::with_capacity(pass.vertices.len());
+    for &vertex in &pass.vertices {
+        if mesh
+            .topology
+            .non_manifold_vertices
+            .get(vertex as usize)
+            .copied()
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(position) = source_position(mesh, source_positions, vertex) else {
+            continue;
+        };
+        let neighbors = smoothing_neighbors(mesh, vertex);
+        if neighbors.is_empty() {
+            continue;
+        }
+        let average = neighbors
+            .iter()
+            .filter_map(|&neighbor| source_position(mesh, source_positions, neighbor))
+            .sum::<Vec3>()
+            / neighbors.len() as f32;
+        first_pass.insert(vertex, position + (average - position) * LAMBDA);
+    }
+
+    let mut units = HashMap::with_capacity(first_pass.len());
+    for (&vertex, &first_position) in &first_pass {
+        let neighbors = smoothing_neighbors(mesh, vertex);
+        if neighbors.is_empty() {
+            continue;
+        }
+        let average = neighbors
+            .iter()
+            .filter_map(|&neighbor| {
+                first_pass
+                    .get(&neighbor)
+                    .copied()
+                    .or_else(|| source_position(mesh, source_positions, neighbor))
+            })
+            .sum::<Vec3>()
+            / neighbors.len() as f32;
+        let Some(original) = source_position(mesh, source_positions, vertex) else {
+            continue;
+        };
+        units.insert(
+            vertex,
+            (first_position - original) + (average - first_position) * MU,
+        );
+    }
+    units
+}
+
+fn smoothing_neighbors(mesh: &Mesh, vertex: u32) -> Vec<u32> {
+    let Some(neighbors) = mesh.topology.vertex_neighbors.get(vertex as usize) else {
+        return Vec::new();
+    };
+    if !mesh
+        .topology
+        .boundary_vertices
+        .get(vertex as usize)
+        .copied()
+        .unwrap_or(false)
+    {
+        return neighbors.to_vec();
+    }
+    neighbors
+        .iter()
+        .copied()
+        .filter(|&neighbor| {
+            let edge = if vertex < neighbor {
+                (vertex, neighbor)
+            } else {
+                (neighbor, vertex)
+            };
+            mesh.topology
+                .edge_faces
+                .get(&edge)
+                .is_some_and(|faces| faces.len() == 1)
+        })
+        .collect()
+}
+
+fn density_warning(mesh: &Mesh, passes: &[PreparedPass], radius: f32) -> Option<String> {
+    let mut edges = HashSet::new();
+    let mut lengths = Vec::new();
+    for pass in passes {
+        for &vertex in &pass.vertices {
+            let Some(neighbors) = mesh.topology.vertex_neighbors.get(vertex as usize) else {
+                continue;
+            };
+            for &neighbor in neighbors {
+                let edge = if vertex < neighbor {
+                    (vertex, neighbor)
+                } else {
+                    (neighbor, vertex)
+                };
+                if edges.insert(edge)
+                    && let (Some(a), Some(b)) = (
+                        mesh.positions.get(edge.0 as usize),
+                        mesh.positions.get(edge.1 as usize),
+                    )
+                {
+                    let length = a.distance(*b);
+                    if length.is_finite() && length > f32::EPSILON {
+                        lengths.push(length);
+                    }
+                }
+            }
+        }
+    }
+    if lengths.is_empty() {
         return None;
     }
-    let plane_point =
-        weighted_position / weight_sum + plane_normal * (direction * settings.radius * 0.15);
-    Some((plane_point, plane_normal))
+    lengths.sort_by(f32::total_cmp);
+    let median = lengths[lengths.len() / 2];
+    (radius < median * 2.0).then(|| {
+        "Brush is undersampled by this mesh; increase its radius or voxel-remesh a closed mesh at finer resolution"
+            .to_owned()
+    })
 }
 
 /// Smooth radial brush weight with an optional hard inner core.
@@ -1185,21 +1684,23 @@ mod tests {
         let mut mesh = grid();
         let mut settings = test_settings();
         settings.falloff = 1.0;
-        let brush_sample = sample(Vec3::ZERO, 0);
+        settings.strength = 0.1;
+        let mut brush_sample = sample(Vec3::ZERO, 0);
+        brush_sample.normal = Vec3::NAN;
         let mut engine = SculptEngine::default();
         engine.begin_stroke(&mesh);
 
         assert!(!engine.apply_sample(
             &mut mesh,
-            SculptTool::Pinch,
+            SculptTool::Draw,
             &settings,
             brush_sample,
             DabKind::Spatial,
         ));
-        settings.strength = 0.1;
+        brush_sample.normal = Vec3::Z;
         assert!(engine.apply_sample(
             &mut mesh,
-            SculptTool::Pinch,
+            SculptTool::Draw,
             &settings,
             brush_sample,
             DabKind::Spatial,
@@ -1657,7 +2158,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_topology_rejects_a_degenerate_position_edit_before_refreshing_derived_data() {
+    fn fixed_topology_step_limits_a_degenerate_position_edit_before_refreshing_derived_data() {
         let mut mesh = grid();
         let before_positions = mesh.positions.clone();
         let before_normals = mesh.normals.clone();
@@ -1666,7 +2167,7 @@ mod tests {
         let mut engine = SculptEngine::default();
         engine.begin_stroke(&mesh);
 
-        assert!(!engine.apply_sample(
+        assert!(engine.apply_sample(
             &mut mesh,
             SculptTool::Pinch,
             &settings,
@@ -1674,11 +2175,135 @@ mod tests {
             DabKind::Spatial,
         ));
 
-        assert_eq!(mesh.positions, before_positions);
+        assert_ne!(mesh.positions, before_positions);
         assert_eq!(mesh.normals, before_normals);
-        assert!(engine.take_updated_vertices().is_empty());
-        assert!(engine.take_error().is_some());
+        assert!(!engine.take_updated_vertices().is_empty());
+        assert!(engine.take_error().is_none());
+        assert!(!engine.end_stroke(&mesh).edit.is_empty());
+    }
+
+    #[test]
+    fn anchored_grab_uses_press_selection_and_total_pointer_displacement() {
+        let mut mesh = grid();
+        let before = mesh.positions.clone();
+        let settings = test_settings();
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+        assert!(engine.anchor_grab(&mesh, &settings, sample(Vec3::ZERO, 0)));
+
+        assert!(engine.apply_grab_delta(&mut mesh, Vec3::new(0.25, 0.0, 0.0), 1.0));
+        assert!(mesh.positions[4].x > before[4].x);
+        assert!(engine.apply_grab_delta(&mut mesh, Vec3::new(-0.25, 0.0, 0.0), 1.0));
+        assert_eq!(mesh.positions, before);
         assert!(engine.end_stroke(&mesh).edit.is_empty());
+    }
+
+    #[test]
+    fn grab_symmetry_cancels_axis_motion_on_the_plane() {
+        let mut mesh = grid();
+        let mut settings = test_settings();
+        settings.symmetry = Some(SymmetryAxis::X);
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+        assert!(engine.anchor_grab(&mesh, &settings, sample(Vec3::ZERO, 0)));
+        assert!(engine.apply_grab_delta(&mut mesh, Vec3::new(0.25, 0.2, 0.0), 1.0));
+
+        assert!(mesh.positions[4].x.abs() < 1.0e-6);
+        assert!(mesh.positions[4].y > 0.0);
+    }
+
+    #[test]
+    fn temporary_smoothing_rebases_an_active_grab_anchor() {
+        let mut mesh = grid();
+        let mut settings = test_settings();
+        settings.accumulation = Accumulation::Accumulate;
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+        assert!(engine.anchor_grab(&mesh, &settings, sample(Vec3::ZERO, 0)));
+        assert!(engine.apply_grab_delta(&mut mesh, Vec3::new(0.25, 0.0, 0.0), 1.0));
+
+        let positions_before_smooth = mesh.positions.clone();
+        let bases_before = engine
+            .active
+            .as_ref()
+            .and_then(|stroke| stroke.grab.as_ref())
+            .unwrap()
+            .vertices
+            .iter()
+            .map(|(&vertex, grabbed)| (vertex, grabbed.base))
+            .collect::<HashMap<_, _>>();
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Smooth,
+            &settings,
+            sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
+        ));
+
+        let grab = engine
+            .active
+            .as_ref()
+            .and_then(|stroke| stroke.grab.as_ref())
+            .unwrap();
+        for (&vertex, grabbed) in &grab.vertices {
+            let smooth_delta =
+                mesh.positions[vertex as usize] - positions_before_smooth[vertex as usize];
+            assert!(
+                grabbed
+                    .base
+                    .abs_diff_eq(bases_before[&vertex] + smooth_delta, 1.0e-6)
+            );
+        }
+    }
+
+    #[test]
+    fn taubin_smoothing_keeps_more_volume_than_a_full_laplacian_step() {
+        fn volume(mesh: &Mesh) -> f32 {
+            mesh.triangles
+                .iter()
+                .map(|triangle| {
+                    let [a, b, c] = triangle.map(|vertex| mesh.positions[vertex as usize]);
+                    a.dot(b.cross(c)) / 6.0
+                })
+                .sum::<f32>()
+                .abs()
+        }
+
+        let mut mesh = octahedron();
+        let before = volume(&mesh);
+        let mut settings = test_settings();
+        settings.radius = 3.0;
+        settings.falloff = 1.0;
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Smooth,
+            &settings,
+            sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
+        ));
+
+        assert!(volume(&mesh) > before * 0.4);
+    }
+
+    #[test]
+    fn undersampled_brush_reports_one_non_blocking_warning() {
+        let mut mesh = grid();
+        let mut settings = test_settings();
+        settings.radius = 0.25;
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &settings,
+            sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
+        ));
+        let outcome = engine.end_stroke(&mesh);
+        assert!(outcome.warning.is_some());
+        assert!(!outcome.edit.is_empty());
     }
 
     #[test]

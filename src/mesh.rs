@@ -632,19 +632,18 @@ impl Mesh {
         normal_vertices
     }
 
-    /// Checks a position-only local edit before normals and BVH bounds are refreshed.
+    /// Checks sparse candidate positions before they are installed.
     ///
-    /// Fixed-topology brushes use this to reject non-finite positions and collapsed
-    /// incident triangles without paying for topology recording on every sample.
-    pub(crate) fn validated_deformation_faces(&self, moved_vertices: &[u32]) -> Option<Vec<u32>> {
+    /// Fixed-topology brushes use this to reject non-finite positions, collapsed
+    /// triangles, and face inversions without mutating the editable mesh first.
+    pub(crate) fn validated_deformation_candidates(
+        &self,
+        candidates: &HashMap<u32, Vec3>,
+    ) -> Option<Vec<u32>> {
         let mut affected_faces = Vec::new();
-        for &vertex in moved_vertices {
+        for (&vertex, &position) in candidates {
             let index = vertex as usize;
-            if !self
-                .positions
-                .get(index)
-                .is_some_and(|position| position.is_finite())
-            {
+            if self.positions.get(index).is_none() || !position.is_finite() {
                 return None;
             }
             let faces = self.topology.vertex_triangles.get(index)?;
@@ -660,7 +659,19 @@ impl Mesh {
         affected_faces.dedup();
         if affected_faces.iter().all(|&face| {
             let triangle = self.triangles[face as usize];
-            triangle_is_valid(&self.positions, triangle)
+            let before = triangle.map(|vertex| self.positions[vertex as usize]);
+            let after = triangle.map(|vertex| {
+                candidates
+                    .get(&vertex)
+                    .copied()
+                    .unwrap_or(self.positions[vertex as usize])
+            });
+            if !positions_form_valid_triangle(after) {
+                return false;
+            }
+            let before_cross = (before[1] - before[0]).cross(before[2] - before[0]);
+            let after_cross = (after[1] - after[0]).cross(after[2] - after[0]);
+            before_cross.dot(after_cross) > 0.0
         }) {
             Some(affected_faces)
         } else {
@@ -1782,6 +1793,16 @@ mod tests {
         .unwrap();
         assert_eq!(mesh.triangles, vec![[0, 2, 1]]);
         assert_eq!(mesh.mask, vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn candidate_validation_accepts_safe_motion_and_rejects_face_inversion() {
+        let mesh = square();
+        let safe = HashMap::from([(2, Vec3::new(1.0, 1.0, 0.25))]);
+        assert!(mesh.validated_deformation_candidates(&safe).is_some());
+
+        let inverted = HashMap::from([(2, Vec3::new(0.0, -2.0, 0.0))]);
+        assert!(mesh.validated_deformation_candidates(&inverted).is_none());
     }
 
     #[test]

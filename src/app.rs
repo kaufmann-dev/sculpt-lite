@@ -50,6 +50,19 @@ struct PointerDab {
     kind: DabKind,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct GrabTransform {
+    right: Vec3,
+    up: Vec3,
+    units_per_point: f32,
+}
+
+impl GrabTransform {
+    fn world_delta(self, delta: Vec2) -> Vec3 {
+        self.right * delta.x * self.units_per_point - self.up * delta.y * self.units_per_point
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SculptInput {
     camera: CameraFrame,
@@ -1157,6 +1170,7 @@ pub struct SculptLiteApp {
     wireframe: bool,
     show_quick_controls: bool,
     stroke_sampler: Option<StrokeSampler<SculptInput>>,
+    grab_transform: Option<GrabTransform>,
     frame_render: FrameRenderBatch,
     pending_action: Option<PendingAction>,
     worker: Option<BackgroundWorker>,
@@ -1209,6 +1223,7 @@ impl SculptLiteApp {
             wireframe: false,
             show_quick_controls: true,
             stroke_sampler: None,
+            grab_transform: None,
             frame_render: FrameRenderBatch::default(),
             pending_action: None,
             worker,
@@ -1391,6 +1406,7 @@ impl SculptLiteApp {
             dirty: false,
         });
         self.stroke_sampler = None;
+        self.grab_transform = None;
         self.active_stroke_behavior = None;
         self.frame_render = FrameRenderBatch::default();
     }
@@ -1416,6 +1432,7 @@ impl SculptLiteApp {
             document.dirty = dirty;
         }
         self.stroke_sampler = None;
+        self.grab_transform = None;
         self.active_stroke_behavior = None;
         self.frame_render = FrameRenderBatch::default();
     }
@@ -3111,6 +3128,34 @@ impl SculptLiteApp {
                         sculpt_input,
                         Instant::now(),
                     ));
+                    if self.tool == SculptTool::Grab {
+                        let depth_scale = (pointer_hit.hit.distance
+                            / sculpt_input.camera.distance().max(1.0e-6))
+                        .max(0.05);
+                        let units_per_point =
+                            sculpt_input.camera.world_units_per_point() * depth_scale;
+                        let mut settings = sculpt_input.brush;
+                        settings.radius = sculpt_input.radius_points * units_per_point;
+                        let sample = BrushSample::from_hit(
+                            &pointer_hit.hit,
+                            Vec3::ZERO,
+                            pointer_hit.view_direction,
+                            MOUSE_PRESSURE,
+                            modifiers.ctrl,
+                        );
+                        let anchored = self.document.as_ref().is_some_and(|document| {
+                            document.mesh.as_ref().is_some_and(|mesh| {
+                                self.sculpt.anchor_grab(mesh, &settings, sample)
+                            })
+                        });
+                        if anchored {
+                            self.grab_transform = Some(GrabTransform {
+                                right: sculpt_input.camera.right(),
+                                up: sculpt_input.camera.up(),
+                                units_per_point,
+                            });
+                        }
+                    }
                     if effective_tool != SculptTool::Grab {
                         let initial_dab = self
                             .stroke_sampler
@@ -3149,17 +3194,18 @@ impl SculptLiteApp {
                                 })
                                 .unwrap_or(Vec2::ZERO);
                             if delta.length_sq() > f32::EPSILON {
-                                self.apply_pointer_sample(
-                                    sculpt_input,
-                                    PointerDab {
-                                        position,
-                                        delta,
-                                        pressure: MOUSE_PRESSURE,
-                                        modifiers,
-                                        hit: None,
-                                        kind: DabKind::Spatial,
-                                    },
-                                );
+                                if let Some(transform) = self.grab_transform {
+                                    let changed = self.document.as_mut().is_some_and(|document| {
+                                        document.mesh.as_mut().is_some_and(|mesh| {
+                                            self.sculpt.apply_grab_delta(
+                                                mesh,
+                                                transform.world_delta(delta),
+                                                MOUSE_PRESSURE,
+                                            )
+                                        })
+                                    });
+                                    self.consume_sculpt_step(changed, true);
+                                }
                                 if let Some(sampler) = self.stroke_sampler.as_mut() {
                                     sampler.record_spatial_dab();
                                 }
@@ -3306,17 +3352,23 @@ impl SculptLiteApp {
             .and_then(|document| document.mesh.as_ref())
             .map(|mesh| self.sculpt.end_stroke(mesh))
             .unwrap_or_default();
+        let warning = outcome.warning;
         let history_entry = (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit));
         if let Some(history_entry) = history_entry {
             if let Some(document) = self.document.as_mut() {
                 document.dirty = true;
             }
             let history_saved = self.history.record(history_entry);
-            self.status = if history_saved {
+            let base_status = if history_saved {
                 format!("{} stroke", self.tool.label())
             } else {
                 format!("{} stroke (undo memory limit reached)", self.tool.label())
             };
+            self.status = warning.as_ref().map_or(base_status.clone(), |warning| {
+                format!("{base_status} · {warning}")
+            });
+        } else if let Some(warning) = warning {
+            self.status = warning;
         }
         if self.document.as_ref().is_some_and(|document| {
             document.bounds.is_some_and(|bounds| !bounds.exact)
@@ -3325,6 +3377,7 @@ impl SculptLiteApp {
             self.refresh_document_bounds();
         }
         self.stroke_sampler = None;
+        self.grab_transform = None;
         self.active_stroke_behavior = None;
     }
 
@@ -4067,6 +4120,20 @@ mod tests {
     #[test]
     fn mouse_samples_use_full_pressure() {
         assert_eq!(MOUSE_PRESSURE, 1.0);
+    }
+
+    #[test]
+    fn grab_pointer_motion_uses_the_captured_world_space_transform() {
+        let transform = GrabTransform {
+            right: Vec3::X,
+            up: Vec3::Y,
+            units_per_point: 0.25,
+        };
+
+        assert_eq!(
+            transform.world_delta(Vec2::new(4.0, -2.0)),
+            Vec3::new(1.0, 0.5, 0.0)
+        );
     }
 
     #[test]
