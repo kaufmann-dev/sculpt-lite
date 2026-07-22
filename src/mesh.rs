@@ -1068,6 +1068,10 @@ impl Mesh {
         self.topology
             .bvh
             .remove_face(&self.positions, &self.triangles, face);
+        self.detach_face_topology(face, triangle, changes);
+    }
+
+    fn detach_face_topology(&mut self, face: u32, triangle: [u32; 3], changes: &mut MeshChangeSet) {
         if self.topology.face_lookup.get(&sorted_triangle(triangle)) == Some(&face) {
             self.topology.face_lookup.remove(&sorted_triangle(triangle));
         }
@@ -1098,6 +1102,13 @@ impl Mesh {
     }
 
     fn attach_face(&mut self, face: u32, triangle: [u32; 3], changes: &mut MeshChangeSet) {
+        self.attach_face_topology(face, triangle, changes);
+        self.topology
+            .bvh
+            .insert_face(&self.positions, &self.triangles, face);
+    }
+
+    fn attach_face_topology(&mut self, face: u32, triangle: [u32; 3], changes: &mut MeshChangeSet) {
         self.topology
             .face_lookup
             .insert(sorted_triangle(triangle), face);
@@ -1115,9 +1126,6 @@ impl Mesh {
                 changes.record_edge_change(edge, EdgeDelta::Added);
             }
         }
-        self.topology
-            .bvh
-            .insert_face(&self.positions, &self.triangles, face);
     }
 
     fn replace_face_local(
@@ -1132,6 +1140,82 @@ impl Mesh {
         self.detach_face(face, old, changes);
         self.triangles[face as usize] = triangle;
         self.attach_face(face, triangle, changes);
+        changes.dirty_faces.push(face);
+    }
+
+    fn replace_face_for_split(
+        &mut self,
+        face: u32,
+        triangle: [u32; 3],
+        recorder: &mut MeshEditRecorder,
+        changes: &mut MeshChangeSet,
+    ) {
+        recorder.record_face(self, face);
+        let old = self.triangles[face as usize];
+        let removed_vertex = old
+            .into_iter()
+            .find(|vertex| !triangle.contains(vertex))
+            .expect("an edge split removes one face vertex");
+        let added_vertex = triangle
+            .into_iter()
+            .find(|vertex| !old.contains(vertex))
+            .expect("an edge split adds its midpoint vertex");
+        debug_assert_eq!(added_vertex as usize, self.positions.len() - 1);
+
+        if self.topology.face_lookup.get(&sorted_triangle(old)) == Some(&face) {
+            self.topology.face_lookup.remove(&sorted_triangle(old));
+        }
+        self.topology
+            .face_lookup
+            .insert(sorted_triangle(triangle), face);
+
+        let incident = &mut self.topology.vertex_triangles[removed_vertex as usize];
+        let position = incident
+            .iter()
+            .position(|&candidate| candidate == face)
+            .expect("the split face is incident to its old vertex");
+        incident.swap_remove(position);
+        self.topology.vertex_triangles[added_vertex as usize].push(face);
+
+        let old_edges = triangle_edges(old);
+        let replacement_edges = triangle_edges(triangle);
+        for edge in old_edges {
+            if replacement_edges.contains(&edge) {
+                continue;
+            }
+            let faces = self
+                .topology
+                .edge_faces
+                .get_mut(&edge)
+                .expect("the split face has complete edge topology");
+            let position = faces
+                .iter()
+                .position(|&candidate| candidate == face)
+                .expect("the split face is attached to its old edge");
+            faces.swap_remove(position);
+            if faces.is_empty() {
+                self.topology.edge_faces.remove(&edge);
+                remove_small_value(&mut self.topology.vertex_neighbors[edge.0 as usize], edge.1);
+                remove_small_value(&mut self.topology.vertex_neighbors[edge.1 as usize], edge.0);
+                changes.record_edge_change(edge, EdgeDelta::Removed);
+            }
+        }
+        for edge in replacement_edges {
+            if old_edges.contains(&edge) {
+                continue;
+            }
+            let is_new = !self.topology.edge_faces.contains_key(&edge);
+            self.topology.edge_faces.entry(edge).or_default().push(face);
+            if is_new {
+                insert_small_sorted(&mut self.topology.vertex_neighbors[edge.0 as usize], edge.1);
+                insert_small_sorted(&mut self.topology.vertex_neighbors[edge.1 as usize], edge.0);
+                changes.record_edge_change(edge, EdgeDelta::Added);
+            }
+        }
+
+        self.triangles[face as usize] = triangle;
+        changes.dirty_vertices.extend(old);
+        changes.dirty_vertices.push(added_vertex);
         changes.dirty_faces.push(face);
     }
 
@@ -1949,6 +2033,8 @@ impl Mesh {
             .reserve(selected.len().saturating_mul(3));
 
         let mut split_count = 0;
+        let mut refit_faces = Vec::with_capacity(selected.len().saturating_mul(2));
+        let mut appended_faces = Vec::with_capacity(selected.len().saturating_mul(2));
         for ((a, b), faces) in selected {
             let Ok(new_vertex) = u32::try_from(self.positions.len()) else {
                 break;
@@ -1968,11 +2054,17 @@ impl Mesh {
             let appended = self.append_vertex_local(position, mask, recorder, changes);
             debug_assert_eq!(appended, new_vertex);
             active.insert(new_vertex);
-            self.replace_face_local(faces[0], first_a, recorder, changes);
-            self.replace_face_local(faces[1], second_a, recorder, changes);
-            self.append_face_local(first_b, recorder, changes);
-            self.append_face_local(second_b, recorder, changes);
+            self.replace_face_for_split(faces[0], first_a, recorder, changes);
+            self.replace_face_for_split(faces[1], second_a, recorder, changes);
+            refit_faces.extend(faces);
+            appended_faces.extend([first_b, second_b]);
             split_count += 1;
+        }
+        self.topology
+            .bvh
+            .refit_triangles(&self.positions, &self.triangles, &refit_faces);
+        for triangle in appended_faces {
+            self.append_face_local(triangle, recorder, changes);
         }
         if split_count != 0 {
             self.finish_local_changes(changes);
@@ -3025,6 +3117,14 @@ fn validate_positions_and_indices(
 
 fn edge_key(a: u32, b: u32) -> EdgeKey {
     if a < b { (a, b) } else { (b, a) }
+}
+
+fn triangle_edges(triangle: [u32; 3]) -> [EdgeKey; 3] {
+    [
+        edge_key(triangle[0], triangle[1]),
+        edge_key(triangle[1], triangle[2]),
+        edge_key(triangle[2], triangle[0]),
+    ]
 }
 
 fn mesh_vertex_state(mesh: &Mesh, vertex: u32) -> Option<MeshVertexState> {

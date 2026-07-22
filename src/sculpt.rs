@@ -12,7 +12,9 @@ use crate::{
     },
 };
 
-const MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB: usize = 128;
+// The compact undersized-brush patch needs more than 64 edits to retain bounded
+// support across repeated dabs, while 96 avoids spending a full frame over-refining it.
+const MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB: usize = 96;
 const ADAPTIVE_SPLIT_THRESHOLD: f32 = 2.0;
 const ADAPTIVE_COLLAPSE_THRESHOLD: f32 = 0.5;
 const MIN_ADAPTIVE_SUPPORT_INFLUENCE: f32 = 0.05;
@@ -395,7 +397,6 @@ impl SculptEngine {
                 return false;
             }
         }
-
         for brush_sample in &mut samples {
             if let Some(seed) = mesh.nearest_triangle(brush_sample.center) {
                 brush_sample.seed_triangle = seed;
@@ -477,18 +478,14 @@ impl SculptEngine {
             }
 
             if changed && !safe {
-                deformation_recorder
-                    .take()
-                    .expect("deformation attempt has a recorder")
-                    .finish(mesh)
-                    .apply_before(mesh);
+                restore_deformation(mesh, &affected, &self.source_positions, &baseline_faces);
+                deformation_recorder = None;
                 let mut low = 0.0_f32;
                 let mut high = 1.0_f32;
                 for _ in 0..SAFE_DEFORMATION_SEARCH_STEPS {
                     let factor = (low + high) * 0.5;
                     let mut scaled = *settings;
                     scaled.strength *= factor;
-                    let mut trial_recorder = MeshEditRecorder::new(mesh);
                     let (trial_changed, mut trial_affected) = apply_passes(
                         mesh,
                         tool,
@@ -500,7 +497,7 @@ impl SculptEngine {
                             .as_mut()
                             .expect("active stroke checked above")
                             .original,
-                        Some(&mut trial_recorder),
+                        None,
                     );
                     let trial_safe = trial_changed
                         && refresh_and_validate_deformation(
@@ -509,7 +506,12 @@ impl SculptEngine {
                             &baseline_faces,
                             &mut Vec::new(),
                         );
-                    trial_recorder.finish(mesh).apply_before(mesh);
+                    restore_deformation(
+                        mesh,
+                        &trial_affected,
+                        &self.source_positions,
+                        &baseline_faces,
+                    );
                     if trial_safe {
                         low = factor;
                     } else {
@@ -545,11 +547,13 @@ impl SculptEngine {
                             &mut self.updated_vertices,
                         );
                     if !safe {
-                        deformation_recorder
-                            .take()
-                            .expect("deformation attempt has a recorder")
-                            .finish(mesh)
-                            .apply_before(mesh);
+                        restore_deformation(
+                            mesh,
+                            &affected,
+                            &self.source_positions,
+                            &baseline_faces,
+                        );
+                        deformation_recorder = None;
                         changed = false;
                         self.updated_vertices.clear();
                     }
@@ -758,6 +762,25 @@ fn refresh_and_validate_deformation(
     updated_vertices.sort_unstable();
     updated_vertices.dedup();
     !mesh.faces_have_self_intersections(&faces)
+}
+
+fn restore_deformation(
+    mesh: &mut Mesh,
+    affected: &[u32],
+    source_positions: &HashMap<u32, Vec3>,
+    baseline_faces: &HashMap<u32, Vec3>,
+) {
+    for &vertex in affected {
+        let Some(&source) = source_positions.get(&vertex) else {
+            continue;
+        };
+        if let Some(position) = mesh.positions.get_mut(vertex as usize) {
+            *position = source;
+        }
+    }
+    let mut faces = baseline_faces.keys().copied().collect::<Vec<_>>();
+    faces.sort_unstable();
+    mesh.update_deformed_faces(&faces);
 }
 
 impl PreparedPass {
