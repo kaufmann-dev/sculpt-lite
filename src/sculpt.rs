@@ -41,7 +41,6 @@ pub enum SculptTool {
 
 impl SculptTool {
     pub const ALL: [Self; 9] = [
-        Self::Grab,
         Self::Draw,
         Self::Clay,
         Self::Crease,
@@ -49,6 +48,7 @@ impl SculptTool {
         Self::Smooth,
         Self::Pinch,
         Self::Flatten,
+        Self::Grab,
         Self::Mask,
     ];
 

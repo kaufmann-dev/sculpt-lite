@@ -10,8 +10,8 @@ use std::{
 };
 
 use eframe::egui::{
-    self, Align, Align2, Color32, Key, Layout, Modifiers, PointerButton, Pos2, Rect, RichText,
-    Sense, Vec2,
+    self, Align, Align2, Color32, Key, KeyboardShortcut, Layout, Modifiers, PointerButton, Pos2,
+    Rect, RichText, Sense, Vec2,
 };
 use glam::Vec3;
 
@@ -83,6 +83,241 @@ const BRUSH_SPACING_RADIUS_FRACTION: f32 = 0.15;
 const DEFAULT_ADAPTIVE_DETAIL: f32 = 0.12;
 const MOUSE_PRESSURE: f32 = 1.0;
 const SCULPT_FRAME_BUDGET: Duration = Duration::from_millis(8);
+const BRUSH_VALUE_STEP: f32 = 0.05;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShortcutDirection {
+    Decrease,
+    Increase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShortcutAction {
+    Open,
+    Export,
+    Undo,
+    Redo,
+    Frame,
+    ToggleWireframe,
+    SelectTool(SculptTool),
+    AdjustRadius(ShortcutDirection),
+    AdjustStrength(ShortcutDirection),
+    AdjustHardness(ShortcutDirection),
+    ToggleAirbrush,
+    ToggleAdaptiveTopology,
+    ToggleBrushInvert,
+    SetSymmetry(Option<SymmetryAxis>),
+    ClearMask,
+    InvertMask,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShortcutBinding {
+    shortcut: KeyboardShortcut,
+    action: ShortcutAction,
+}
+
+const fn shortcut(modifiers: Modifiers, key: Key, action: ShortcutAction) -> ShortcutBinding {
+    ShortcutBinding {
+        shortcut: KeyboardShortcut::new(modifiers, key),
+        action,
+    }
+}
+
+const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
+    // Put shortcuts with required Shift modifiers before their less-specific
+    // variants because egui permits extra Shift for logical key matching.
+    shortcut(
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::S,
+        ShortcutAction::Export,
+    ),
+    shortcut(
+        Modifiers::CTRL.plus(Modifiers::SHIFT),
+        Key::Z,
+        ShortcutAction::Redo,
+    ),
+    shortcut(Modifiers::CTRL, Key::O, ShortcutAction::Open),
+    shortcut(Modifiers::CTRL, Key::Z, ShortcutAction::Undo),
+    shortcut(Modifiers::CTRL, Key::Y, ShortcutAction::Redo),
+    shortcut(Modifiers::CTRL, Key::Backspace, ShortcutAction::ClearMask),
+    shortcut(Modifiers::CTRL, Key::I, ShortcutAction::InvertMask),
+    shortcut(Modifiers::NONE, Key::F, ShortcutAction::Frame),
+    shortcut(Modifiers::NONE, Key::W, ShortcutAction::ToggleWireframe),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num1,
+        ShortcutAction::SelectTool(SculptTool::Draw),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num2,
+        ShortcutAction::SelectTool(SculptTool::Clay),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num3,
+        ShortcutAction::SelectTool(SculptTool::Crease),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num4,
+        ShortcutAction::SelectTool(SculptTool::Inflate),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num5,
+        ShortcutAction::SelectTool(SculptTool::Smooth),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num6,
+        ShortcutAction::SelectTool(SculptTool::Pinch),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num7,
+        ShortcutAction::SelectTool(SculptTool::Flatten),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num8,
+        ShortcutAction::SelectTool(SculptTool::Grab),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num9,
+        ShortcutAction::SelectTool(SculptTool::Mask),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::OpenBracket,
+        ShortcutAction::AdjustRadius(ShortcutDirection::Decrease),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::CloseBracket,
+        ShortcutAction::AdjustRadius(ShortcutDirection::Increase),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Minus,
+        ShortcutAction::AdjustStrength(ShortcutDirection::Decrease),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Equals,
+        ShortcutAction::AdjustStrength(ShortcutDirection::Increase),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Comma,
+        ShortcutAction::AdjustHardness(ShortcutDirection::Decrease),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Period,
+        ShortcutAction::AdjustHardness(ShortcutDirection::Increase),
+    ),
+    shortcut(Modifiers::NONE, Key::A, ShortcutAction::ToggleAirbrush),
+    shortcut(
+        Modifiers::NONE,
+        Key::T,
+        ShortcutAction::ToggleAdaptiveTopology,
+    ),
+    shortcut(Modifiers::NONE, Key::I, ShortcutAction::ToggleBrushInvert),
+    shortcut(
+        Modifiers::NONE,
+        Key::Num0,
+        ShortcutAction::SetSymmetry(None),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::X,
+        ShortcutAction::SetSymmetry(Some(SymmetryAxis::X)),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Y,
+        ShortcutAction::SetSymmetry(Some(SymmetryAxis::Y)),
+    ),
+    shortcut(
+        Modifiers::NONE,
+        Key::Z,
+        ShortcutAction::SetSymmetry(Some(SymmetryAxis::Z)),
+    ),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShortcutAvailability {
+    actions_ready: bool,
+    mesh_ready: bool,
+    can_undo: bool,
+    can_redo: bool,
+    tool: SculptTool,
+}
+
+fn shortcut_is_enabled(action: ShortcutAction, availability: ShortcutAvailability) -> bool {
+    match action {
+        ShortcutAction::ToggleWireframe => true,
+        ShortcutAction::Open => availability.actions_ready,
+        ShortcutAction::Undo => availability.mesh_ready && availability.can_undo,
+        ShortcutAction::Redo => availability.mesh_ready && availability.can_redo,
+        ShortcutAction::Export
+        | ShortcutAction::Frame
+        | ShortcutAction::SelectTool(_)
+        | ShortcutAction::AdjustRadius(_)
+        | ShortcutAction::AdjustStrength(_)
+        | ShortcutAction::AdjustHardness(_)
+        | ShortcutAction::ToggleBrushInvert
+        | ShortcutAction::SetSymmetry(_)
+        | ShortcutAction::ClearMask
+        | ShortcutAction::InvertMask => availability.mesh_ready,
+        ShortcutAction::ToggleAirbrush => {
+            availability.mesh_ready && availability.tool != SculptTool::Grab
+        }
+        ShortcutAction::ToggleAdaptiveTopology => {
+            availability.mesh_ready && availability.tool != SculptTool::Mask
+        }
+    }
+}
+
+fn adjusted_brush_value(
+    value: f32,
+    direction: ShortcutDirection,
+    minimum: f32,
+    maximum: f32,
+) -> f32 {
+    let delta = match direction {
+        ShortcutDirection::Decrease => -BRUSH_VALUE_STEP,
+        ShortcutDirection::Increase => BRUSH_VALUE_STEP,
+    };
+    (value + delta).clamp(minimum, maximum)
+}
+
+fn shortcuts_for(action: ShortcutAction) -> impl Iterator<Item = KeyboardShortcut> {
+    SHORTCUT_BINDINGS
+        .iter()
+        .filter(move |binding| binding.action == action)
+        .map(|binding| binding.shortcut)
+}
+
+fn shortcut_hint(context: &egui::Context, actions: &[ShortcutAction]) -> String {
+    actions
+        .iter()
+        .flat_map(|&action| shortcuts_for(action))
+        .map(|binding| context.format_shortcut(&binding))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+fn shortcut_label(context: &egui::Context, label: &str, actions: &[ShortcutAction]) -> String {
+    format!("{label}  {}", shortcut_hint(context, actions))
+}
+
+fn shortcut_tooltip(context: &egui::Context, actions: &[ShortcutAction]) -> String {
+    format!("Shortcut: {}", shortcut_hint(context, actions))
+}
 
 fn adaptive_target_edge_length(radius: f32, detail: f32, units_per_point: f32) -> f32 {
     (radius * detail.clamp(0.03, 0.35)).max(units_per_point)
@@ -935,47 +1170,84 @@ impl SculptLiteApp {
         self.upload_vertices_partial(&changed_vertices);
     }
 
-    fn handle_shortcuts(&mut self, context: &egui::Context) {
-        if context.egui_wants_keyboard_input() {
+    fn shortcut_availability(&self) -> ShortcutAvailability {
+        let actions_ready = self.background_task.is_none() && !self.sculpt.is_stroking();
+        let mesh_ready = actions_ready
+            && self
+                .document
+                .as_ref()
+                .is_some_and(|document| document.mesh.is_some());
+        ShortcutAvailability {
+            actions_ready,
+            mesh_ready,
+            can_undo: self.history.can_undo(),
+            can_redo: self.history.can_redo(),
+            tool: self.tool,
+        }
+    }
+
+    fn apply_shortcut(&mut self, action: ShortcutAction, context: &egui::Context) {
+        if !shortcut_is_enabled(action, self.shortcut_availability()) {
             return;
         }
 
-        let open = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::O));
-        let export = context
-            .input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::S));
-        let undo = context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Z));
-        let redo = context.input_mut(|input| {
-            input.consume_key(Modifiers::CTRL, Key::Y)
-                || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Z)
-        });
-        let frame = context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F));
-        let smaller =
-            context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::OpenBracket));
-        let larger =
-            context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::CloseBracket));
+        match action {
+            ShortcutAction::Open => self.request_action(PendingAction::OpenDialog, context),
+            ShortcutAction::Export => {
+                self.export_as(None, context);
+            }
+            ShortcutAction::Undo => self.undo(context),
+            ShortcutAction::Redo => self.redo(context),
+            ShortcutAction::Frame => self.frame_mesh(),
+            ShortcutAction::ToggleWireframe => self.wireframe = !self.wireframe,
+            ShortcutAction::SelectTool(tool) => self.tool = tool,
+            ShortcutAction::AdjustRadius(direction) => match direction {
+                ShortcutDirection::Decrease => {
+                    self.brush_radius_points =
+                        (self.brush_radius_points / 1.12).max(MIN_BRUSH_RADIUS_POINTS);
+                }
+                ShortcutDirection::Increase => {
+                    self.brush_radius_points =
+                        (self.brush_radius_points * 1.12).min(MAX_BRUSH_RADIUS_POINTS);
+                }
+            },
+            ShortcutAction::AdjustStrength(direction) => {
+                self.brush.strength =
+                    adjusted_brush_value(self.brush.strength, direction, 0.01, 1.0);
+            }
+            ShortcutAction::AdjustHardness(direction) => {
+                self.brush.falloff = adjusted_brush_value(self.brush.falloff, direction, 0.0, 0.95);
+            }
+            ShortcutAction::ToggleAirbrush => self.airbrush = !self.airbrush,
+            ShortcutAction::ToggleAdaptiveTopology => {
+                self.adaptive_topology = !self.adaptive_topology;
+            }
+            ShortcutAction::ToggleBrushInvert => self.brush.invert = !self.brush.invert,
+            ShortcutAction::SetSymmetry(symmetry) => self.brush.symmetry = symmetry,
+            ShortcutAction::ClearMask => self.edit_mask(false),
+            ShortcutAction::InvertMask => self.edit_mask(true),
+        }
+    }
 
-        if open {
-            self.request_action(PendingAction::OpenDialog, context);
+    fn handle_shortcuts(&mut self, context: &egui::Context) {
+        if context.egui_wants_keyboard_input()
+            || self.pending_action.is_some()
+            || self.error.is_some()
+        {
+            return;
         }
-        if export {
-            self.export_as(None, context);
-        }
-        if undo {
-            self.undo(context);
-        }
-        if redo {
-            self.redo(context);
-        }
-        if frame {
-            self.frame_mesh();
-        }
-        if smaller {
-            self.brush_radius_points =
-                (self.brush_radius_points / 1.12).max(MIN_BRUSH_RADIUS_POINTS);
-        }
-        if larger {
-            self.brush_radius_points =
-                (self.brush_radius_points * 1.12).min(MAX_BRUSH_RADIUS_POINTS);
+
+        let actions = context.input_mut(|input| {
+            let mut actions = Vec::new();
+            for binding in SHORTCUT_BINDINGS {
+                if input.consume_shortcut(&binding.shortcut) && !actions.contains(&binding.action) {
+                    actions.push(binding.action);
+                }
+            }
+            actions
+        });
+        for action in actions {
+            self.apply_shortcut(action, context);
         }
     }
 
@@ -990,12 +1262,14 @@ impl SculptLiteApp {
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(actions_ready, egui::Button::new("Import STL"))
+                    .on_hover_text(shortcut_tooltip(context, &[ShortcutAction::Open]))
                     .clicked()
                 {
                     self.request_action(PendingAction::OpenDialog, context);
                 }
                 if ui
                     .add_enabled(mesh_ready, egui::Button::new("Export As…"))
+                    .on_hover_text(shortcut_tooltip(context, &[ShortcutAction::Export]))
                     .clicked()
                 {
                     self.export_as(None, context);
@@ -1006,6 +1280,7 @@ impl SculptLiteApp {
                         mesh_ready && self.history.can_undo(),
                         egui::Button::new("Undo"),
                     )
+                    .on_hover_text(shortcut_tooltip(context, &[ShortcutAction::Undo]))
                     .clicked()
                 {
                     self.undo(context);
@@ -1015,6 +1290,7 @@ impl SculptLiteApp {
                         mesh_ready && self.history.can_redo(),
                         egui::Button::new("Redo"),
                     )
+                    .on_hover_text(shortcut_tooltip(context, &[ShortcutAction::Redo]))
                     .clicked()
                 {
                     self.redo(context);
@@ -1022,11 +1298,14 @@ impl SculptLiteApp {
                 ui.separator();
                 if ui
                     .add_enabled(mesh_ready, egui::Button::new("Frame"))
+                    .on_hover_text(shortcut_tooltip(context, &[ShortcutAction::Frame]))
                     .clicked()
                 {
                     self.frame_mesh();
                 }
-                ui.checkbox(&mut self.wireframe, "Wireframe");
+                let wireframe_label =
+                    shortcut_label(context, "Wireframe", &[ShortcutAction::ToggleWireframe]);
+                ui.checkbox(&mut self.wireframe, wireframe_label);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new("SculptLite").strong());
                 });
@@ -1053,7 +1332,14 @@ impl SculptLiteApp {
                         .spacing([6.0, 6.0])
                         .show(ui, |ui| {
                             for (index, tool) in SculptTool::ALL.into_iter().enumerate() {
-                                ui.selectable_value(&mut self.tool, tool, tool.label());
+                                let action = ShortcutAction::SelectTool(tool);
+                                let label = shortcut_label(ui.ctx(), tool.label(), &[action]);
+                                if ui
+                                    .add(egui::Button::selectable(self.tool == tool, label))
+                                    .clicked()
+                                {
+                                    self.tool = tool;
+                                }
                                 if index % 2 == 1 {
                                     ui.end_row();
                                 }
@@ -1061,7 +1347,14 @@ impl SculptLiteApp {
                         });
 
                     ui.separator();
-                    ui.label("Radius");
+                    ui.label(shortcut_label(
+                        ui.ctx(),
+                        "Radius",
+                        &[
+                            ShortcutAction::AdjustRadius(ShortcutDirection::Decrease),
+                            ShortcutAction::AdjustRadius(ShortcutDirection::Increase),
+                        ],
+                    ));
                     ui.add(
                         egui::Slider::new(
                             &mut self.brush_radius_points,
@@ -1070,12 +1363,28 @@ impl SculptLiteApp {
                         .suffix(" px")
                         .logarithmic(true),
                     );
-                    ui.label("Strength");
+                    ui.label(shortcut_label(
+                        ui.ctx(),
+                        "Strength",
+                        &[
+                            ShortcutAction::AdjustStrength(ShortcutDirection::Decrease),
+                            ShortcutAction::AdjustStrength(ShortcutDirection::Increase),
+                        ],
+                    ));
                     ui.add(egui::Slider::new(&mut self.brush.strength, 0.01..=1.0));
-                    ui.label("Hardness");
+                    ui.label(shortcut_label(
+                        ui.ctx(),
+                        "Hardness",
+                        &[
+                            ShortcutAction::AdjustHardness(ShortcutDirection::Decrease),
+                            ShortcutAction::AdjustHardness(ShortcutDirection::Increase),
+                        ],
+                    ));
                     ui.add(egui::Slider::new(&mut self.brush.falloff, 0.0..=0.95));
                     ui.add_enabled_ui(self.tool != SculptTool::Grab, |ui| {
-                        ui.checkbox(&mut self.airbrush, "Airbrush");
+                        let label =
+                            shortcut_label(ui.ctx(), "Airbrush", &[ShortcutAction::ToggleAirbrush]);
+                        ui.checkbox(&mut self.airbrush, label);
                         if self.airbrush {
                             ui.label("Rate");
                             ui.add(
@@ -1088,7 +1397,12 @@ impl SculptLiteApp {
                         }
                     });
                     ui.add_enabled_ui(self.tool != SculptTool::Mask, |ui| {
-                        ui.checkbox(&mut self.adaptive_topology, "Adaptive topology");
+                        let label = shortcut_label(
+                            ui.ctx(),
+                            "Adaptive topology",
+                            &[ShortcutAction::ToggleAdaptiveTopology],
+                        );
+                        ui.checkbox(&mut self.adaptive_topology, label);
                         if self.adaptive_topology {
                             ui.small("Updates topology continuously inside the brush region.");
                             ui.label("Detail");
@@ -1098,41 +1412,93 @@ impl SculptLiteApp {
                             );
                         }
                     });
-                    ui.checkbox(&mut self.brush.invert, "Invert brush");
+                    let invert_label = shortcut_label(
+                        ui.ctx(),
+                        "Invert brush",
+                        &[ShortcutAction::ToggleBrushInvert],
+                    );
+                    ui.checkbox(&mut self.brush.invert, invert_label);
 
                     ui.separator();
                     ui.label("Symmetry");
                     egui::ComboBox::from_id_salt("symmetry")
                         .selected_text(match self.brush.symmetry {
-                            None => "Off",
-                            Some(SymmetryAxis::X) => "X axis",
-                            Some(SymmetryAxis::Y) => "Y axis",
-                            Some(SymmetryAxis::Z) => "Z axis",
+                            None => shortcut_label(
+                                ui.ctx(),
+                                "Off",
+                                &[ShortcutAction::SetSymmetry(None)],
+                            ),
+                            Some(SymmetryAxis::X) => shortcut_label(
+                                ui.ctx(),
+                                "X axis",
+                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::X))],
+                            ),
+                            Some(SymmetryAxis::Y) => shortcut_label(
+                                ui.ctx(),
+                                "Y axis",
+                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Y))],
+                            ),
+                            Some(SymmetryAxis::Z) => shortcut_label(
+                                ui.ctx(),
+                                "Z axis",
+                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Z))],
+                            ),
                         })
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.brush.symmetry, None, "Off");
+                            let off_label = shortcut_label(
+                                ui.ctx(),
+                                "Off",
+                                &[ShortcutAction::SetSymmetry(None)],
+                            );
+                            ui.selectable_value(&mut self.brush.symmetry, None, off_label);
+                            let x_label = shortcut_label(
+                                ui.ctx(),
+                                "X axis",
+                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::X))],
+                            );
                             ui.selectable_value(
                                 &mut self.brush.symmetry,
                                 Some(SymmetryAxis::X),
-                                "X axis",
+                                x_label,
+                            );
+                            let y_label = shortcut_label(
+                                ui.ctx(),
+                                "Y axis",
+                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Y))],
                             );
                             ui.selectable_value(
                                 &mut self.brush.symmetry,
                                 Some(SymmetryAxis::Y),
-                                "Y axis",
+                                y_label,
+                            );
+                            let z_label = shortcut_label(
+                                ui.ctx(),
+                                "Z axis",
+                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Z))],
                             );
                             ui.selectable_value(
                                 &mut self.brush.symmetry,
                                 Some(SymmetryAxis::Z),
-                                "Z axis",
+                                z_label,
                             );
                         });
 
                     ui.horizontal(|ui| {
-                        if ui.button("Clear mask").clicked() {
+                        if ui
+                            .button("Clear mask")
+                            .on_hover_text(shortcut_tooltip(ui.ctx(), &[ShortcutAction::ClearMask]))
+                            .clicked()
+                        {
                             self.edit_mask(false);
                         }
-                        if ui.button("Invert mask").clicked() {
+                        if ui
+                            .button("Invert mask")
+                            .on_hover_text(shortcut_tooltip(
+                                ui.ctx(),
+                                &[ShortcutAction::InvertMask],
+                            ))
+                            .clicked()
+                        {
                             self.edit_mask(true);
                         }
                     });
@@ -1635,7 +2001,7 @@ impl SculptLiteApp {
         let Some(pending) = self.pending_action.clone() else {
             return;
         };
-        egui::Modal::new(egui::Id::new("unsaved_sculpt")).show(context, |ui| {
+        let response = egui::Modal::new(egui::Id::new("unsaved_sculpt")).show(context, |ui| {
             ui.heading("Unsaved sculpt");
             ui.label("The current sculpt has changes that have not been exported.");
             ui.label("Export it before continuing?");
@@ -1655,19 +2021,25 @@ impl SculptLiteApp {
                 }
             });
         });
+        if response.should_close() {
+            self.pending_action = None;
+        }
     }
 
     fn error_prompt(&mut self, context: &egui::Context) {
         let Some(message) = self.error.clone() else {
             return;
         };
-        egui::Modal::new(egui::Id::new("sculpt_lite_error")).show(context, |ui| {
+        let response = egui::Modal::new(egui::Id::new("sculpt_lite_error")).show(context, |ui| {
             ui.heading("SculptLite error");
             ui.label(message);
             if ui.button("Close").clicked() {
                 self.error = None;
             }
         });
+        if response.should_close() {
+            self.error = None;
+        }
     }
 }
 
@@ -1827,6 +2199,134 @@ mod tests {
     #[test]
     fn mouse_samples_use_full_pressure() {
         assert_eq!(MOUSE_PRESSURE, 1.0);
+    }
+
+    #[test]
+    fn tool_shortcuts_follow_workflow_order() {
+        let assignments = [
+            (SculptTool::Draw, Key::Num1),
+            (SculptTool::Clay, Key::Num2),
+            (SculptTool::Crease, Key::Num3),
+            (SculptTool::Inflate, Key::Num4),
+            (SculptTool::Smooth, Key::Num5),
+            (SculptTool::Pinch, Key::Num6),
+            (SculptTool::Flatten, Key::Num7),
+            (SculptTool::Grab, Key::Num8),
+            (SculptTool::Mask, Key::Num9),
+        ];
+
+        assert_eq!(SculptTool::ALL, assignments.map(|(tool, _shortcut)| tool));
+        for (tool, key) in assignments {
+            assert_eq!(
+                shortcuts_for(ShortcutAction::SelectTool(tool)).collect::<Vec<_>>(),
+                [KeyboardShortcut::new(Modifiers::NONE, key)]
+            );
+        }
+    }
+
+    #[test]
+    fn shortcut_bindings_are_unique_and_prioritize_specific_redo() {
+        for (index, binding) in SHORTCUT_BINDINGS.iter().enumerate() {
+            assert!(
+                SHORTCUT_BINDINGS[..index]
+                    .iter()
+                    .all(|earlier| earlier.shortcut != binding.shortcut),
+                "duplicate shortcut: {:?}",
+                binding.shortcut
+            );
+        }
+
+        let shifted_redo = KeyboardShortcut::new(Modifiers::CTRL.plus(Modifiers::SHIFT), Key::Z);
+        let undo = KeyboardShortcut::new(Modifiers::CTRL, Key::Z);
+        let shifted_redo_index = SHORTCUT_BINDINGS
+            .iter()
+            .position(|binding| binding.shortcut == shifted_redo)
+            .unwrap();
+        let undo_index = SHORTCUT_BINDINGS
+            .iter()
+            .position(|binding| binding.shortcut == undo)
+            .unwrap();
+        assert!(shifted_redo_index < undo_index);
+
+        assert_eq!(
+            shortcuts_for(ShortcutAction::ToggleBrushInvert).collect::<Vec<_>>(),
+            [KeyboardShortcut::new(Modifiers::NONE, Key::I)]
+        );
+        assert_eq!(
+            shortcuts_for(ShortcutAction::InvertMask).collect::<Vec<_>>(),
+            [KeyboardShortcut::new(Modifiers::CTRL, Key::I)]
+        );
+    }
+
+    #[test]
+    fn shortcut_availability_matches_control_state() {
+        let ready = ShortcutAvailability {
+            actions_ready: true,
+            mesh_ready: true,
+            can_undo: true,
+            can_redo: false,
+            tool: SculptTool::Draw,
+        };
+        assert!(shortcut_is_enabled(ShortcutAction::Open, ready));
+        assert!(shortcut_is_enabled(ShortcutAction::Undo, ready));
+        assert!(!shortcut_is_enabled(ShortcutAction::Redo, ready));
+        assert!(shortcut_is_enabled(ShortcutAction::ToggleAirbrush, ready));
+        assert!(shortcut_is_enabled(
+            ShortcutAction::ToggleAdaptiveTopology,
+            ready
+        ));
+
+        assert!(!shortcut_is_enabled(
+            ShortcutAction::ToggleAirbrush,
+            ShortcutAvailability {
+                tool: SculptTool::Grab,
+                ..ready
+            }
+        ));
+        assert!(!shortcut_is_enabled(
+            ShortcutAction::ToggleAdaptiveTopology,
+            ShortcutAvailability {
+                tool: SculptTool::Mask,
+                ..ready
+            }
+        ));
+
+        let unavailable = ShortcutAvailability {
+            actions_ready: false,
+            mesh_ready: false,
+            can_undo: true,
+            can_redo: true,
+            tool: SculptTool::Draw,
+        };
+        assert!(!shortcut_is_enabled(ShortcutAction::Open, unavailable));
+        assert!(!shortcut_is_enabled(
+            ShortcutAction::SelectTool(SculptTool::Clay),
+            unavailable
+        ));
+        assert!(shortcut_is_enabled(
+            ShortcutAction::ToggleWireframe,
+            unavailable
+        ));
+    }
+
+    #[test]
+    fn brush_shortcut_steps_clamp_to_slider_bounds() {
+        assert_eq!(
+            adjusted_brush_value(0.5, ShortcutDirection::Decrease, 0.01, 1.0),
+            0.45
+        );
+        assert_eq!(
+            adjusted_brush_value(0.5, ShortcutDirection::Increase, 0.01, 1.0),
+            0.55
+        );
+        assert_eq!(
+            adjusted_brush_value(0.01, ShortcutDirection::Decrease, 0.01, 1.0),
+            0.01
+        );
+        assert_eq!(
+            adjusted_brush_value(0.95, ShortcutDirection::Increase, 0.0, 0.95),
+            0.95
+        );
     }
 
     #[test]
