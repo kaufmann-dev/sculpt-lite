@@ -9,6 +9,7 @@ const FLY_RADIANS_PER_POINT: f32 = 0.0025;
 const INITIAL_FLY_SPEED: f32 = 0.15;
 const MIN_FLY_SPEED: f32 = 0.002;
 const MAX_FLY_SPEED: f32 = 2.0;
+const FLY_BOOST_MULTIPLIER: f32 = 4.0;
 const MAX_FLY_DELTA_SECONDS: f32 = 0.1;
 const MAX_FLY_WHEEL_POINTS: f32 = 240.0;
 const FLY_WHEEL_EXPONENT_PER_POINT: f32 = 0.005;
@@ -109,6 +110,7 @@ pub(crate) struct FlyMovement {
     pub forward: f32,
     pub right: f32,
     pub up: f32,
+    pub boost: bool,
 }
 
 /// Positive Z is up. `yaw == 0` places the eye on the positive X axis and the
@@ -356,9 +358,15 @@ impl Camera {
             + self.fly.right() * finite_axis(movement.right)
             + Vec3::Z * finite_axis(movement.up);
         let direction = direction.normalize_or_zero();
+        let speed_multiplier = if movement.boost {
+            FLY_BOOST_MULTIPLIER
+        } else {
+            1.0
+        };
         let displacement = direction
             * self.scene_radius.max(1.0e-4)
             * self.fly.speed_radii_per_second
+            * speed_multiplier
             * delta_seconds;
         let position = self.fly.position + displacement;
         if position.is_finite() {
@@ -681,6 +689,7 @@ mod tests {
                 forward: 1.0,
                 right: 1.0,
                 up: 1.0,
+                ..FlyMovement::default()
             },
             0.1,
         );
@@ -688,6 +697,36 @@ mod tests {
         let straight_distance = straight.fly.position.distance(start);
         let diagonal_distance = diagonal.fly.position.distance(diagonal_start);
         assert!((straight_distance - diagonal_distance).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn fly_boost_temporarily_multiplies_movement_without_changing_base_speed() {
+        let mut normal = Camera::default();
+        normal.set_mode(CameraMode::Fly);
+        let mut boosted = normal.clone();
+        let normal_start = normal.fly.position;
+        let boosted_start = boosted.fly.position;
+
+        normal.fly_move(
+            FlyMovement {
+                forward: 1.0,
+                ..FlyMovement::default()
+            },
+            0.1,
+        );
+        boosted.fly_move(
+            FlyMovement {
+                forward: 1.0,
+                boost: true,
+                ..FlyMovement::default()
+            },
+            0.1,
+        );
+
+        let normal_distance = normal.fly.position.distance(normal_start);
+        let boosted_distance = boosted.fly.position.distance(boosted_start);
+        assert!((boosted_distance - normal_distance * FLY_BOOST_MULTIPLIER).abs() < 1.0e-6);
+        assert_eq!(normal.fly_speed(), boosted.fly_speed());
     }
 
     #[test]
@@ -804,6 +843,7 @@ mod tests {
                 forward: f32::NAN,
                 right: f32::INFINITY,
                 up: f32::NEG_INFINITY,
+                ..FlyMovement::default()
             },
             0.1,
         );

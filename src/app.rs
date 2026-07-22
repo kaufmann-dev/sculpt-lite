@@ -587,6 +587,7 @@ struct FlyKeyState {
     d: bool,
     shift: bool,
     space: bool,
+    ctrl: bool,
 }
 
 fn fly_movement(keys: FlyKeyState) -> FlyMovement {
@@ -597,6 +598,7 @@ fn fly_movement(keys: FlyKeyState) -> FlyMovement {
         forward: axis(keys.w, keys.s),
         right: axis(keys.d, keys.a),
         up: axis(keys.space, keys.shift),
+        boost: keys.ctrl,
     }
 }
 
@@ -691,11 +693,11 @@ fn quick_controls_copy(
         CameraMode::Fly => match fly_movement_mode {
             FlyMovementMode::Level => (
                 "LMB drag · Shift smooth · Ctrl invert",
-                "Hold RMB · Mouse look · WASD horizontal · Shift/Space down/up · Wheel speed · Esc release",
+                "Hold RMB · Mouse look · WASD horizontal · Shift/Space down/up · Ctrl boost · Wheel speed · Esc release",
             ),
             FlyMovementMode::Free => (
                 "LMB drag · Shift smooth · Ctrl invert",
-                "Hold RMB · Mouse look · W/S follow look · A/D strafe · Shift/Space down/up · Wheel speed · Esc release",
+                "Hold RMB · Mouse look · W/S follow look · A/D strafe · Shift/Space down/up · Ctrl boost · Wheel speed · Esc release",
             ),
         },
     }
@@ -2794,7 +2796,7 @@ impl SculptLiteApp {
                                 FlyMovementMode::Free => "W/S: follow look · A/D: strafe",
                             };
                             ui.small(format!(
-                                "Hold RMB: look/fly · {movement} · Shift/Space: height · Wheel: speed"
+                                "Hold RMB: look/fly · {movement} · Shift/Space: height · Ctrl: boost · Wheel: speed"
                             ));
                         }
                     }
@@ -2925,6 +2927,7 @@ impl SculptLiteApp {
                                         d: input.key_down(Key::D),
                                         shift: input.modifiers.shift,
                                         space: input.key_down(Key::Space),
+                                        ctrl: input.modifiers.ctrl,
                                     };
                                     (
                                         fly_look_delta(
@@ -3751,6 +3754,7 @@ mod tests {
         assert!(level_view.contains("Hold RMB"));
         assert!(level_view.contains("WASD horizontal"));
         assert!(level_view.contains("Shift/Space down/up"));
+        assert!(level_view.contains("Ctrl boost"));
 
         let (free_sculpt, free_view) = quick_controls_copy(CameraMode::Fly, FlyMovementMode::Free);
         assert_eq!(free_sculpt, orbit_sculpt);
@@ -3780,6 +3784,7 @@ mod tests {
                 forward: 1.0,
                 right: -1.0,
                 up: 1.0,
+                ..FlyMovement::default()
             }
         );
         assert_eq!(
@@ -3800,8 +3805,16 @@ mod tests {
                 d: true,
                 shift: true,
                 space: true,
+                ctrl: false,
             }),
             FlyMovement::default()
+        );
+        assert!(
+            fly_movement(FlyKeyState {
+                ctrl: true,
+                ..FlyKeyState::default()
+            })
+            .boost
         );
     }
 
