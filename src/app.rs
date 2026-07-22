@@ -440,9 +440,8 @@ struct FlyKeyState {
     s: bool,
     a: bool,
     d: bool,
-    q: bool,
-    e: bool,
-    boost: bool,
+    shift: bool,
+    space: bool,
 }
 
 fn fly_movement(keys: FlyKeyState) -> FlyMovement {
@@ -452,8 +451,7 @@ fn fly_movement(keys: FlyKeyState) -> FlyMovement {
     FlyMovement {
         forward: axis(keys.w, keys.s),
         right: axis(keys.d, keys.a),
-        up: axis(keys.e, keys.q),
-        boost: keys.boost,
+        up: axis(keys.space, keys.shift),
     }
 }
 
@@ -1920,7 +1918,9 @@ impl SculptLiteApp {
                             ui.small("RMB: pan · MMB: orbit · Wheel: zoom");
                         }
                         CameraMode::Fly => {
-                            ui.small("Hold RMB: look/fly · WASD + Q/E: move · Wheel: speed");
+                            ui.small(
+                                "Hold RMB: look/fly · WASD + Shift/Space: move · Wheel: speed",
+                            );
                         }
                     }
                 });
@@ -1974,10 +1974,10 @@ impl SculptLiteApp {
                                         }
                                         CameraMode::Fly => {
                                             ui.small(
-                                                "Hold RMB: look · W/S: forward/back · A/D: strafe · Q/E: down/up",
+                                                "Hold RMB: look · W/S: forward/back · A/D: strafe",
                                             );
                                             ui.small(
-                                                "Shift: 4× speed · Wheel: adjust speed · Esc: release",
+                                                "Shift/Space: down/up · Wheel: adjust speed · Esc: release",
                                             );
                                         }
                                     }
@@ -2085,9 +2085,8 @@ impl SculptLiteApp {
                                         s: input.key_down(Key::S),
                                         a: input.key_down(Key::A),
                                         d: input.key_down(Key::D),
-                                        q: input.key_down(Key::Q),
-                                        e: input.key_down(Key::E),
-                                        boost: input.modifiers.shift,
+                                        shift: input.modifiers.shift,
+                                        space: input.key_down(Key::Space),
                                     };
                                     (
                                         fly_look_delta(
@@ -2734,15 +2733,23 @@ mod tests {
             fly_movement(FlyKeyState {
                 w: true,
                 a: true,
-                e: true,
-                boost: true,
+                space: true,
                 ..FlyKeyState::default()
             }),
             FlyMovement {
                 forward: 1.0,
                 right: -1.0,
                 up: 1.0,
-                boost: true,
+            }
+        );
+        assert_eq!(
+            fly_movement(FlyKeyState {
+                shift: true,
+                ..FlyKeyState::default()
+            }),
+            FlyMovement {
+                up: -1.0,
+                ..FlyMovement::default()
             }
         );
         assert_eq!(
@@ -2751,9 +2758,8 @@ mod tests {
                 s: true,
                 a: true,
                 d: true,
-                q: true,
-                e: true,
-                ..FlyKeyState::default()
+                shift: true,
+                space: true,
             }),
             FlyMovement::default()
         );
