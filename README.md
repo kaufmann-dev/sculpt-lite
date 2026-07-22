@@ -4,7 +4,7 @@ SculptLite is a native Linux desktop application for importing, sculpting, and e
 
 ## Viewport controls
 
-Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle modes. In Orbit, right-drag pans, middle-drag orbits, and the wheel zooms. In Fly, hold RMB to capture the pointer, look with the mouse, move horizontally with `W`/`S`, strafe horizontally with `A`/`D`, move down with Shift, and move up with Space; use the wheel to adjust flight speed. Release RMB or press Escape to release the pointer. Press `F` to frame the mesh and return to Orbit.
+Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle modes. In Orbit, right-drag pans, middle-drag orbits, and the wheel zooms. Fly defaults to **Level (Minecraft)** movement, where `W`/`S` and `A`/`D` stay horizontal regardless of look pitch; choose **Free flight** beside the Fly button to make `W`/`S` follow the look direction instead. In either Fly style, hold RMB to capture the pointer, look with the mouse, move down with Shift, move up with Space, and use the wheel to adjust flight speed. Release RMB or press Escape to release the pointer. Press `F` to frame the mesh and return to Orbit.
 
 With the pointer released, left-drag sculpting and the usual Shift-to-Smooth and Ctrl-to-Invert modifiers work from either viewpoint.
 

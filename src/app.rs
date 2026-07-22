@@ -16,7 +16,7 @@ use eframe::egui::{
 use glam::Vec3;
 
 use crate::{
-    camera::{Camera, CameraFrame, CameraMode, FlyMovement},
+    camera::{Camera, CameraFrame, CameraMode, FlyMovement, FlyMovementMode},
     history::{History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot},
     mesh::{Mesh, MeshChangeSet, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
@@ -526,16 +526,32 @@ fn viewport_sense() -> Sense {
     Sense::drag()
 }
 
-fn quick_controls_copy(mode: CameraMode) -> (&'static str, &'static str) {
+fn fly_movement_mode_label(mode: FlyMovementMode) -> &'static str {
+    match mode {
+        FlyMovementMode::Level => "Level (Minecraft)",
+        FlyMovementMode::Free => "Free flight",
+    }
+}
+
+fn quick_controls_copy(
+    mode: CameraMode,
+    fly_movement_mode: FlyMovementMode,
+) -> (&'static str, &'static str) {
     match mode {
         CameraMode::Orbit => (
             "LMB drag · Shift smooth · Ctrl invert",
             "RMB drag pan · MMB drag orbit · Wheel zoom",
         ),
-        CameraMode::Fly => (
-            "LMB drag · Shift smooth · Ctrl invert",
-            "Hold RMB · Mouse look · WASD horizontal · Shift/Space down/up · Wheel speed · Esc release",
-        ),
+        CameraMode::Fly => match fly_movement_mode {
+            FlyMovementMode::Level => (
+                "LMB drag · Shift smooth · Ctrl invert",
+                "Hold RMB · Mouse look · WASD horizontal · Shift/Space down/up · Wheel speed · Esc release",
+            ),
+            FlyMovementMode::Free => (
+                "LMB drag · Shift smooth · Ctrl invert",
+                "Hold RMB · Mouse look · W/S follow look · A/D strafe · Shift/Space down/up · Wheel speed · Esc release",
+            ),
+        },
     }
 }
 
@@ -1545,6 +1561,25 @@ impl SculptLiteApp {
                 {
                     self.set_camera_mode(CameraMode::Fly, context);
                 }
+                if self.camera.mode() == CameraMode::Fly {
+                    let mut movement_mode = self.camera.fly_movement_mode();
+                    ui.add_enabled_ui(mesh_ready && !self.fly_captured, |ui| {
+                        egui::ComboBox::from_id_salt("fly_movement_mode")
+                            .selected_text(fly_movement_mode_label(movement_mode))
+                            .show_ui(ui, |ui| {
+                                for mode in [FlyMovementMode::Level, FlyMovementMode::Free] {
+                                    ui.selectable_value(
+                                        &mut movement_mode,
+                                        mode,
+                                        fly_movement_mode_label(mode),
+                                    );
+                                }
+                            })
+                            .response
+                            .on_hover_text("Choose whether W/S stays level or follows look pitch");
+                    });
+                    self.camera.set_fly_movement_mode(movement_mode);
+                }
                 let wireframe_label =
                     shortcut_label(context, "Wireframe", &[ShortcutAction::ToggleWireframe]);
                 ui.checkbox(&mut self.wireframe, wireframe_label);
@@ -1887,9 +1922,13 @@ impl SculptLiteApp {
                             ui.small("RMB: pan · MMB: orbit · Wheel: zoom");
                         }
                         CameraMode::Fly => {
-                            ui.small(
-                                "Hold RMB: look/fly · WASD: horizontal · Shift/Space: height · Wheel: speed",
-                            );
+                            let movement = match self.camera.fly_movement_mode() {
+                                FlyMovementMode::Level => "WASD: horizontal",
+                                FlyMovementMode::Free => "W/S: follow look · A/D: strafe",
+                            };
+                            ui.small(format!(
+                                "Hold RMB: look/fly · {movement} · Shift/Space: height · Wheel: speed"
+                            ));
                         }
                     }
                 });
@@ -2064,7 +2103,8 @@ impl SculptLiteApp {
 
                 if self.show_quick_controls && has_mesh {
                     let mode = self.camera.mode();
-                    let (sculpt_controls, view_controls) = quick_controls_copy(mode);
+                    let (sculpt_controls, view_controls) =
+                        quick_controls_copy(mode, self.camera.fly_movement_mode());
                     let view_label = match mode {
                         CameraMode::Orbit => "ORBIT",
                         CameraMode::Fly => "FLY",
@@ -2719,16 +2759,35 @@ mod tests {
 
     #[test]
     fn quick_controls_copy_matches_the_active_camera_mode() {
-        let (orbit_sculpt, orbit_view) = quick_controls_copy(CameraMode::Orbit);
+        let (orbit_sculpt, orbit_view) =
+            quick_controls_copy(CameraMode::Orbit, FlyMovementMode::Level);
         assert!(orbit_sculpt.contains("LMB drag"));
         assert!(orbit_view.contains("RMB drag pan"));
         assert!(orbit_view.contains("MMB drag orbit"));
 
-        let (fly_sculpt, fly_view) = quick_controls_copy(CameraMode::Fly);
-        assert_eq!(fly_sculpt, orbit_sculpt);
-        assert!(fly_view.contains("Hold RMB"));
-        assert!(fly_view.contains("WASD horizontal"));
-        assert!(fly_view.contains("Shift/Space down/up"));
+        let (level_sculpt, level_view) =
+            quick_controls_copy(CameraMode::Fly, FlyMovementMode::Level);
+        assert_eq!(level_sculpt, orbit_sculpt);
+        assert!(level_view.contains("Hold RMB"));
+        assert!(level_view.contains("WASD horizontal"));
+        assert!(level_view.contains("Shift/Space down/up"));
+
+        let (free_sculpt, free_view) = quick_controls_copy(CameraMode::Fly, FlyMovementMode::Free);
+        assert_eq!(free_sculpt, orbit_sculpt);
+        assert!(free_view.contains("W/S follow look"));
+        assert!(free_view.contains("A/D strafe"));
+    }
+
+    #[test]
+    fn fly_movement_mode_labels_identify_level_as_the_minecraft_style() {
+        assert_eq!(
+            fly_movement_mode_label(FlyMovementMode::Level),
+            "Level (Minecraft)"
+        );
+        assert_eq!(
+            fly_movement_mode_label(FlyMovementMode::Free),
+            "Free flight"
+        );
     }
 
     #[test]

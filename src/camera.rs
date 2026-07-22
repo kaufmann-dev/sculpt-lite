@@ -97,6 +97,13 @@ pub(crate) enum CameraMode {
     Fly,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum FlyMovementMode {
+    #[default]
+    Level,
+    Free,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FlyMovement {
     pub forward: f32,
@@ -217,6 +224,7 @@ pub struct Camera {
     orbit: OrbitCamera,
     fly: FlyCamera,
     fly_entered: bool,
+    fly_movement_mode: FlyMovementMode,
     fov_y_radians: f32,
     bounds_minimum: Vec3,
     bounds_maximum: Vec3,
@@ -232,6 +240,7 @@ impl Default for Camera {
             orbit,
             fly,
             fly_entered: false,
+            fly_movement_mode: FlyMovementMode::default(),
             fov_y_radians: 45.0_f32.to_radians(),
             bounds_minimum: Vec3::splat(-1.0 / 3.0_f32.sqrt()),
             bounds_maximum: Vec3::splat(1.0 / 3.0_f32.sqrt()),
@@ -252,6 +261,15 @@ impl Camera {
             self.fly_entered = true;
         }
         self.mode = mode;
+    }
+
+    #[must_use]
+    pub(crate) fn fly_movement_mode(&self) -> FlyMovementMode {
+        self.fly_movement_mode
+    }
+
+    pub(crate) fn set_fly_movement_mode(&mut self, mode: FlyMovementMode) {
+        self.fly_movement_mode = mode;
     }
 
     /// Frames a world-space bounding box, resets both viewpoints, and selects Orbit.
@@ -330,7 +348,11 @@ impl Camera {
                 0.0
             }
         };
-        let direction = self.fly.planar_forward() * finite_axis(movement.forward)
+        let forward = match self.fly_movement_mode {
+            FlyMovementMode::Level => self.fly.planar_forward(),
+            FlyMovementMode::Free => self.fly.forward(),
+        };
+        let direction = forward * finite_axis(movement.forward)
             + self.fly.right() * finite_axis(movement.right)
             + Vec3::Z * finite_axis(movement.up);
         let direction = direction.normalize_or_zero();
@@ -671,6 +693,7 @@ mod tests {
     #[test]
     fn fly_horizontal_movement_ignores_look_pitch() {
         let mut camera = Camera::default();
+        assert_eq!(camera.fly_movement_mode(), FlyMovementMode::Level);
         camera.set_mode(CameraMode::Fly);
         camera.fly.pitch = 1.0;
         let start = camera.fly.position;
@@ -699,6 +722,38 @@ mod tests {
         let vertical_displacement = camera.fly.position - horizontal_position;
         assert!(vertical_displacement.truncate().length() < 1.0e-6);
         assert!(vertical_displacement.z > 0.0);
+    }
+
+    #[test]
+    fn free_fly_forward_movement_follows_look_pitch() {
+        let mut camera = Camera::default();
+        camera.set_mode(CameraMode::Fly);
+        camera.set_fly_movement_mode(FlyMovementMode::Free);
+        camera.fly.pitch = 1.0;
+        let start = camera.fly.position;
+
+        camera.fly_move(
+            FlyMovement {
+                forward: 1.0,
+                ..FlyMovement::default()
+            },
+            0.1,
+        );
+
+        let displacement = camera.fly.position - start;
+        assert!(displacement.truncate().length() > 0.0);
+        assert!(displacement.z > 0.0);
+    }
+
+    #[test]
+    fn fly_movement_mode_survives_framing_and_camera_mode_changes() {
+        let mut camera = Camera::default();
+        camera.set_fly_movement_mode(FlyMovementMode::Free);
+        camera.set_mode(CameraMode::Fly);
+        camera.set_mode(CameraMode::Orbit);
+        camera.fit(Vec3::splat(-2.0), Vec3::splat(2.0));
+
+        assert_eq!(camera.fly_movement_mode(), FlyMovementMode::Free);
     }
 
     #[test]
