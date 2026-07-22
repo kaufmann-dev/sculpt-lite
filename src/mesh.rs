@@ -94,6 +94,29 @@ impl Default for RemeshSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RemeshRegion {
+    center: Vec3,
+    radius_squared: f32,
+}
+
+impl RemeshRegion {
+    fn new(center: Vec3, radius: f32) -> Option<Self> {
+        (center.is_finite() && radius.is_finite() && radius > 0.0).then_some(Self {
+            center,
+            radius_squared: radius * radius,
+        })
+    }
+
+    fn intersects_edge(self, a: Vec3, b: Vec3) -> bool {
+        self.edge_distance_squared(a, b) <= self.radius_squared
+    }
+
+    fn edge_distance_squared(self, a: Vec3, b: Vec3) -> f32 {
+        point_segment_distance_squared(self.center, a, b)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemeshStats {
     pub splits: usize,
@@ -1597,11 +1620,151 @@ impl Mesh {
         vertices
     }
 
+    pub(crate) fn insert_brush_support_patch(
+        &mut self,
+        seed_triangle: u32,
+        center: Vec3,
+        radius: f32,
+        target_edge_length: f32,
+        recorder: &mut MeshEditRecorder,
+    ) -> Option<(usize, MeshChangeSet)> {
+        const MIN_SUPPORT_RINGS: usize = 6;
+        const MAX_SUPPORT_RINGS: usize = 34;
+        const BARYCENTRIC_INTERIOR_EPSILON: f32 = 1.0e-5;
+
+        let &triangle = self.triangles.get(seed_triangle as usize)?;
+        if !center.is_finite()
+            || !radius.is_finite()
+            || radius <= 0.0
+            || !target_edge_length.is_finite()
+            || target_edge_length <= 0.0
+        {
+            return None;
+        }
+        let triangle_positions = triangle.map(|vertex| self.positions[vertex as usize]);
+        let (position, barycentric) = closest_point_on_triangle(center, triangle_positions);
+        if center.distance_squared(position) > radius * radius
+            || barycentric.min_element() <= BARYCENTRIC_INTERIOR_EPSILON
+        {
+            return None;
+        }
+        let corner_distances = triangle_positions.map(|corner| position.distance(corner));
+        if corner_distances
+            .iter()
+            .any(|&distance| distance <= radius * (1.0 + 1.0e-5))
+        {
+            return None;
+        }
+        let ring_count = ((radius / target_edge_length).ceil() as usize)
+            .clamp(MIN_SUPPORT_RINGS, MAX_SUPPORT_RINGS);
+        let added_vertex_count = 1 + ring_count * 3;
+        let base_vertex = u32::try_from(self.positions.len()).ok()?;
+        let center_mask = self.mask[triangle[0] as usize] * barycentric.x
+            + self.mask[triangle[1] as usize] * barycentric.y
+            + self.mask[triangle[2] as usize] * barycentric.z;
+
+        let mut added_positions = Vec::with_capacity(added_vertex_count);
+        let mut added_masks = Vec::with_capacity(added_vertex_count);
+        added_positions.push(position);
+        added_masks.push(center_mask);
+        for ring in 1..=ring_count {
+            let distance = radius * ring as f32 / ring_count as f32;
+            for corner in 0..3 {
+                let parameter = distance / corner_distances[corner];
+                added_positions.push(position.lerp(triangle_positions[corner], parameter));
+                added_masks.push(
+                    center_mask + (self.mask[triangle[corner] as usize] - center_mask) * parameter,
+                );
+            }
+        }
+
+        let ring_vertex = |ring: usize, corner: usize| base_vertex + 1 + (ring * 3 + corner) as u32;
+        let mut replacements = Vec::with_capacity(ring_count * 6 + 3);
+        replacements.extend([
+            [base_vertex, ring_vertex(0, 0), ring_vertex(0, 1)],
+            [base_vertex, ring_vertex(0, 1), ring_vertex(0, 2)],
+            [base_vertex, ring_vertex(0, 2), ring_vertex(0, 0)],
+        ]);
+        for ring in 0..ring_count.saturating_sub(1) {
+            for corner in 0..3 {
+                let next_corner = (corner + 1) % 3;
+                let inner = ring_vertex(ring, corner);
+                let inner_next = ring_vertex(ring, next_corner);
+                let outer = ring_vertex(ring + 1, corner);
+                let outer_next = ring_vertex(ring + 1, next_corner);
+                replacements.push([inner, outer, outer_next]);
+                replacements.push([inner, outer_next, inner_next]);
+            }
+        }
+        for corner in 0..3 {
+            let next_corner = (corner + 1) % 3;
+            let inner = ring_vertex(ring_count - 1, corner);
+            let inner_next = ring_vertex(ring_count - 1, next_corner);
+            replacements.push([inner, triangle[corner], triangle[next_corner]]);
+            replacements.push([inner, triangle[next_corner], inner_next]);
+        }
+
+        let original_cross = triangle_cross(&self.positions, triangle);
+        if replacements.iter().any(|candidate| {
+            let positions = candidate.map(|vertex| {
+                if vertex >= base_vertex {
+                    added_positions[(vertex - base_vertex) as usize]
+                } else {
+                    self.positions[vertex as usize]
+                }
+            });
+            !positions_form_valid_triangle(positions)
+                || original_cross
+                    .dot((positions[1] - positions[0]).cross(positions[2] - positions[0]))
+                    <= 0.0
+        }) {
+            return None;
+        }
+
+        let mut changes = MeshChangeSet::default();
+        for (added_position, added_mask) in added_positions.into_iter().zip(added_masks) {
+            self.append_vertex_local(added_position, added_mask, recorder, &mut changes);
+        }
+        self.replace_face_local(seed_triangle, replacements[0], recorder, &mut changes);
+        for replacement in replacements.into_iter().skip(1) {
+            self.append_face_local(replacement, recorder, &mut changes);
+        }
+        self.finish_local_changes(&mut changes);
+        Some((added_vertex_count, changes))
+    }
+
+    #[cfg(test)]
     pub fn remesh_region(
         &mut self,
         vertices: &[u32],
         settings: RemeshSettings,
         recorder: &mut MeshEditRecorder,
+    ) -> RemeshOutcome {
+        self.remesh_region_filtered(vertices, settings, recorder, None)
+    }
+
+    pub(crate) fn remesh_brush_region(
+        &mut self,
+        vertices: &[u32],
+        center: Vec3,
+        radius: f32,
+        settings: RemeshSettings,
+        recorder: &mut MeshEditRecorder,
+    ) -> RemeshOutcome {
+        self.remesh_region_filtered(
+            vertices,
+            settings,
+            recorder,
+            RemeshRegion::new(center, radius),
+        )
+    }
+
+    fn remesh_region_filtered(
+        &mut self,
+        vertices: &[u32],
+        settings: RemeshSettings,
+        recorder: &mut MeshEditRecorder,
+        region: Option<RemeshRegion>,
     ) -> RemeshOutcome {
         if !settings.target_edge_length.is_finite()
             || settings.target_edge_length <= 0.0
@@ -1641,6 +1804,8 @@ impl Mesh {
             if stats.splits + stats.collapses + stats.flips >= settings.max_topology_edits {
                 break;
             }
+            let edits_before = stats.splits + stats.collapses + stats.flips;
+            let relaxed_before = stats.relaxed_vertices;
             stats.iterations += 1;
             let mut phase_changes = MeshChangeSet::default();
             let remaining = settings
@@ -1650,6 +1815,7 @@ impl Mesh {
                 &mut active,
                 split_length,
                 remaining,
+                region,
                 recorder,
                 &mut phase_changes,
             );
@@ -1663,6 +1829,7 @@ impl Mesh {
                 &mut active,
                 collapse_length,
                 remaining,
+                region,
                 recorder,
                 &mut phase_changes,
             );
@@ -1673,8 +1840,14 @@ impl Mesh {
                 let remaining = settings
                     .max_topology_edits
                     .saturating_sub(stats.splits + stats.collapses + stats.flips);
-                stats.flips +=
-                    self.flip_active_edges_batch(&active, remaining, recorder, &mut phase_changes);
+                stats.flips += self.flip_active_edges_batch(
+                    &active,
+                    split_length,
+                    remaining,
+                    region,
+                    recorder,
+                    &mut phase_changes,
+                );
                 changes.merge(phase_changes);
             }
 
@@ -1687,6 +1860,12 @@ impl Mesh {
                 phase_changes.face_count = self.triangles.len();
                 phase_changes.normalize();
                 changes.merge(phase_changes);
+            }
+
+            if stats.splits + stats.collapses + stats.flips == edits_before
+                && stats.relaxed_vertices == relaxed_before
+            {
+                break;
             }
         }
 
@@ -1703,6 +1882,7 @@ impl Mesh {
         active: &mut HashSet<u32>,
         threshold: f32,
         limit: usize,
+        region: Option<RemeshRegion>,
         recorder: &mut MeshEditRecorder,
         changes: &mut MeshChangeSet,
     ) -> usize {
@@ -1717,6 +1897,9 @@ impl Mesh {
                 if faces.len() != 2
                     || self.topology.vertex_in_protected_neighborhood(a)
                     || self.topology.vertex_in_protected_neighborhood(b)
+                    || region.is_some_and(|region| {
+                        !region.intersects_edge(self.positions[ai], self.positions[bi])
+                    })
                 {
                     return None;
                 }
@@ -1725,19 +1908,24 @@ impl Mesh {
                     edge,
                     [faces[0], faces[1]],
                     length_squared,
+                    region
+                        .map(|region| {
+                            region.edge_distance_squared(self.positions[ai], self.positions[bi])
+                        })
+                        .unwrap_or(0.0),
                 ))
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable_by(|left, right| {
-            right
-                .2
-                .total_cmp(&left.2)
+            left.3
+                .total_cmp(&right.3)
+                .then_with(|| right.2.total_cmp(&left.2))
                 .then_with(|| left.0.cmp(&right.0))
         });
 
         let mut used_faces = HashSet::new();
         let mut selected = Vec::new();
-        for (edge, faces, _) in candidates {
+        for (edge, faces, _, _) in candidates {
             if selected.len() == limit {
                 break;
             }
@@ -1798,6 +1986,7 @@ impl Mesh {
         active: &mut HashSet<u32>,
         threshold: f32,
         limit: usize,
+        region: Option<RemeshRegion>,
         recorder: &mut MeshEditRecorder,
         changes: &mut MeshChangeSet,
     ) -> usize {
@@ -1812,6 +2001,9 @@ impl Mesh {
                 if faces.len() != 2
                     || self.topology.vertex_in_protected_neighborhood(a)
                     || self.topology.vertex_in_protected_neighborhood(b)
+                    || region.is_some_and(|region| {
+                        !region.intersects_edge(self.positions[ai], self.positions[bi])
+                    })
                 {
                     return None;
                 }
@@ -2063,7 +2255,9 @@ impl Mesh {
     fn flip_active_edges_batch(
         &mut self,
         active: &HashSet<u32>,
+        maximum_new_edge_length: f32,
         limit: usize,
+        region: Option<RemeshRegion>,
         recorder: &mut MeshEditRecorder,
         changes: &mut MeshChangeSet,
     ) -> usize {
@@ -2076,6 +2270,10 @@ impl Mesh {
                 if faces.len() != 2
                     || self.topology.vertex_in_protected_neighborhood(a)
                     || self.topology.vertex_in_protected_neighborhood(b)
+                    || region.is_some_and(|region| {
+                        !region
+                            .intersects_edge(self.positions[a as usize], self.positions[b as usize])
+                    })
                 {
                     return None;
                 }
@@ -2089,6 +2287,8 @@ impl Mesh {
                     || self.topology.vertex_in_protected_neighborhood(c)
                     || self.topology.vertex_in_protected_neighborhood(d)
                     || self.topology.edge_faces.contains_key(&edge_key(c, d))
+                    || self.positions[c as usize].distance_squared(self.positions[d as usize])
+                        > maximum_new_edge_length * maximum_new_edge_length
                 {
                     return None;
                 }
@@ -3270,54 +3470,68 @@ fn point_aabb_distance_squared(point: Vec3, min: Vec3, max: Vec3) -> f32 {
     (below + above).length_squared()
 }
 
+fn point_segment_distance_squared(point: Vec3, a: Vec3, b: Vec3) -> f32 {
+    let edge = b - a;
+    let length_squared = edge.length_squared();
+    if length_squared <= f32::EPSILON {
+        return point.distance_squared(a);
+    }
+    let parameter = (point - a).dot(edge) / length_squared;
+    point.distance_squared(a + edge * parameter.clamp(0.0, 1.0))
+}
+
 // Closest-point regions from Real-Time Collision Detection, Christer Ericson.
-fn point_triangle_distance_squared(point: Vec3, [a, b, c]: [Vec3; 3]) -> f32 {
+fn closest_point_on_triangle(point: Vec3, [a, b, c]: [Vec3; 3]) -> (Vec3, Vec3) {
     let ab = b - a;
     let ac = c - a;
     let ap = point - a;
     let d1 = ab.dot(ap);
     let d2 = ac.dot(ap);
     if d1 <= 0.0 && d2 <= 0.0 {
-        return ap.length_squared();
+        return (a, Vec3::X);
     }
 
     let bp = point - b;
     let d3 = ab.dot(bp);
     let d4 = ac.dot(bp);
     if d3 >= 0.0 && d4 <= d3 {
-        return bp.length_squared();
+        return (b, Vec3::Y);
     }
 
     let vc = d1 * d4 - d3 * d2;
     if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
         let v = d1 / (d1 - d3);
-        return point.distance_squared(a + ab * v);
+        return (a + ab * v, Vec3::new(1.0 - v, v, 0.0));
     }
 
     let cp = point - c;
     let d5 = ab.dot(cp);
     let d6 = ac.dot(cp);
     if d6 >= 0.0 && d5 <= d6 {
-        return cp.length_squared();
+        return (c, Vec3::Z);
     }
 
     let vb = d5 * d2 - d1 * d6;
     if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
         let w = d2 / (d2 - d6);
-        return point.distance_squared(a + ac * w);
+        return (a + ac * w, Vec3::new(1.0 - w, 0.0, w));
     }
 
     let va = d3 * d6 - d5 * d4;
     if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
         let edge = c - b;
         let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        return point.distance_squared(b + edge * w);
+        return (b + edge * w, Vec3::new(0.0, 1.0 - w, w));
     }
 
     let denominator = (va + vb + vc).recip();
     let v = vb * denominator;
     let w = vc * denominator;
-    point.distance_squared(a + ab * v + ac * w)
+    (a + ab * v + ac * w, Vec3::new(1.0 - v - w, v, w))
+}
+
+fn point_triangle_distance_squared(point: Vec3, triangle: [Vec3; 3]) -> f32 {
+    point.distance_squared(closest_point_on_triangle(point, triangle).0)
 }
 
 #[cfg(test)]

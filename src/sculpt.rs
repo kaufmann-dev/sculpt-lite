@@ -12,10 +12,11 @@ use crate::{
     },
 };
 
-const MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB: usize = 512;
-const MAX_ADAPTIVE_REMESH_ITERATIONS: u32 = 8;
+const MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB: usize = 128;
 const ADAPTIVE_SPLIT_THRESHOLD: f32 = 2.0;
 const ADAPTIVE_COLLAPSE_THRESHOLD: f32 = 0.5;
+const MIN_ADAPTIVE_SUPPORT_INFLUENCE: f32 = 0.05;
+const MAX_ADAPTIVE_SUPPORT_INFLUENCE_STEP: f32 = 0.35;
 const SAFE_DEFORMATION_SEARCH_STEPS: usize = 6;
 const MIN_SAFE_DEFORMATION_FACTOR: f32 = 1.0 / 64.0;
 
@@ -332,35 +333,49 @@ impl SculptEngine {
         if let (Some(target), Some(recorder)) = (target_edge_length, topology_recorder.as_mut()) {
             for (brush_sample, initial_pass) in samples.iter().zip(&initial_passes) {
                 let needs_support = initial_pass.vertices.is_empty();
-                let active = if needs_support {
-                    let seed = mesh
-                        .nearest_triangle(brush_sample.center)
-                        .unwrap_or(brush_sample.seed_triangle);
-                    mesh.brush_remesh_vertices(
+                let seed = mesh
+                    .nearest_triangle(brush_sample.center)
+                    .unwrap_or(brush_sample.seed_triangle);
+                if needs_support
+                    && topology_edits < MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB
+                    && let Some((added_vertices, changes)) = mesh.insert_brush_support_patch(
                         seed,
                         brush_sample.center,
                         settings.radius,
                         target,
-                        brush_sample.view_direction,
+                        recorder,
                     )
-                } else {
-                    initial_pass.vertices.clone()
-                };
+                {
+                    topology_changes.merge(changes);
+                    topology_edits += added_vertices;
+                }
+                if needs_support {
+                    continue;
+                }
+                let active = mesh.brush_remesh_vertices(
+                    seed,
+                    brush_sample.center,
+                    settings.radius,
+                    target,
+                    brush_sample.view_direction,
+                );
                 let remaining = MAX_ADAPTIVE_TOPOLOGY_EDITS_PER_DAB.saturating_sub(topology_edits);
                 if active.is_empty() || remaining == 0 {
                     continue;
                 }
                 let mut remesh = RemeshSettings::new(target);
-                remesh.iterations = if needs_support {
-                    MAX_ADAPTIVE_REMESH_ITERATIONS
-                } else {
-                    1
-                };
+                remesh.iterations = 4;
                 remesh.max_topology_edits = remaining;
                 remesh.split_threshold = ADAPTIVE_SPLIT_THRESHOLD;
                 remesh.collapse_threshold = ADAPTIVE_COLLAPSE_THRESHOLD;
                 remesh.relaxation = 0.0;
-                let outcome = mesh.remesh_region(&active, remesh, recorder);
+                let outcome = mesh.remesh_brush_region(
+                    &active,
+                    brush_sample.center,
+                    settings.radius,
+                    remesh,
+                    recorder,
+                );
                 topology_edits +=
                     outcome.stats.splits + outcome.stats.collapses + outcome.stats.flips;
                 topology_changes.merge(outcome.changes);
@@ -397,6 +412,29 @@ impl SculptEngine {
         }
 
         if adaptive && passes.iter().all(|pass| pass.vertices.is_empty()) {
+            topology_recorder
+                .take()
+                .expect("adaptive samples have a topology recorder")
+                .finish(mesh)
+                .apply_before(mesh);
+            self.warning = Some("Mesh resolution too low for this brush".to_owned());
+            return false;
+        }
+        if let Some(target) = target_edge_length
+            && passes
+                .iter()
+                .zip(&initial_passes)
+                .any(|(pass, initial_pass)| {
+                    initial_pass.vertices.is_empty()
+                        && !pass.has_remesh_support(
+                            mesh,
+                            settings.radius,
+                            settings.strength,
+                            settings.falloff,
+                            target * ADAPTIVE_SPLIT_THRESHOLD,
+                        )
+                })
+        {
             topology_recorder
                 .take()
                 .expect("adaptive samples have a topology recorder")
@@ -739,6 +777,44 @@ impl PreparedPass {
             &mut vertices,
         );
         Self { sample, vertices }
+    }
+
+    fn has_remesh_support(
+        &self,
+        mesh: &Mesh,
+        radius: f32,
+        strength: f32,
+        falloff: f32,
+        maximum_edge_length: f32,
+    ) -> bool {
+        let maximum_edge_squared = maximum_edge_length * maximum_edge_length * (1.0 + 1.0e-5);
+        self.vertices.iter().all(|&vertex| {
+            let index = vertex as usize;
+            let Some(&position) = mesh.positions.get(index) else {
+                return false;
+            };
+            let weight = brush_falloff(position.distance(self.sample.center) / radius, falloff);
+            let influence = weight * strength.abs() * self.sample.pressure.clamp(0.0, 1.0);
+            if influence < MIN_ADAPTIVE_SUPPORT_INFLUENCE {
+                return true;
+            }
+            mesh.topology
+                .vertex_neighbors
+                .get(index)
+                .is_some_and(|neighbors| {
+                    !neighbors.is_empty()
+                        && neighbors.iter().all(|&neighbor| {
+                            let neighbor_position = mesh.positions[neighbor as usize];
+                            let neighbor_weight = brush_falloff(
+                                neighbor_position.distance(self.sample.center) / radius,
+                                falloff,
+                            );
+                            position.distance_squared(neighbor_position) <= maximum_edge_squared
+                                || (weight - neighbor_weight).abs()
+                                    <= MAX_ADAPTIVE_SUPPORT_INFLUENCE_STEP
+                        })
+                })
+        })
     }
 }
 
@@ -1147,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_topology_supports_a_brush_smaller_than_its_seed_face() {
+    fn small_adaptive_brush_builds_bounded_support_without_spikes_or_stalls() {
         let mut mesh = Mesh::new(
             vec![
                 Vec3::X,
@@ -1169,17 +1245,66 @@ mod tests {
             ],
         )
         .unwrap();
+        let before = mesh.clone();
         let center = Vec3::splat(1.0 / 3.0);
-        let seed = mesh.nearest_triangle(center).unwrap();
         let mut settings = test_settings();
         settings.radius = 0.1;
         settings.remesh_target_edge_length = Some(settings.radius * 0.2);
-        let before = mesh.positions.clone();
+        let original_vertex_count = mesh.positions.len();
         let mut engine = SculptEngine::default();
         engine.begin_stroke(&mesh);
+        let mut longest_dab = std::time::Duration::ZERO;
 
-        assert!(engine.apply_sample(&mut mesh, SculptTool::Draw, &settings, sample(center, seed),));
-        assert_ne!(mesh.positions, before);
+        for dab in 0..5 {
+            let seed = mesh.nearest_triangle(center).unwrap();
+            let dab_started = Instant::now();
+            assert!(engine.apply_sample(
+                &mut mesh,
+                SculptTool::Draw,
+                &settings,
+                sample(center, seed),
+            ));
+            longest_dab = longest_dab.max(dab_started.elapsed());
+            assert!(engine.take_error().is_none());
+            let warning = engine.take_warning();
+            if dab == 0 {
+                assert!(warning.is_none());
+                assert!(mesh.positions.len() - original_vertex_count <= 24);
+            }
+        }
+
+        assert!(mesh.positions.len() <= 256);
+        mesh.validate().unwrap();
+        let faces = (0..mesh.triangles.len() as u32).collect::<Vec<_>>();
+        assert!(!mesh.faces_have_self_intersections(&faces));
+        if !cfg!(debug_assertions) {
+            assert!(
+                longest_dab < std::time::Duration::from_millis(8),
+                "small adaptive dab exceeded one frame: {longest_dab:?}"
+            );
+        }
+        let seed = mesh.nearest_triangle(center).unwrap();
+        let pass = PreparedPass::new(
+            &mesh,
+            sample(center, seed),
+            settings.radius,
+            &mut VertexTraversalScratch::default(),
+        );
+        assert!(pass.has_remesh_support(
+            &mesh,
+            settings.radius,
+            settings.strength,
+            settings.falloff,
+            settings.remesh_target_edge_length.unwrap() * ADAPTIVE_SPLIT_THRESHOLD,
+        ));
+        let topology = engine
+            .end_stroke(&mesh)
+            .topology
+            .expect("small adaptive stroke records its support patch");
+        topology.apply_before(&mut mesh);
+        assert_eq!(mesh.positions, before.positions);
+        assert_eq!(mesh.triangles, before.triangles);
+        assert_eq!(mesh.mask, before.mask);
     }
 
     #[test]
