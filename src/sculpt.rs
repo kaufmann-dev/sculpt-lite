@@ -9,7 +9,7 @@ use crate::{
     mesh::{Mesh, RayHit, VertexTraversalScratch},
 };
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum SculptTool {
     Grab,
     #[default]
@@ -149,6 +149,12 @@ pub struct BrushSample {
     pub invert_modifier: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DabKind {
+    Spatial,
+    Airbrush,
+}
+
 impl BrushSample {
     #[must_use]
     pub fn from_hit(
@@ -186,12 +192,52 @@ pub struct StrokeState {
     symmetry_center: Vec3,
     mirrored_seed: Option<u32>,
     original: StrokeOriginals,
+    coverage: CoverageMap,
 }
 
 #[derive(Clone, Debug, Default)]
 struct StrokeOriginals {
     positions: HashMap<u32, Vec3>,
     masks: HashMap<u32, f32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum CoveragePolarity {
+    Add,
+    Subtract,
+    Neutral,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct CoverageChannel {
+    tool: SculptTool,
+    polarity: CoveragePolarity,
+}
+
+type CoverageKey = (CoverageChannel, u32);
+type CoverageMap = HashMap<CoverageKey, f32>;
+
+impl CoverageChannel {
+    fn for_sample(tool: SculptTool, inverted: bool) -> Option<Self> {
+        let polarity = match tool {
+            SculptTool::Grab => return None,
+            SculptTool::Smooth => CoveragePolarity::Neutral,
+            SculptTool::Draw
+            | SculptTool::Clay
+            | SculptTool::Crease
+            | SculptTool::Inflate
+            | SculptTool::Pinch
+            | SculptTool::Flatten
+            | SculptTool::Mask => {
+                if inverted {
+                    CoveragePolarity::Subtract
+                } else {
+                    CoveragePolarity::Add
+                }
+            }
+        };
+        Some(Self { tool, polarity })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -235,6 +281,7 @@ impl SculptEngine {
             symmetry_center,
             mirrored_seed: None,
             original: StrokeOriginals::default(),
+            coverage: CoverageMap::new(),
         });
         self.updated_vertices.clear();
         self.error = None;
@@ -268,6 +315,7 @@ impl SculptEngine {
         tool: SculptTool,
         settings: &BrushSettings,
         sample: BrushSample,
+        dab_kind: DabKind,
     ) -> bool {
         self.clear_step_outputs();
         let Some(stroke) = self.active.as_ref() else {
@@ -322,24 +370,34 @@ impl SculptEngine {
 
         capture_source_positions(mesh, tool, &passes, &mut self.source_positions);
 
-        let (changed, mut affected) = apply_passes(
-            mesh,
-            tool,
-            settings,
-            &passes,
-            &self.source_positions,
-            &mut self
-                .active
-                .as_mut()
-                .expect("active stroke checked above")
-                .original,
-        );
+        let channel = (dab_kind == DabKind::Spatial)
+            .then(|| CoverageChannel::for_sample(tool, settings.invert ^ sample.invert_modifier))
+            .flatten();
+        let mut staged_coverage = CoverageMap::new();
+        let (changed, mut affected) = {
+            let stroke = self.active.as_mut().expect("active stroke checked above");
+            let mut coverage = SampleCoverage {
+                channel,
+                committed: &stroke.coverage,
+                staged: &mut staged_coverage,
+            };
+            apply_passes(
+                mesh,
+                tool,
+                settings,
+                &passes,
+                &self.source_positions,
+                &mut stroke.original,
+                &mut coverage,
+            )
+        };
         if !changed {
             return false;
         }
         affected.sort_unstable();
         affected.dedup();
         if tool == SculptTool::Mask {
+            self.commit_coverage(staged_coverage);
             self.updated_vertices = affected;
             self.sample_committed = true;
             return true;
@@ -362,8 +420,19 @@ impl SculptEngine {
         self.updated_vertices.extend(affected);
         self.updated_vertices.sort_unstable();
         self.updated_vertices.dedup();
+        self.commit_coverage(staged_coverage);
         self.sample_committed = true;
         true
+    }
+
+    fn commit_coverage(&mut self, staged: CoverageMap) {
+        let Some(stroke) = self.active.as_mut() else {
+            return;
+        };
+        for (key, influence) in staged {
+            let maximum = stroke.coverage.entry(key).or_default();
+            *maximum = maximum.max(influence);
+        }
     }
 
     fn clear_step_outputs(&mut self) {
@@ -417,9 +486,40 @@ struct PreparedPass {
     vertices: Vec<u32>,
 }
 
-struct SampleEdits<'a> {
+struct SampleEdits<'a, 'coverage> {
     affected: &'a mut Vec<u32>,
     original: &'a mut StrokeOriginals,
+    coverage: &'a mut SampleCoverage<'coverage>,
+}
+
+struct SampleCoverage<'a> {
+    channel: Option<CoverageChannel>,
+    committed: &'a CoverageMap,
+    staged: &'a mut CoverageMap,
+}
+
+impl SampleCoverage<'_> {
+    fn limited_influence(&mut self, vertex: u32, current: f32) -> f32 {
+        let Some(channel) = self.channel else {
+            return current;
+        };
+        let key = (channel, vertex);
+        let previous = self
+            .committed
+            .get(&key)
+            .copied()
+            .unwrap_or(0.0)
+            .max(self.staged.get(&key).copied().unwrap_or(0.0));
+        if current <= previous {
+            return 0.0;
+        }
+        self.staged.insert(key, current);
+        current - previous
+    }
+
+    fn is_limited(&self) -> bool {
+        self.channel.is_some()
+    }
 }
 
 fn apply_passes(
@@ -429,11 +529,13 @@ fn apply_passes(
     passes: &[PreparedPass],
     source_positions: &HashMap<u32, Vec3>,
     original: &mut StrokeOriginals,
+    coverage: &mut SampleCoverage<'_>,
 ) -> (bool, Vec<u32>) {
     let mut affected = Vec::new();
     let mut edits = SampleEdits {
         affected: &mut affected,
         original,
+        coverage,
     };
     let mut changed = false;
     for pass in passes {
@@ -470,7 +572,7 @@ fn apply_pass(
     settings: &BrushSettings,
     pass: &PreparedPass,
     source_positions: &HashMap<u32, Vec3>,
-    edits: &mut SampleEdits<'_>,
+    edits: &mut SampleEdits<'_, '_>,
 ) -> bool {
     let radius = settings.radius;
     let pressure = pass.sample.pressure.clamp(0.0, 1.0);
@@ -511,7 +613,11 @@ fn apply_pass(
             let Some(before) = mesh.mask.get(index).copied() else {
                 continue;
             };
-            let next = (before + direction * strength * weight).clamp(0.0, 1.0);
+            let influence = edits.coverage.limited_influence(vertex, strength * weight);
+            if influence <= f32::EPSILON {
+                continue;
+            }
+            let next = (before + direction * influence).clamp(0.0, 1.0);
             if next != before {
                 edits.original.masks.entry(vertex).or_insert(before);
                 mesh.mask[index] = next;
@@ -522,7 +628,9 @@ fn apply_pass(
         }
 
         let unmasked = 1.0 - mesh.mask.get(index).copied().unwrap_or(0.0).clamp(0.0, 1.0);
-        let influence = strength * weight * unmasked;
+        let influence = edits
+            .coverage
+            .limited_influence(vertex, strength * weight * unmasked);
         if influence <= f32::EPSILON {
             continue;
         }
@@ -585,7 +693,12 @@ fn apply_pass(
         if !displacement.is_finite() || displacement.length_squared() <= f32::EPSILON.powi(2) {
             continue;
         }
-        let next = position + displacement;
+        let base = if edits.coverage.is_limited() {
+            mesh.positions[index]
+        } else {
+            position
+        };
+        let next = base + displacement;
         if next != mesh.positions[index] {
             edits
                 .original
@@ -783,6 +896,27 @@ mod tests {
         }
     }
 
+    fn coverage_mesh() -> Mesh {
+        let mut mesh = grid();
+        mesh.positions[4].z = 0.35;
+        let _ = mesh.rebuild();
+        mesh
+    }
+
+    fn coverage_settings() -> BrushSettings {
+        BrushSettings {
+            radius: 2.1,
+            strength: 0.1,
+            falloff: 0.95,
+            invert: false,
+            symmetry: None,
+        }
+    }
+
+    fn editable_state(mesh: &Mesh) -> (Vec<Vec3>, Vec<f32>) {
+        (mesh.positions.clone(), mesh.mask.clone())
+    }
+
     fn assert_editable_mesh_eq(actual: &Mesh, expected: &Mesh) {
         assert_eq!(actual.positions, expected.positions);
         assert_eq!(actual.triangles, expected.triangles);
@@ -799,6 +933,245 @@ mod tests {
     }
 
     #[test]
+    fn spatial_dab_tools_do_not_accumulate_until_the_next_stroke() {
+        let tools = [
+            SculptTool::Draw,
+            SculptTool::Clay,
+            SculptTool::Crease,
+            SculptTool::Inflate,
+            SculptTool::Smooth,
+            SculptTool::Pinch,
+            SculptTool::Flatten,
+            SculptTool::Mask,
+        ];
+        for tool in tools {
+            let mut mesh = coverage_mesh();
+            let settings = coverage_settings();
+            let brush_sample = sample(mesh.positions[4], 0);
+            let mut engine = SculptEngine::default();
+            engine.begin_stroke(&mesh);
+
+            assert!(
+                engine.apply_sample(&mut mesh, tool, &settings, brush_sample, DabKind::Spatial,),
+                "{tool} first spatial dab"
+            );
+            let after_first = editable_state(&mesh);
+            assert!(
+                !engine.apply_sample(&mut mesh, tool, &settings, brush_sample, DabKind::Spatial,),
+                "{tool} repeated spatial dab"
+            );
+            assert_eq!(editable_state(&mesh), after_first, "{tool} retrace");
+
+            assert!(!engine.end_stroke(&mesh).edit.is_empty());
+            engine.begin_stroke(&mesh);
+            assert!(
+                engine.apply_sample(&mut mesh, tool, &settings, brush_sample, DabKind::Spatial,),
+                "{tool} next stroke"
+            );
+        }
+    }
+
+    #[test]
+    fn airbrush_dab_tools_keep_accumulating() {
+        for tool in [
+            SculptTool::Draw,
+            SculptTool::Clay,
+            SculptTool::Crease,
+            SculptTool::Inflate,
+            SculptTool::Smooth,
+            SculptTool::Pinch,
+            SculptTool::Flatten,
+            SculptTool::Mask,
+        ] {
+            let mut mesh = coverage_mesh();
+            let settings = coverage_settings();
+            let brush_sample = sample(mesh.positions[4], 0);
+            let mut engine = SculptEngine::default();
+            engine.begin_stroke(&mesh);
+
+            assert!(engine.apply_sample(
+                &mut mesh,
+                tool,
+                &settings,
+                brush_sample,
+                DabKind::Airbrush,
+            ));
+            let after_first = editable_state(&mesh);
+            assert!(
+                engine.apply_sample(&mut mesh, tool, &settings, brush_sample, DabKind::Airbrush,),
+                "{tool} second airbrush dab"
+            );
+            assert_ne!(editable_state(&mesh), after_first, "{tool} airbrush");
+        }
+    }
+
+    #[test]
+    fn spatial_coverage_tracks_tool_polarity_pressure_and_masking() {
+        let settings = coverage_settings();
+        let mut mesh = coverage_mesh();
+        let brush_sample = sample(mesh.positions[4], 0);
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Smooth,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+        let after_smooth = editable_state(&mesh);
+        let mut inverted = brush_sample;
+        inverted.invert_modifier = true;
+        assert!(!engine.apply_sample(
+            &mut mesh,
+            SculptTool::Smooth,
+            &settings,
+            inverted,
+            DabKind::Spatial,
+        ));
+        assert_eq!(editable_state(&mesh), after_smooth);
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &settings,
+            inverted,
+            DabKind::Spatial,
+        ));
+
+        let mut pressure_mesh = grid();
+        let mut pressure_sample = sample(Vec3::ZERO, 0);
+        pressure_sample.pressure = 0.25;
+        let mut pressure_engine = SculptEngine::default();
+        pressure_engine.begin_stroke(&pressure_mesh);
+        assert!(pressure_engine.apply_sample(
+            &mut pressure_mesh,
+            SculptTool::Draw,
+            &settings,
+            pressure_sample,
+            DabKind::Spatial,
+        ));
+        let first_height = pressure_mesh.positions[4].z;
+        pressure_sample.pressure = 0.5;
+        assert!(pressure_engine.apply_sample(
+            &mut pressure_mesh,
+            SculptTool::Draw,
+            &settings,
+            pressure_sample,
+            DabKind::Spatial,
+        ));
+        assert!((pressure_mesh.positions[4].z - first_height * 2.0).abs() < 1.0e-6);
+        assert!(!pressure_engine.apply_sample(
+            &mut pressure_mesh,
+            SculptTool::Draw,
+            &settings,
+            pressure_sample,
+            DabKind::Spatial,
+        ));
+
+        let mut masked = grid();
+        masked.mask[4] = 0.5;
+        let mut masked_engine = SculptEngine::default();
+        masked_engine.begin_stroke(&masked);
+        assert!(masked_engine.apply_sample(
+            &mut masked,
+            SculptTool::Draw,
+            &settings,
+            sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
+        ));
+        assert!((masked.positions[4].z - first_height * 2.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn mirrored_spatial_passes_share_coverage() {
+        let mut regular = grid();
+        let mut mirrored = grid();
+        let settings = coverage_settings();
+        let mut symmetry_settings = settings;
+        symmetry_settings.symmetry = Some(SymmetryAxis::X);
+        let brush_sample = sample(Vec3::new(0.1, 0.0, 0.0), 0);
+        let mut regular_engine = SculptEngine::default();
+        let mut mirrored_engine = SculptEngine::default();
+        regular_engine.begin_stroke(&regular);
+        mirrored_engine.begin_stroke(&mirrored);
+
+        assert!(regular_engine.apply_sample(
+            &mut regular,
+            SculptTool::Mask,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+        assert!(mirrored_engine.apply_sample(
+            &mut mirrored,
+            SculptTool::Mask,
+            &symmetry_settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+        assert_eq!(mirrored.mask, regular.mask);
+    }
+
+    #[test]
+    fn rejected_spatial_sample_does_not_consume_coverage() {
+        let mut mesh = grid();
+        let mut settings = test_settings();
+        settings.falloff = 1.0;
+        let brush_sample = sample(Vec3::ZERO, 0);
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+
+        assert!(!engine.apply_sample(
+            &mut mesh,
+            SculptTool::Pinch,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+        settings.strength = 0.1;
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Pinch,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+    }
+
+    #[test]
+    fn one_spatial_click_records_one_history_entry() {
+        let mut mesh = grid();
+        let before = mesh.clone();
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&mesh);
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &coverage_settings(),
+            sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
+        ));
+        let outcome = engine.end_stroke(&mesh);
+        let mut history = History::default();
+        assert!(history.record(HistoryEntry::Local(outcome.edit)));
+
+        assert!(matches!(
+            history.undo(&mut mesh),
+            HistoryAction::Local { .. }
+        ));
+        assert_editable_mesh_eq(&mesh, &before);
+        assert!(matches!(history.undo(&mut mesh), HistoryAction::Empty));
+    }
+
+    #[test]
     fn a_full_mask_prevents_deformation() {
         let mut mesh = grid();
         mesh.mask[4] = 1.0;
@@ -811,6 +1184,7 @@ mod tests {
             SculptTool::Draw,
             &test_settings(),
             sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
         ));
         assert_eq!(mesh.positions[4], before);
         assert!(mesh.positions.iter().any(|position| position.z > 0.0));
@@ -831,6 +1205,7 @@ mod tests {
             SculptTool::Draw,
             &settings,
             sample(Vec3::new(1.0, 0.0, 0.0), 2),
+            DabKind::Spatial,
         ));
         assert!(mesh.positions[5].z > 0.0);
         assert_eq!(mesh.positions[3].z, mesh.positions[5].z);
@@ -849,8 +1224,20 @@ mod tests {
         let mut inverse_sample = normal_sample;
         inverse_sample.invert_modifier = true;
 
-        normal_engine.apply_sample(&mut outward, SculptTool::Inflate, &settings, normal_sample);
-        inverse_engine.apply_sample(&mut inward, SculptTool::Inflate, &settings, inverse_sample);
+        normal_engine.apply_sample(
+            &mut outward,
+            SculptTool::Inflate,
+            &settings,
+            normal_sample,
+            DabKind::Spatial,
+        );
+        inverse_engine.apply_sample(
+            &mut inward,
+            SculptTool::Inflate,
+            &settings,
+            inverse_sample,
+            DabKind::Spatial,
+        );
 
         assert!(outward.positions[4].z > 0.0);
         assert_eq!(outward.positions[4].z, -inward.positions[4].z);
@@ -871,12 +1258,19 @@ mod tests {
         let mut subtract_sample = add_sample;
         subtract_sample.invert_modifier = true;
 
-        assert!(add_engine.apply_sample(&mut added, SculptTool::Clay, &settings, add_sample,));
+        assert!(add_engine.apply_sample(
+            &mut added,
+            SculptTool::Clay,
+            &settings,
+            add_sample,
+            DabKind::Spatial,
+        ));
         assert!(subtract_engine.apply_sample(
             &mut subtracted,
             SculptTool::Clay,
             &settings,
             subtract_sample,
+            DabKind::Spatial,
         ));
         assert!(added.positions[4].z > 0.0);
         assert_eq!(added.positions[4].z, -subtracted.positions[4].z);
@@ -894,6 +1288,7 @@ mod tests {
             SculptTool::Clay,
             &planar_settings,
             sample(center, 0),
+            DabKind::Spatial,
         ));
         let minimum = uneven
             .positions
@@ -924,14 +1319,19 @@ mod tests {
         let mut groove_sample = ridge_sample;
         groove_sample.invert_modifier = true;
 
-        assert!(
-            ridge_engine.apply_sample(&mut ridge, SculptTool::Crease, &settings, ridge_sample,)
-        );
+        assert!(ridge_engine.apply_sample(
+            &mut ridge,
+            SculptTool::Crease,
+            &settings,
+            ridge_sample,
+            DabKind::Spatial,
+        ));
         assert!(groove_engine.apply_sample(
             &mut groove,
             SculptTool::Crease,
             &settings,
             groove_sample,
+            DabKind::Spatial,
         ));
         assert!(ridge.positions[4].z > 0.0);
         assert_eq!(ridge.positions[4].z, -groove.positions[4].z);
@@ -957,8 +1357,20 @@ mod tests {
             let mut high_sample = low_sample;
             high_sample.pressure = 0.5;
 
-            assert!(low_engine.apply_sample(&mut low, tool, &settings, low_sample));
-            assert!(high_engine.apply_sample(&mut high, tool, &settings, high_sample));
+            assert!(low_engine.apply_sample(
+                &mut low,
+                tool,
+                &settings,
+                low_sample,
+                DabKind::Spatial,
+            ));
+            assert!(high_engine.apply_sample(
+                &mut high,
+                tool,
+                &settings,
+                high_sample,
+                DabKind::Spatial,
+            ));
             assert!((high.positions[4].z - low.positions[4].z * 2.0).abs() < 1.0e-6);
         }
     }
@@ -976,7 +1388,13 @@ mod tests {
                 let mut engine = SculptEngine::default();
                 engine.begin_stroke(&mesh);
 
-                assert!(!engine.apply_sample(&mut mesh, tool, &settings, brush_sample));
+                assert!(!engine.apply_sample(
+                    &mut mesh,
+                    tool,
+                    &settings,
+                    brush_sample,
+                    DabKind::Spatial,
+                ));
                 assert!(!engine.take_sample_committed());
                 assert_editable_mesh_eq(&mesh, &before);
                 assert_eq!(engine.end_stroke(&mesh), StrokeOutcome::default());
@@ -1000,6 +1418,7 @@ mod tests {
                 tool,
                 &settings,
                 sample(Vec3::ZERO, 0),
+                DabKind::Spatial,
             ));
             assert_eq!(fully_masked.positions, before);
 
@@ -1015,12 +1434,14 @@ mod tests {
                 tool,
                 &settings,
                 sample(Vec3::ZERO, 0),
+                DabKind::Spatial,
             ));
             assert!(partial_engine.apply_sample(
                 &mut partially_masked,
                 tool,
                 &settings,
                 sample(Vec3::ZERO, 0),
+                DabKind::Spatial,
             ));
             assert!(
                 (partially_masked.positions[4].z - unmasked.positions[4].z * 0.5).abs() < 1.0e-6
@@ -1037,6 +1458,7 @@ mod tests {
                 tool,
                 &symmetry_settings,
                 sample(Vec3::X * 0.8, 2),
+                DabKind::Spatial,
             ));
             assert!(symmetric.positions[5].z > 0.0);
             assert_eq!(symmetric.positions[3].z, symmetric.positions[5].z);
@@ -1054,7 +1476,13 @@ mod tests {
             settings.strength = 0.5;
             let mut engine = SculptEngine::default();
             engine.begin_stroke(&mesh);
-            assert!(engine.apply_sample(&mut mesh, tool, &settings, sample(Vec3::ZERO, 0),));
+            assert!(engine.apply_sample(
+                &mut mesh,
+                tool,
+                &settings,
+                sample(Vec3::ZERO, 0),
+                DabKind::Spatial,
+            ));
             let outcome = engine.end_stroke(&mesh);
             assert!(!outcome.edit.is_empty());
             let after = mesh.clone();
@@ -1086,7 +1514,13 @@ mod tests {
         let mut engine = SculptEngine::default();
         engine.begin_stroke(&mesh);
 
-        assert!(engine.apply_sample(&mut mesh, SculptTool::Smooth, &settings, sample(center, 0),));
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Smooth,
+            &settings,
+            sample(center, 0),
+            DabKind::Spatial,
+        ));
         assert!(mesh.positions[4].z < before);
     }
 
@@ -1098,11 +1532,23 @@ mod tests {
         engine.begin_stroke(&mesh);
         let mut brush_sample = sample(Vec3::ZERO, 0);
 
-        assert!(engine.apply_sample(&mut mesh, SculptTool::Mask, &settings, brush_sample,));
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Mask,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
         assert!(mesh.mask[4] > 0.0);
 
         brush_sample.invert_modifier = true;
-        assert!(engine.apply_sample(&mut mesh, SculptTool::Mask, &settings, brush_sample,));
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Mask,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
         assert_eq!(mesh.mask[4], 0.0);
         let outcome = engine.end_stroke(&mesh);
         assert!(outcome.edit.is_empty());
@@ -1121,12 +1567,14 @@ mod tests {
             SculptTool::Draw,
             &settings,
             sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
         );
         engine.apply_sample(
             &mut mesh,
             SculptTool::Draw,
             &settings,
             sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
         );
         let outcome = engine.end_stroke(&mesh);
 
@@ -1159,6 +1607,7 @@ mod tests {
             SculptTool::Pinch,
             &settings,
             sample(Vec3::ZERO, 0),
+            DabKind::Spatial,
         ));
 
         assert_eq!(mesh.positions, before_positions);
@@ -1204,7 +1653,13 @@ mod tests {
         engine.begin_stroke(&mesh);
 
         let fixed_started = Instant::now();
-        assert!(engine.apply_sample(&mut mesh, SculptTool::Draw, &settings, sample(center, seed),));
+        assert!(engine.apply_sample(
+            &mut mesh,
+            SculptTool::Draw,
+            &settings,
+            sample(center, seed),
+            DabKind::Spatial,
+        ));
         let fixed_elapsed = fixed_started.elapsed();
         let _ = engine.take_updated_vertices();
         let _ = engine.end_stroke(&mesh);

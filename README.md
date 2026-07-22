@@ -1,12 +1,12 @@
 # SculptLite
 
-SculptLite is a native Linux desktop application for importing, sculpting, and exporting STL meshes. It provides responsive fixed-topology, distance-spaced sculpting brushes including Clay and Crease, time-budgeted path processing that preserves captured input, optional Airbrush buildup, symmetry, undo and redo, a wireframe overlay, and STL export.
+SculptLite is a native Linux desktop application for importing, sculpting, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes including Clay and Crease, non-accumulating distance-spaced strokes, time-budgeted path processing that preserves captured input, optional accumulating Airbrush buildup, symmetry, undo and redo, a wireframe overlay, and STL export.
 
 ## Viewport controls
 
 Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle modes. In Orbit, right-drag pans, middle-drag orbits, and the wheel zooms. Fly defaults to **Level** movement, where `W`/`S` and `A`/`D` stay horizontal regardless of look pitch; choose **Free flight** beside the Fly button to make `W`/`S` follow the look direction instead. In either Fly style, hold RMB to capture the pointer, look with the mouse, move down with Shift, move up with Space, and use the wheel to adjust flight speed. Release RMB or press Escape to release the pointer. Press `F` to frame the mesh and return to Orbit.
 
-With the pointer released, left-drag sculpting and the usual Shift-to-Smooth and Ctrl-to-Invert modifiers work from either viewpoint.
+With the pointer released, a left click applies one dab and left-drag sculpts from either viewpoint. Spatial dabs only apply newly increased brush influence while the button remains held, so retracing the same area does not keep building it up; release the button to begin a fresh stroke. Enable Airbrush when intentional timed buildup is desired. The usual Shift-to-Smooth and Ctrl-to-Invert modifiers work throughout a stroke.
 
 ## Run from source
 

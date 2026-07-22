@@ -20,7 +20,7 @@ use crate::{
     history::{History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot},
     mesh::{Mesh, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
-    sculpt::{BrushSample, BrushSettings, SculptEngine, SculptTool, SymmetryAxis},
+    sculpt::{BrushSample, BrushSettings, DabKind, SculptEngine, SculptTool, SymmetryAxis},
     stl::{ImportReport, load_stl, save_stl_atomic},
     stroke::{MAX_DABS_PER_FRAME, StrokeSampler},
 };
@@ -29,6 +29,16 @@ use crate::{
 struct PointerHit {
     hit: RayHit,
     view_direction: Vec3,
+}
+
+#[derive(Clone, Copy)]
+struct PointerDab {
+    position: Pos2,
+    delta: Vec2,
+    pressure: f32,
+    modifiers: Modifiers,
+    hit: Option<PointerHit>,
+    kind: DabKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2096,17 +2106,35 @@ impl SculptLiteApp {
                 ui.painter()
                     .galley(badge_rect.min + badge_padding, badge_galley, badge_color);
 
-                let mut began_stroke = false;
+                let (primary_press, primary_down, primary_released) = context.input(|input| {
+                    let primary_press = input.events.iter().find_map(|event| match event {
+                        egui::Event::PointerButton {
+                            pos,
+                            button: PointerButton::Primary,
+                            pressed: true,
+                            modifiers,
+                        } => Some((*pos, *modifiers)),
+                        _ => None,
+                    });
+                    (
+                        primary_press,
+                        input.pointer.button_down(PointerButton::Primary),
+                        input.pointer.button_released(PointerButton::Primary),
+                    )
+                });
+                let viewport_primary_press = primary_press.filter(|(position, _modifiers)| {
+                    response.interact_rect.contains(*position)
+                        && context.layer_id_at(*position) == Some(response.layer_id)
+                });
                 if sculpting_allowed(self.fly_captured)
                     && self.background_task.is_none()
-                    && response.drag_started_by(PointerButton::Primary)
-                    && let Some(position) = pointer
+                    && !self.sculpt.is_stroking()
+                    && let Some((position, modifiers)) = viewport_primary_press
                     && let Some(pointer_hit) = self.hit_at(position, camera_frame)
                     && let Some(document) = self.document.as_ref()
                     && let Some(mesh) = document.mesh.as_ref()
                 {
                     self.sculpt.begin_stroke(mesh);
-                    let modifiers = context.input(|input| input.modifiers);
                     let sculpt_input = self.sculpt_input(camera_frame);
                     self.stroke_sampler = Some(StrokeSampler::begin(
                         position,
@@ -2125,29 +2153,25 @@ impl SculptLiteApp {
                         if let Some(initial_dab) = initial_dab {
                             self.apply_pointer_sample(
                                 initial_dab.context,
-                                initial_dab.position,
-                                Vec2::ZERO,
-                                initial_dab.pressure,
-                                initial_dab.modifiers,
-                                Some(pointer_hit),
+                                PointerDab {
+                                    position: initial_dab.position,
+                                    delta: Vec2::ZERO,
+                                    pressure: initial_dab.pressure,
+                                    modifiers: initial_dab.modifiers,
+                                    hit: Some(pointer_hit),
+                                    kind: DabKind::Spatial,
+                                },
                             );
                         }
                     }
-                    began_stroke = true;
                 }
 
-                if sculpting_allowed(self.fly_captured)
-                    && !began_stroke
-                    && self.sculpt.is_stroking()
-                {
-                    let stopped = response.drag_stopped_by(PointerButton::Primary);
-                    let primary_down =
-                        context.input(|input| input.pointer.button_down(PointerButton::Primary));
+                if sculpting_allowed(self.fly_captured) && self.sculpt.is_stroking() {
                     let modifiers = context.input(|input| input.modifiers);
                     let sculpt_input = self.sculpt_input(camera_frame);
                     let brush_spacing = self.brush_spacing();
                     let effective_tool = effective_tool(sculpt_input.tool, modifiers);
-                    if (primary_down || stopped)
+                    if (primary_down || primary_released)
                         && let Some(position) = pointer
                     {
                         if effective_tool == SculptTool::Grab {
@@ -2161,11 +2185,14 @@ impl SculptLiteApp {
                             if delta.length_sq() > f32::EPSILON {
                                 self.apply_pointer_sample(
                                     sculpt_input,
-                                    position,
-                                    delta,
-                                    MOUSE_PRESSURE,
-                                    modifiers,
-                                    None,
+                                    PointerDab {
+                                        position,
+                                        delta,
+                                        pressure: MOUSE_PRESSURE,
+                                        modifiers,
+                                        hit: None,
+                                        kind: DabKind::Spatial,
+                                    },
                                 );
                                 if let Some(sampler) = self.stroke_sampler.as_mut() {
                                     sampler.record_spatial_dab();
@@ -2181,7 +2208,7 @@ impl SculptLiteApp {
                             );
                         }
                     }
-                    if stopped && let Some(sampler) = self.stroke_sampler.as_mut() {
+                    if primary_released && let Some(sampler) = self.stroke_sampler.as_mut() {
                         sampler.release();
                     }
 
@@ -2241,11 +2268,14 @@ impl SculptLiteApp {
             };
             self.apply_pointer_sample(
                 dab.context,
-                dab.position,
-                Vec2::ZERO,
-                dab.pressure,
-                dab.modifiers,
-                None,
+                PointerDab {
+                    position: dab.position,
+                    delta: Vec2::ZERO,
+                    pressure: dab.pressure,
+                    modifiers: dab.modifiers,
+                    hit: None,
+                    kind: DabKind::Spatial,
+                },
             );
             processed += 1;
             if started.elapsed() >= SCULPT_FRAME_BUDGET {
@@ -2272,11 +2302,14 @@ impl SculptLiteApp {
         };
         self.apply_pointer_sample(
             dab.context,
-            dab.position,
-            Vec2::ZERO,
-            dab.pressure,
-            dab.modifiers,
-            None,
+            PointerDab {
+                position: dab.position,
+                delta: Vec2::ZERO,
+                pressure: dab.pressure,
+                modifiers: dab.modifiers,
+                hit: None,
+                kind: DabKind::Airbrush,
+            },
         );
         if let Some(sampler) = self.stroke_sampler.as_mut() {
             sampler.record_airbrush_dab();
@@ -2321,39 +2354,31 @@ impl SculptLiteApp {
         self.stroke_sampler = None;
     }
 
-    fn apply_pointer_sample(
-        &mut self,
-        input: SculptInput,
-        pointer: Pos2,
-        pointer_delta: Vec2,
-        pressure: f32,
-        modifiers: Modifiers,
-        pointer_hit: Option<PointerHit>,
-    ) {
-        let Some(pointer_hit) = pointer_hit.or_else(|| self.hit_at(pointer, input.camera)) else {
+    fn apply_pointer_sample(&mut self, input: SculptInput, dab: PointerDab) {
+        let Some(pointer_hit) = dab.hit.or_else(|| self.hit_at(dab.position, input.camera)) else {
             return;
         };
         let hit = pointer_hit.hit;
 
         let depth_scale = (hit.distance / input.camera.distance().max(1.0e-6)).max(0.05);
         let units_per_point = input.camera.world_units_per_point() * depth_scale;
-        let world_drag = input.camera.right() * pointer_delta.x * units_per_point
-            - input.camera.up() * pointer_delta.y * units_per_point;
-        let effective_tool = effective_tool(input.tool, modifiers);
+        let world_drag = input.camera.right() * dab.delta.x * units_per_point
+            - input.camera.up() * dab.delta.y * units_per_point;
+        let effective_tool = effective_tool(input.tool, dab.modifiers);
         let mut settings = input.brush;
         settings.radius = input.radius_points * units_per_point;
         let sample = BrushSample::from_hit(
             &hit,
             world_drag,
             pointer_hit.view_direction,
-            pressure,
-            modifiers.ctrl,
+            dab.pressure,
+            dab.modifiers.ctrl,
         );
 
         let changed = self.document.as_mut().is_some_and(|document| {
             document.mesh.as_mut().is_some_and(|mesh| {
                 self.sculpt
-                    .apply_sample(mesh, effective_tool, &settings, sample)
+                    .apply_sample(mesh, effective_tool, &settings, sample, dab.kind)
             })
         });
         self.consume_sculpt_step(changed, effective_tool != SculptTool::Mask);
