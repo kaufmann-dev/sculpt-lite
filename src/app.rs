@@ -18,7 +18,7 @@ use glam::Vec3;
 use crate::{
     camera::{Camera, CameraFrame, CameraMode, FlyMovement, FlyMovementMode},
     history::{History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot},
-    mesh::{Mesh, MeshChangeSet, RayHit},
+    mesh::{Mesh, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
     sculpt::{BrushSample, BrushSettings, SculptEngine, SculptTool, SymmetryAxis},
     stl::{ImportReport, load_stl, save_stl_atomic},
@@ -36,40 +36,24 @@ struct SculptInput {
     camera: CameraFrame,
     tool: SculptTool,
     brush: BrushSettings,
-    adaptive_topology: bool,
-    adaptive_detail: f32,
     radius_points: f32,
 }
 
 #[derive(Debug, Default)]
 struct FrameRenderBatch {
     vertices: Vec<u32>,
-    changes: MeshChangeSet,
-    has_topology: bool,
     changed: bool,
 }
 
 impl FrameRenderBatch {
     fn clear(&mut self) {
         self.vertices.clear();
-        self.changes.clear();
-        self.has_topology = false;
         self.changed = false;
     }
 
-    fn queue(&mut self, updated_vertices: Vec<u32>, mesh_changes: Option<MeshChangeSet>) {
+    fn queue(&mut self, updated_vertices: Vec<u32>) {
         self.changed = true;
-        if let Some(changes) = mesh_changes {
-            if !self.has_topology {
-                self.changes.include_vertices(self.vertices.drain(..));
-                self.has_topology = true;
-            }
-            self.changes.merge(changes);
-        } else if self.has_topology {
-            self.changes.include_vertices(updated_vertices);
-        } else {
-            self.vertices.extend(updated_vertices);
-        }
+        self.vertices.extend(updated_vertices);
     }
 }
 
@@ -80,7 +64,6 @@ const DEFAULT_AIRBRUSH_DABS_PER_SECOND: f32 = 10.0;
 const MIN_AIRBRUSH_DABS_PER_SECOND: f32 = 2.0;
 const MAX_AIRBRUSH_DABS_PER_SECOND: f32 = 30.0;
 const BRUSH_SPACING_RADIUS_FRACTION: f32 = 0.15;
-const DEFAULT_ADAPTIVE_DETAIL: f32 = 0.12;
 const MOUSE_PRESSURE: f32 = 1.0;
 const SCULPT_FRAME_BUDGET: Duration = Duration::from_millis(8);
 const BRUSH_VALUE_STEP: f32 = 0.05;
@@ -107,7 +90,6 @@ enum ShortcutAction {
     AdjustStrength(ShortcutDirection),
     AdjustHardness(ShortcutDirection),
     ToggleAirbrush,
-    ToggleAdaptiveTopology,
     ToggleBrushInvert,
     SetSymmetry(Option<SymmetryAxis>),
     ClearMask,
@@ -127,7 +109,7 @@ const fn shortcut(modifiers: Modifiers, key: Key, action: ShortcutAction) -> Sho
     }
 }
 
-const SHORTCUT_BINDINGS: [ShortcutBinding; 32] = [
+const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
     // Put shortcuts with required Shift modifiers before their less-specific
     // variants because egui permits extra Shift for logical key matching.
     shortcut(
@@ -224,11 +206,6 @@ const SHORTCUT_BINDINGS: [ShortcutBinding; 32] = [
         ShortcutAction::AdjustHardness(ShortcutDirection::Increase),
     ),
     shortcut(Modifiers::NONE, Key::A, ShortcutAction::ToggleAirbrush),
-    shortcut(
-        Modifiers::NONE,
-        Key::T,
-        ShortcutAction::ToggleAdaptiveTopology,
-    ),
     shortcut(Modifiers::NONE, Key::I, ShortcutAction::ToggleBrushInvert),
     shortcut(
         Modifiers::NONE,
@@ -281,9 +258,6 @@ fn shortcut_is_enabled(action: ShortcutAction, availability: ShortcutAvailabilit
         ShortcutAction::ToggleAirbrush => {
             availability.mesh_ready && availability.tool != SculptTool::Grab
         }
-        ShortcutAction::ToggleAdaptiveTopology => {
-            availability.mesh_ready && availability.tool != SculptTool::Mask
-        }
     }
 }
 
@@ -322,10 +296,6 @@ fn shortcut_label(context: &egui::Context, label: &str, actions: &[ShortcutActio
 
 fn shortcut_tooltip(context: &egui::Context, actions: &[ShortcutAction]) -> String {
     format!("Shortcut: {}", shortcut_hint(context, actions))
-}
-
-fn adaptive_target_edge_length(radius: f32, detail: f32, units_per_point: f32) -> f32 {
-    (radius * detail.clamp(0.03, 0.35)).max(units_per_point)
 }
 
 struct MeshDocument {
@@ -727,8 +697,6 @@ pub struct SculptLiteApp {
     sculpt: SculptEngine,
     tool: SculptTool,
     brush: BrushSettings,
-    adaptive_topology: bool,
-    adaptive_detail: f32,
     airbrush: bool,
     airbrush_dabs_per_second: f32,
     brush_radius_points: f32,
@@ -779,8 +747,6 @@ impl SculptLiteApp {
             sculpt: SculptEngine::default(),
             tool: SculptTool::default(),
             brush: BrushSettings::default(),
-            adaptive_topology: false,
-            adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             airbrush: false,
             airbrush_dabs_per_second: DEFAULT_AIRBRUSH_DABS_PER_SECOND,
             brush_radius_points: INITIAL_BRUSH_RADIUS_POINTS,
@@ -954,7 +920,7 @@ impl SculptLiteApp {
             renderer.install_prepared_mesh(upload);
         }
         self.status = if report.has_topology_warnings() {
-            format!("Loaded {} with protected topology regions", path.display())
+            format!("Loaded {} with topology warnings", path.display())
         } else {
             format!("Loaded {}", path.display())
         };
@@ -1199,48 +1165,21 @@ impl SculptLiteApp {
         }
     }
 
-    fn upload_mesh_partial(&self, changes: &MeshChangeSet) {
-        if let (Some(renderer), Some(mesh)) = (
-            &self.renderer,
-            self.document
-                .as_ref()
-                .and_then(|document| document.mesh.as_ref()),
-        ) {
-            renderer.update_mesh_partial(mesh, changes);
-        }
-    }
-
     fn begin_frame_render_batch(&mut self) {
         self.frame_render.clear();
     }
 
-    fn queue_frame_render_update(
-        &mut self,
-        updated_vertices: Vec<u32>,
-        mesh_changes: Option<MeshChangeSet>,
-    ) {
-        self.frame_render.queue(updated_vertices, mesh_changes);
+    fn queue_frame_render_update(&mut self, updated_vertices: Vec<u32>) {
+        self.frame_render.queue(updated_vertices);
     }
 
     fn flush_frame_render_batch(&mut self, context: &egui::Context) {
         if !self.frame_render.changed {
             return;
         }
-        if self.frame_render.has_topology {
-            let counts = self
-                .document
-                .as_ref()
-                .and_then(|document| document.mesh.as_ref())
-                .map(|mesh| (mesh.positions.len(), mesh.triangles.len()));
-            if let Some((vertex_count, face_count)) = counts {
-                self.frame_render.changes.finalize(vertex_count, face_count);
-                self.upload_mesh_partial(&self.frame_render.changes);
-            }
-        } else {
-            self.frame_render.vertices.sort_unstable();
-            self.frame_render.vertices.dedup();
-            self.upload_vertices_partial(&self.frame_render.vertices);
-        }
+        self.frame_render.vertices.sort_unstable();
+        self.frame_render.vertices.dedup();
+        self.upload_vertices_partial(&self.frame_render.vertices);
         context.request_repaint();
     }
 
@@ -1300,14 +1239,6 @@ impl SculptLiteApp {
                 self.refresh_document_bounds();
                 self.status = "Undo".to_owned();
             }
-            HistoryAction::Topology { changes } => {
-                if let Some(document) = self.document.as_mut() {
-                    document.dirty = true;
-                }
-                self.upload_mesh_partial(&changes);
-                self.refresh_document_bounds();
-                self.status = "Undo".to_owned();
-            }
         }
     }
 
@@ -1327,14 +1258,6 @@ impl SculptLiteApp {
                     document.dirty = true;
                 }
                 self.upload_vertices_partial(&changed_vertices);
-                self.refresh_document_bounds();
-                self.status = "Redo".to_owned();
-            }
-            HistoryAction::Topology { changes } => {
-                if let Some(document) = self.document.as_mut() {
-                    document.dirty = true;
-                }
-                self.upload_mesh_partial(&changes);
                 self.refresh_document_bounds();
                 self.status = "Redo".to_owned();
             }
@@ -1452,9 +1375,6 @@ impl SculptLiteApp {
                 self.brush.falloff = adjusted_brush_value(self.brush.falloff, direction, 0.0, 0.95);
             }
             ShortcutAction::ToggleAirbrush => self.airbrush = !self.airbrush,
-            ShortcutAction::ToggleAdaptiveTopology => {
-                self.adaptive_topology = !self.adaptive_topology;
-            }
             ShortcutAction::ToggleBrushInvert => self.brush.invert = !self.brush.invert,
             ShortcutAction::SetSymmetry(symmetry) => self.brush.symmetry = symmetry,
             ShortcutAction::ClearMask => self.edit_mask(false),
@@ -1720,7 +1640,7 @@ impl SculptLiteApp {
                             });
 
                         ui.separator();
-                        egui::CollapsingHeader::new(RichText::new("Stroke & topology").strong())
+                        egui::CollapsingHeader::new(RichText::new("Stroke").strong())
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.add_enabled_ui(mesh_ready, |ui| {
@@ -1743,27 +1663,6 @@ impl SculptLiteApp {
                                                 ..=MAX_AIRBRUSH_DABS_PER_SECOND,
                                         )
                                         .suffix(" dabs/s"),
-                                    );
-
-                                    ui.add_space(4.0);
-                                    let supports_topology = self.tool != SculptTool::Mask;
-                                    ui.add_enabled_ui(supports_topology, |ui| {
-                                        let label = shortcut_label(
-                                            ui.ctx(),
-                                            "Adaptive topology",
-                                            &[ShortcutAction::ToggleAdaptiveTopology],
-                                        );
-                                        ui.checkbox(&mut self.adaptive_topology, label)
-                                            .on_hover_text("Continuously adjusts topology inside the brush region.");
-                                    });
-                                    ui.label("Detail");
-                                    ui.add_enabled(
-                                        supports_topology && self.adaptive_topology,
-                                        egui::Slider::new(
-                                            &mut self.adaptive_detail,
-                                            0.03..=0.35,
-                                        )
-                                        .logarithmic(true),
                                     );
                                 });
                             });
@@ -2292,9 +2191,7 @@ impl SculptLiteApp {
                     }
 
                     let finished = self.stroke_sampler.as_ref().is_some_and(|sampler| {
-                        sampler.is_released()
-                            && !sampler.has_pending_path()
-                            && !self.sculpt.has_pending_sample()
+                        sampler.is_released() && !sampler.has_pending_path()
                     });
                     if finished {
                         self.finish_pointer_stroke();
@@ -2323,8 +2220,6 @@ impl SculptLiteApp {
             camera,
             tool: self.tool,
             brush: self.brush,
-            adaptive_topology: self.adaptive_topology,
-            adaptive_detail: self.adaptive_detail,
             radius_points: self.brush_radius_points,
         }
     }
@@ -2335,12 +2230,6 @@ impl SculptLiteApp {
 
     fn apply_spatial_dabs(&mut self) {
         let started = Instant::now();
-        if self.sculpt.has_pending_sample() {
-            self.continue_pending_sculpt_sample();
-            if self.sculpt.has_pending_sample() || started.elapsed() >= SCULPT_FRAME_BUDGET {
-                return;
-            }
-        }
         let mut processed = 0;
         while processed < MAX_DABS_PER_FRAME {
             let dab = self
@@ -2359,7 +2248,7 @@ impl SculptLiteApp {
                 None,
             );
             processed += 1;
-            if self.sculpt.has_pending_sample() || started.elapsed() >= SCULPT_FRAME_BUDGET {
+            if started.elapsed() >= SCULPT_FRAME_BUDGET {
                 break;
             }
         }
@@ -2371,7 +2260,7 @@ impl SculptLiteApp {
     }
 
     fn apply_airbrush_dab(&mut self) {
-        if !self.airbrush || self.tool == SculptTool::Grab || self.sculpt.has_pending_sample() {
+        if !self.airbrush || self.tool == SculptTool::Grab {
             return;
         }
         let interval = self.airbrush_interval();
@@ -2409,10 +2298,7 @@ impl SculptLiteApp {
             .and_then(|document| document.mesh.as_ref())
             .map(|mesh| self.sculpt.end_stroke(mesh))
             .unwrap_or_default();
-        let history_entry = outcome
-            .topology
-            .map(|edit| HistoryEntry::Topology(Arc::new(edit)))
-            .or_else(|| (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit)));
+        let history_entry = (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit));
         if let Some(history_entry) = history_entry {
             if let Some(document) = self.document.as_mut() {
                 document.dirty = true;
@@ -2456,15 +2342,6 @@ impl SculptLiteApp {
         let effective_tool = effective_tool(input.tool, modifiers);
         let mut settings = input.brush;
         settings.radius = input.radius_points * units_per_point;
-        if effective_tool == SculptTool::Mask || !input.adaptive_topology {
-            settings.remesh_target_edge_length = None;
-        } else {
-            settings.remesh_target_edge_length = Some(adaptive_target_edge_length(
-                settings.radius,
-                input.adaptive_detail,
-                units_per_point,
-            ));
-        }
         let sample = BrushSample::from_hit(
             &hit,
             world_drag,
@@ -2482,25 +2359,11 @@ impl SculptLiteApp {
         self.consume_sculpt_step(changed, effective_tool != SculptTool::Mask);
     }
 
-    fn continue_pending_sculpt_sample(&mut self) {
-        let changed = self.document.as_mut().is_some_and(|document| {
-            document
-                .mesh
-                .as_mut()
-                .is_some_and(|mesh| self.sculpt.continue_pending_sample(mesh))
-        });
-        self.consume_sculpt_step(changed, true);
-    }
-
     fn consume_sculpt_step(&mut self, changed: bool, geometry_changed: bool) {
         let committed = self.sculpt.take_sample_committed();
         let updated_vertices = self.sculpt.take_updated_vertices();
-        let mesh_changes = self.sculpt.take_mesh_changes();
         if let Some(error) = self.sculpt.take_error() {
             self.error = Some(error);
-        }
-        if let Some(warning) = self.sculpt.take_warning() {
-            self.status = warning;
         }
         if committed && let Some(document) = self.document.as_mut() {
             document.dirty = true;
@@ -2509,7 +2372,7 @@ impl SculptLiteApp {
             if geometry_changed {
                 self.update_document_bounds(&updated_vertices);
             }
-            self.queue_frame_render_update(updated_vertices, mesh_changes);
+            self.queue_frame_render_update(updated_vertices);
         }
     }
 
@@ -2631,7 +2494,7 @@ impl eframe::App for SculptLiteApp {
         }
 
         if let Some(sampler) = &self.stroke_sampler {
-            if sampler.has_pending_path() || self.sculpt.has_pending_sample() {
+            if sampler.has_pending_path() {
                 context.request_repaint();
             } else if self.airbrush && self.tool != SculptTool::Grab && !sampler.is_released() {
                 context.request_repaint_after(sampler.airbrush_wait(self.airbrush_interval()));
@@ -2675,21 +2538,6 @@ fn two_column_item_width(available_width: f32, item_spacing: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn adaptive_target_never_creates_subpoint_edges() {
-        let units_per_point = 0.25;
-        let radius = MIN_BRUSH_RADIUS_POINTS * units_per_point;
-
-        assert_eq!(
-            adaptive_target_edge_length(radius, 0.03, units_per_point),
-            units_per_point
-        );
-        assert_eq!(
-            adaptive_target_edge_length(radius * 100.0, 0.12, units_per_point),
-            radius * 12.0
-        );
-    }
 
     #[test]
     fn grouped_formats_face_counts() {
@@ -3105,22 +2953,11 @@ mod tests {
         assert!(shortcut_is_enabled(ShortcutAction::Undo, ready));
         assert!(!shortcut_is_enabled(ShortcutAction::Redo, ready));
         assert!(shortcut_is_enabled(ShortcutAction::ToggleAirbrush, ready));
-        assert!(shortcut_is_enabled(
-            ShortcutAction::ToggleAdaptiveTopology,
-            ready
-        ));
 
         assert!(!shortcut_is_enabled(
             ShortcutAction::ToggleAirbrush,
             ShortcutAvailability {
                 tool: SculptTool::Grab,
-                ..ready
-            }
-        ));
-        assert!(!shortcut_is_enabled(
-            ShortcutAction::ToggleAdaptiveTopology,
-            ShortcutAvailability {
-                tool: SculptTool::Mask,
                 ..ready
             }
         ));
@@ -3164,23 +3001,16 @@ mod tests {
     }
 
     #[test]
-    fn frame_render_batch_preserves_fixed_edits_around_topology_edits() {
+    fn frame_render_batch_merges_fixed_topology_edits() {
         let mut batch = FrameRenderBatch::default();
-        batch.queue(vec![1, 2], None);
-        let mut topology = MeshChangeSet::default();
-        topology.dirty_vertices = vec![3, 4];
-        topology.dirty_faces = vec![7];
-        topology.vertex_count = 12;
-        topology.face_count = 9;
-        batch.queue(vec![3], Some(topology));
-        batch.queue(vec![5, 2], None);
-        batch.changes.finalize(12, 9);
+        batch.queue(vec![1, 2]);
+        batch.queue(vec![3, 4]);
+        batch.queue(vec![5, 2]);
+        batch.vertices.sort_unstable();
+        batch.vertices.dedup();
 
         assert!(batch.changed);
-        assert!(batch.has_topology);
-        assert_eq!(batch.changes.dirty_vertices, [1, 2, 3, 4, 5]);
-        assert_eq!(batch.changes.dirty_faces, [7]);
-        assert!(batch.vertices.is_empty());
+        assert_eq!(batch.vertices, [1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -3191,8 +3021,6 @@ mod tests {
             camera: camera.frame(viewport).unwrap(),
             tool: SculptTool::Draw,
             brush: BrushSettings::default(),
-            adaptive_topology: true,
-            adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             radius_points: 55.0,
         };
         let mut sampler = StrokeSampler::begin(

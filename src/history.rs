@@ -1,9 +1,7 @@
-use std::collections::VecDeque;
-use std::sync::Arc;
-
 use glam::Vec3;
+use std::collections::VecDeque;
 
-use crate::mesh::{Mesh, MeshChangeSet, MeshEditDelta};
+use crate::mesh::Mesh;
 
 /// Default memory budget shared by undo and redo entries (512 MiB).
 pub const DEFAULT_HISTORY_BUDGET: usize = 512 * 1024 * 1024;
@@ -131,7 +129,6 @@ impl MeshSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HistoryEntry {
     Local(LocalEdit),
-    Topology(Arc<MeshEditDelta>),
 }
 
 impl HistoryEntry {
@@ -139,7 +136,6 @@ impl HistoryEntry {
     pub fn byte_len(&self) -> usize {
         match self {
             Self::Local(edit) => edit.byte_len(),
-            Self::Topology(edit) => edit.byte_len(),
         }
     }
 }
@@ -154,7 +150,6 @@ pub enum HistoryDirection {
 pub enum HistoryAction {
     Empty,
     Local { changed_vertices: Vec<u32> },
-    Topology { changes: MeshChangeSet },
 }
 
 #[derive(Debug)]
@@ -235,17 +230,6 @@ impl History {
                 };
                 self.push_opposite(direction, StoredEntry::new(HistoryEntry::Local(edit)));
                 HistoryAction::Local { changed_vertices }
-            }
-            HistoryEntry::Topology(edit) => {
-                let changes = match direction {
-                    HistoryDirection::Undo => edit.apply_before(mesh),
-                    HistoryDirection::Redo => edit.apply_after(mesh),
-                };
-                self.push_opposite(
-                    direction,
-                    StoredEntry::new(HistoryEntry::Topology(Arc::clone(&edit))),
-                );
-                HistoryAction::Topology { changes }
             }
         }
     }
@@ -373,31 +357,6 @@ mod tests {
             Vec3::new(2.0, 0.0, 0.0),
         ))));
         assert!(!history.can_redo());
-    }
-
-    #[test]
-    fn topology_delta_undo_and_redo_are_exact() {
-        let mut mesh = triangle();
-        let before = mesh.positions[1];
-        let after = Vec3::new(3.0, 0.0, 0.0);
-        let mut recorder = crate::mesh::MeshEditRecorder::new(&mesh);
-        recorder.record_vertex(&mesh, 1);
-        mesh.positions[1] = after;
-        mesh.update_deformed_vertices(&[1]);
-        let edit = Arc::new(recorder.finish(&mesh));
-        let mut history = History::default();
-        assert!(history.record(HistoryEntry::Topology(edit)));
-
-        let HistoryAction::Topology { .. } = history.undo(&mut mesh) else {
-            panic!("topology delta expected");
-        };
-        assert_eq!(mesh.positions[1], before);
-        assert!(history.can_redo());
-
-        let HistoryAction::Topology { .. } = history.redo(&mut mesh) else {
-            panic!("topology delta expected");
-        };
-        assert_eq!(mesh.positions[1], after);
     }
 
     #[test]

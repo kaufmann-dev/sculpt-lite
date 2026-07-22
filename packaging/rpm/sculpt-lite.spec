@@ -29,8 +29,8 @@ Requires:       vulkan-loader
 
 %description
 SculptLite is a native Linux tool for focused, organic sculpting of STL meshes.
-It imports STL files, provides direct sculpting brushes and optional adaptive
-topology, and exports the edited result as STL.
+It imports STL files, provides direct fixed-topology sculpting brushes, and
+exports the edited result as STL.
 
 %prep
 

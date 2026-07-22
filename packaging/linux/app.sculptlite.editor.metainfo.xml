@@ -14,7 +14,7 @@
     </p>
     <p>
       Import an STL mesh, shape it with focused sculpting brushes, optionally
-      adapt its topology, undo edits, and export the result as STL.
+      edit its surface, undo edits, and export the result as STL.
     </p>
   </description>
   <url type="homepage">https://github.com/kaufmann-dev/sculpt-lite</url>
