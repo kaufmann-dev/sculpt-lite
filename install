@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly repo_root
+
+if [[ -z "${HOME:-}" ]]; then
+    printf 'HOME must be set to install SculptLite.\n' >&2
+    exit 1
+fi
+
+readonly required_commands=(
+    cargo
+    chmod
+    cp
+    desktop-file-install
+    gtk-update-icon-cache
+    mkdir
+    update-desktop-database
+)
+
+for command_name in "${required_commands[@]}"; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        printf 'Required command not found: %s\n' "$command_name" >&2
+        exit 1
+    fi
+done
+
+readonly local_root="$HOME/.local"
+readonly data_root="$local_root/share"
+readonly app_id="app.sculptlite.editor"
+
+cd "$repo_root"
+cargo install --locked --force --path "$repo_root" --root "$local_root"
+
+mkdir -p \
+    "$data_root/applications" \
+    "$data_root/icons/hicolor/512x512/apps" \
+    "$data_root/metainfo"
+
+cp "assets/sculpt-lite.png" \
+    "$data_root/icons/hicolor/512x512/apps/$app_id.png"
+cp "packaging/linux/$app_id.metainfo.xml" \
+    "$data_root/metainfo/$app_id.metainfo.xml"
+chmod 0644 \
+    "$data_root/icons/hicolor/512x512/apps/$app_id.png" \
+    "$data_root/metainfo/$app_id.metainfo.xml"
+
+desktop-file-install \
+    --dir="$data_root/applications" \
+    --set-key=Exec --set-value="$local_root/bin/sculpt-lite %f" \
+    --set-key=TryExec --set-value="$local_root/bin/sculpt-lite" \
+    "packaging/linux/$app_id.desktop"
+
+update-desktop-database "$data_root/applications"
+gtk-update-icon-cache --force --ignore-theme-index \
+    "$data_root/icons/hicolor"
+
+printf 'SculptLite is installed at %s/bin/sculpt-lite.\n' "$local_root"

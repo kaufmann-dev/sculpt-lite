@@ -23,10 +23,10 @@ cargo run
 Install or replace the user-local executable without `sudo`:
 
 ```sh
-cargo install --locked --force --path . --root "$HOME/.local"
+./install
 ```
 
-The executable is installed at `~/.local/bin/sculpt-lite`. Ensure that directory appears before `/usr/bin` in `PATH`, then confirm it is the active copy:
+The installer builds and installs the executable, application launcher, icon, and AppStream metadata. The executable is installed at `~/.local/bin/sculpt-lite`. Ensure that directory appears before `/usr/bin` in `PATH`, then confirm it is the active copy:
 
 ```sh
 command -v sculpt-lite
@@ -39,27 +39,7 @@ If necessary, add it for the current shell and open a new terminal afterward:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Run the same `cargo install` command after pulling or making later changes.
-
-### Add the application launcher
-
-`cargo install` installs only the executable. Install or refresh the user-level launcher, icon, and metainfo from the repository root with:
-
-```sh
-install -Dm0644 assets/sculpt-lite.png \
-  "$HOME/.local/share/icons/hicolor/512x512/apps/app.sculptlite.editor.png"
-install -Dm0644 packaging/linux/app.sculptlite.editor.metainfo.xml \
-  "$HOME/.local/share/metainfo/app.sculptlite.editor.metainfo.xml"
-install -d "$HOME/.local/share/applications"
-desktop-file-install \
-  --dir="$HOME/.local/share/applications" \
-  --set-key=Exec --set-value="$HOME/.local/bin/sculpt-lite %f" \
-  --set-key=TryExec --set-value="$HOME/.local/bin/sculpt-lite" \
-  packaging/linux/app.sculptlite.editor.desktop
-update-desktop-database "$HOME/.local/share/applications"
-gtk-update-icon-cache --force --ignore-theme-index \
-  "$HOME/.local/share/icons/hicolor"
-```
+Run `./install` again after pulling or making later changes; the existing executable and desktop files are replaced.
 
 ## Verify a change
 
