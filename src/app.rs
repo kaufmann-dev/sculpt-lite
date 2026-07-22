@@ -17,12 +17,19 @@ use glam::Vec3;
 
 use crate::{
     camera::{Camera, CameraFrame, CameraMode, FlyMovement, FlyMovementMode},
-    history::{History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot},
+    history::{
+        History, HistoryAction, HistoryDirection, HistoryEntry, LocalEdit, MaskChange,
+        MeshSnapshot, PendingMeshReplacement,
+    },
     mesh::{Mesh, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
     sculpt::{BrushSample, BrushSettings, DabKind, SculptEngine, SculptTool, SymmetryAxis},
     stl::{ImportReport, load_stl, save_stl_atomic},
     stroke::{MAX_DABS_PER_FRAME, StrokeSampler},
+    voxel_remesh::{
+        DEFAULT_REMESH_RESOLUTION, MAX_REMESH_RESOLUTION, MIN_REMESH_RESOLUTION, VoxelRemeshOutput,
+        VoxelRemeshSettings, source_eligibility, voxel_remesh,
+    },
 };
 
 #[derive(Clone, Copy)]
@@ -311,6 +318,8 @@ fn shortcut_tooltip(context: &egui::Context, actions: &[ShortcutAction]) -> Stri
 struct MeshDocument {
     mesh: Option<Mesh>,
     bounds: Option<MeshBounds>,
+    remesh_disabled_reason: Option<String>,
+    remesh_bounds: Option<MeshBounds>,
     source_path: PathBuf,
     dirty: bool,
 }
@@ -346,6 +355,30 @@ impl MeshBounds {
         Some(bounds)
     }
 
+    fn from_referenced_mesh(mesh: &Mesh) -> Option<Self> {
+        let first_vertex = mesh.triangles.iter().flatten().copied().find(|&vertex| {
+            mesh.positions
+                .get(vertex as usize)
+                .is_some_and(|position| position.is_finite())
+        })?;
+        let first = mesh.positions[first_vertex as usize];
+        let mut bounds = Self {
+            minimum: first,
+            maximum: first,
+            minimum_vertices: [first_vertex; 3],
+            maximum_vertices: [first_vertex; 3],
+            exact: true,
+        };
+        for &vertex in mesh.triangles.iter().flatten() {
+            if let Some(&position) = mesh.positions.get(vertex as usize)
+                && position.is_finite()
+            {
+                bounds.include(vertex, position);
+            }
+        }
+        Some(bounds)
+    }
+
     fn include(&mut self, vertex: u32, position: Vec3) {
         for axis in 0..3 {
             if position[axis] < self.minimum[axis] {
@@ -360,6 +393,24 @@ impl MeshBounds {
     }
 
     fn update(&mut self, mesh: &Mesh, changed_vertices: &[u32]) {
+        self.update_where(mesh, changed_vertices, |_| true);
+    }
+
+    fn update_referenced(&mut self, mesh: &Mesh, changed_vertices: &[u32]) {
+        self.update_where(mesh, changed_vertices, |vertex| {
+            mesh.topology
+                .vertex_triangles
+                .get(vertex as usize)
+                .is_some_and(|triangles| !triangles.is_empty())
+        });
+    }
+
+    fn update_where(
+        &mut self,
+        mesh: &Mesh,
+        changed_vertices: &[u32],
+        include: impl Fn(u32) -> bool,
+    ) {
         if self
             .minimum_vertices
             .iter()
@@ -368,24 +419,31 @@ impl MeshBounds {
         {
             self.exact = false;
         }
-        let invalidated = changed_vertices.iter().copied().any(|vertex| {
-            let Some(&position) = mesh.positions.get(vertex as usize) else {
-                return self.minimum_vertices.contains(&vertex)
-                    || self.maximum_vertices.contains(&vertex);
-            };
-            if !position.is_finite() {
-                return true;
-            }
-            (0..3).any(|axis| {
-                (self.minimum_vertices[axis] == vertex && position[axis] > self.minimum[axis])
-                    || (self.maximum_vertices[axis] == vertex
-                        && position[axis] < self.maximum[axis])
-            })
-        });
+        let invalidated = changed_vertices
+            .iter()
+            .copied()
+            .filter(|&vertex| include(vertex))
+            .any(|vertex| {
+                let Some(&position) = mesh.positions.get(vertex as usize) else {
+                    return self.minimum_vertices.contains(&vertex)
+                        || self.maximum_vertices.contains(&vertex);
+                };
+                if !position.is_finite() {
+                    return true;
+                }
+                (0..3).any(|axis| {
+                    (self.minimum_vertices[axis] == vertex && position[axis] > self.minimum[axis])
+                        || (self.maximum_vertices[axis] == vertex
+                            && position[axis] < self.maximum[axis])
+                })
+            });
         if invalidated {
             self.exact = false;
         }
         for &vertex in changed_vertices {
+            if !include(vertex) {
+                continue;
+            }
             if let Some(&position) = mesh.positions.get(vertex as usize)
                 && position.is_finite()
             {
@@ -577,12 +635,70 @@ enum PendingAction {
     Close,
 }
 
-enum WorkerJob {
-    Import(PathBuf),
-    Export { mesh: Box<Mesh>, path: PathBuf },
+fn remesh_disabled_reason(mesh: &Mesh) -> Option<String> {
+    source_eligibility(mesh)
+        .err()
+        .map(|error| error.to_string())
 }
 
-type ImportResult = Result<(Box<Mesh>, ImportReport, Option<Box<PreparedMeshUpload>>), String>;
+fn remesh_bounds(mesh: &Mesh) -> Option<MeshBounds> {
+    MeshBounds::from_referenced_mesh(mesh)
+}
+
+fn history_direction_label(direction: HistoryDirection) -> &'static str {
+    match direction {
+        HistoryDirection::Undo => "Undo",
+        HistoryDirection::Redo => "Redo",
+    }
+}
+
+enum WorkerJob {
+    Import(PathBuf),
+    Export {
+        mesh: Box<Mesh>,
+        path: PathBuf,
+    },
+    VoxelRemesh {
+        mesh: Box<Mesh>,
+        settings: VoxelRemeshSettings,
+    },
+    RestoreSnapshot {
+        mesh: Box<Mesh>,
+        target: Arc<MeshSnapshot>,
+    },
+    RecoverSnapshot {
+        snapshot: Arc<MeshSnapshot>,
+    },
+}
+
+type ImportResult = Result<
+    (
+        Box<Mesh>,
+        ImportReport,
+        Option<Box<PreparedMeshUpload>>,
+        Option<String>,
+        Option<MeshBounds>,
+    ),
+    String,
+>;
+type VoxelWorkerResult = Result<
+    (
+        VoxelRemeshOutput,
+        Option<Box<PreparedMeshUpload>>,
+        Option<String>,
+        Option<MeshBounds>,
+    ),
+    String,
+>;
+type SnapshotWorkerResult = Result<
+    (
+        Box<Mesh>,
+        Option<Box<PreparedMeshUpload>>,
+        Option<String>,
+        Option<MeshBounds>,
+    ),
+    String,
+>;
 
 enum WorkerResult {
     Import {
@@ -594,6 +710,21 @@ enum WorkerResult {
         path: PathBuf,
         mesh: Box<Mesh>,
         result: Result<(), String>,
+    },
+    VoxelRemeshCheckpoint(Arc<MeshSnapshot>),
+    VoxelRemesh {
+        original: Box<Mesh>,
+        source: Option<Arc<MeshSnapshot>>,
+        result: Box<VoxelWorkerResult>,
+    },
+    RestoreSnapshotCheckpoint(Arc<MeshSnapshot>),
+    RestoreSnapshot {
+        original: Box<Mesh>,
+        inverse: Option<Arc<MeshSnapshot>>,
+        result: SnapshotWorkerResult,
+    },
+    RecoverSnapshot {
+        result: SnapshotWorkerResult,
     },
 }
 
@@ -618,30 +749,172 @@ impl BackgroundWorker {
                             let result = catch_unwind(AssertUnwindSafe(|| {
                                 let (mesh, report) =
                                     load_stl(&path).map_err(|error| error.to_string())?;
+                                let remesh_disabled_reason = remesh_disabled_reason(&mesh);
+                                let remesh_bounds = remesh_bounds(&mesh);
                                 let upload = mesh_preparer
                                     .as_ref()
                                     .map(|preparer| Box::new(preparer.prepare_mesh(&mesh)));
-                                Ok::<_, String>((Box::new(mesh), report, upload))
+                                Ok::<_, String>((
+                                    Box::new(mesh),
+                                    report,
+                                    upload,
+                                    remesh_disabled_reason,
+                                    remesh_bounds,
+                                ))
                             }))
                             .map_err(panic_message)
                             .and_then(|result| result);
                             WorkerResult::Import { path, result }
                         }
                         WorkerJob::Export { mesh, path } => {
-                            let recovery = Arc::new(MeshSnapshot::capture(&mesh));
-                            if result_sender
-                                .send(WorkerResult::ExportCheckpoint(recovery))
-                                .is_err()
+                            match catch_unwind(AssertUnwindSafe(|| {
+                                Arc::new(MeshSnapshot::capture(&mesh))
+                            }))
+                            .map_err(panic_message)
                             {
-                                break;
+                                Ok(recovery) => {
+                                    if result_sender
+                                        .send(WorkerResult::ExportCheckpoint(recovery))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    context.request_repaint();
+                                    let result = catch_unwind(AssertUnwindSafe(|| {
+                                        save_stl_atomic(&path, &mesh)
+                                            .map_err(|error| error.to_string())
+                                    }))
+                                    .map_err(panic_message)
+                                    .and_then(|result| result);
+                                    WorkerResult::Export { path, mesh, result }
+                                }
+                                Err(error) => WorkerResult::Export {
+                                    path,
+                                    mesh,
+                                    result: Err(format!(
+                                        "Could not capture the export recovery snapshot: {error}"
+                                    )),
+                                },
                             }
-                            context.request_repaint();
+                        }
+                        WorkerJob::VoxelRemesh { mesh, settings } => {
+                            match catch_unwind(AssertUnwindSafe(|| {
+                                Arc::new(MeshSnapshot::capture(&mesh))
+                            }))
+                            .map_err(panic_message)
+                            {
+                                Ok(source) => {
+                                    if result_sender
+                                        .send(WorkerResult::VoxelRemeshCheckpoint(Arc::clone(
+                                            &source,
+                                        )))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    context.request_repaint();
+                                    let result = catch_unwind(AssertUnwindSafe(|| {
+                                        let output = voxel_remesh(&mesh, settings)
+                                            .map_err(|error| error.to_string())?;
+                                        let remesh_disabled_reason =
+                                            remesh_disabled_reason(&output.mesh);
+                                        let remesh_bounds = remesh_bounds(&output.mesh);
+                                        let upload = mesh_preparer.as_ref().map(|preparer| {
+                                            Box::new(preparer.prepare_mesh(&output.mesh))
+                                        });
+                                        Ok::<_, String>((
+                                            output,
+                                            upload,
+                                            remesh_disabled_reason,
+                                            remesh_bounds,
+                                        ))
+                                    }))
+                                    .map_err(panic_message)
+                                    .and_then(|result| result);
+                                    WorkerResult::VoxelRemesh {
+                                        original: mesh,
+                                        source: Some(source),
+                                        result: Box::new(result),
+                                    }
+                                }
+                                Err(error) => WorkerResult::VoxelRemesh {
+                                    original: mesh,
+                                    source: None,
+                                    result: Box::new(Err(format!(
+                                        "Could not capture the remesh history snapshot: {error}"
+                                    ))),
+                                },
+                            }
+                        }
+                        WorkerJob::RestoreSnapshot { mesh, target } => {
+                            match catch_unwind(AssertUnwindSafe(|| {
+                                Arc::new(MeshSnapshot::capture(&mesh))
+                            }))
+                            .map_err(panic_message)
+                            {
+                                Ok(inverse) => {
+                                    if result_sender
+                                        .send(WorkerResult::RestoreSnapshotCheckpoint(Arc::clone(
+                                            &inverse,
+                                        )))
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                    context.request_repaint();
+                                    let result = catch_unwind(AssertUnwindSafe(|| {
+                                        let restored = target
+                                            .restore_mesh()
+                                            .map_err(|error| error.to_string())?;
+                                        let remesh_disabled_reason =
+                                            remesh_disabled_reason(&restored);
+                                        let remesh_bounds = remesh_bounds(&restored);
+                                        let upload = mesh_preparer.as_ref().map(|preparer| {
+                                            Box::new(preparer.prepare_mesh(&restored))
+                                        });
+                                        Ok::<_, String>((
+                                            Box::new(restored),
+                                            upload,
+                                            remesh_disabled_reason,
+                                            remesh_bounds,
+                                        ))
+                                    }))
+                                    .map_err(panic_message)
+                                    .and_then(|result| result);
+                                    WorkerResult::RestoreSnapshot {
+                                        original: mesh,
+                                        inverse: Some(inverse),
+                                        result,
+                                    }
+                                }
+                                Err(error) => WorkerResult::RestoreSnapshot {
+                                    original: mesh,
+                                    inverse: None,
+                                    result: Err(format!(
+                                        "Could not capture the inverse history snapshot: {error}"
+                                    )),
+                                },
+                            }
+                        }
+                        WorkerJob::RecoverSnapshot { snapshot } => {
                             let result = catch_unwind(AssertUnwindSafe(|| {
-                                save_stl_atomic(&path, &mesh).map_err(|error| error.to_string())
+                                let restored =
+                                    snapshot.restore_mesh().map_err(|error| error.to_string())?;
+                                let remesh_disabled_reason = remesh_disabled_reason(&restored);
+                                let remesh_bounds = remesh_bounds(&restored);
+                                let upload = mesh_preparer
+                                    .as_ref()
+                                    .map(|preparer| Box::new(preparer.prepare_mesh(&restored)));
+                                Ok::<_, String>((
+                                    Box::new(restored),
+                                    upload,
+                                    remesh_disabled_reason,
+                                    remesh_bounds,
+                                ))
                             }))
                             .map_err(panic_message)
                             .and_then(|result| result);
-                            WorkerResult::Export { path, mesh, result }
+                            WorkerResult::RecoverSnapshot { result }
                         }
                     };
                     if result_sender.send(result).is_err() {
@@ -669,11 +942,36 @@ enum BackgroundTask {
         dirty_before: bool,
         after: Option<PendingAction>,
     },
+    VoxelRemesh {
+        started: Instant,
+        recovery: Option<Arc<MeshSnapshot>>,
+        dirty_before: bool,
+        settings: VoxelRemeshSettings,
+    },
+    RestoreSnapshot {
+        started: Instant,
+        recovery: Option<Arc<MeshSnapshot>>,
+        dirty_before: bool,
+        pending: PendingMeshReplacement,
+    },
+    RecoverSnapshot {
+        started: Instant,
+        recovery: Arc<MeshSnapshot>,
+        dirty: bool,
+        status: String,
+        after: Option<PendingAction>,
+    },
 }
 
 impl BackgroundTask {
     fn owns_mesh(&self) -> bool {
-        matches!(self, Self::Export { .. })
+        matches!(
+            self,
+            Self::Export { .. }
+                | Self::VoxelRemesh { .. }
+                | Self::RestoreSnapshot { .. }
+                | Self::RecoverSnapshot { .. }
+        )
     }
 
     fn progress_text(&self) -> String {
@@ -691,6 +989,19 @@ impl BackgroundTask {
                     .and_then(|name| name.to_str())
                     .unwrap_or("STL mesh");
                 (format!("Exporting {name}"), started)
+            }
+            Self::VoxelRemesh { started, .. } => ("Voxel remeshing".to_owned(), started),
+            Self::RestoreSnapshot {
+                started, pending, ..
+            } => {
+                let label = match pending.direction() {
+                    HistoryDirection::Undo => "Preparing undo",
+                    HistoryDirection::Redo => "Preparing redo",
+                };
+                (label.to_owned(), started)
+            }
+            Self::RecoverSnapshot { started, .. } => {
+                ("Restoring the editable mesh".to_owned(), started)
             }
         };
         format!("{label}… {:.1}s", started.elapsed().as_secs_f32())
@@ -710,6 +1021,7 @@ pub struct SculptLiteApp {
     airbrush: bool,
     airbrush_dabs_per_second: f32,
     brush_radius_points: f32,
+    voxel_remesh_settings: VoxelRemeshSettings,
     wireframe: bool,
     show_quick_controls: bool,
     stroke_sampler: Option<StrokeSampler<SculptInput>>,
@@ -760,6 +1072,7 @@ impl SculptLiteApp {
             airbrush: false,
             airbrush_dabs_per_second: DEFAULT_AIRBRUSH_DABS_PER_SECOND,
             brush_radius_points: INITIAL_BRUSH_RADIUS_POINTS,
+            voxel_remesh_settings: VoxelRemeshSettings::default(),
             wireframe: false,
             show_quick_controls: true,
             stroke_sampler: None,
@@ -918,6 +1231,8 @@ impl SculptLiteApp {
         mesh: Mesh,
         report: ImportReport,
         upload: Option<PreparedMeshUpload>,
+        remesh_disabled_reason: Option<String>,
+        remesh_bounds: Option<MeshBounds>,
     ) {
         let bounds = MeshBounds::from_mesh(&mesh);
         let (minimum, maximum) = bounds
@@ -937,9 +1252,35 @@ impl SculptLiteApp {
         self.document = Some(MeshDocument {
             mesh: Some(mesh),
             bounds,
+            remesh_disabled_reason,
+            remesh_bounds,
             source_path: path,
             dirty: false,
         });
+        self.stroke_sampler = None;
+        self.frame_render = FrameRenderBatch::default();
+    }
+
+    fn install_worker_mesh(
+        &mut self,
+        mesh: Mesh,
+        upload: Option<PreparedMeshUpload>,
+        remesh_disabled_reason: Option<String>,
+        remesh_bounds: Option<MeshBounds>,
+        dirty: bool,
+    ) {
+        let bounds = MeshBounds::from_mesh(&mesh);
+        self.sculpt.reset_for_mesh(&mesh);
+        if let (Some(renderer), Some(upload)) = (&self.renderer, upload) {
+            renderer.install_prepared_mesh(upload);
+        }
+        if let Some(document) = self.document.as_mut() {
+            document.mesh = Some(mesh);
+            document.bounds = bounds;
+            document.remesh_disabled_reason = remesh_disabled_reason;
+            document.remesh_bounds = remesh_bounds;
+            document.dirty = dirty;
+        }
         self.stroke_sampler = None;
         self.frame_render = FrameRenderBatch::default();
     }
@@ -957,10 +1298,12 @@ impl SculptLiteApp {
             Err(TryRecvError::Disconnected) => {
                 self.worker_error = Some("The mesh worker stopped unexpectedly".to_owned());
                 let message = self.background_task.take().map_or_else(
-                    || "The mesh worker stopped".to_owned(),
-                    |task| self.recover_background_task(task),
+                    || Some("The mesh worker stopped".to_owned()),
+                    |task| self.recover_background_task(task, context, true),
                 );
-                self.error = Some(message);
+                if let Some(message) = message {
+                    self.error = Some(message);
+                }
                 return;
             }
         };
@@ -973,9 +1316,16 @@ impl SculptLiteApp {
                 BackgroundTask::Import { .. },
                 WorkerResult::Import {
                     path,
-                    result: Ok((mesh, report, upload)),
+                    result: Ok((mesh, report, upload, remesh_disabled_reason, remesh_bounds)),
                 },
-            ) => self.install_import(path, *mesh, report, upload.map(|upload| *upload)),
+            ) => self.install_import(
+                path,
+                *mesh,
+                report,
+                upload.map(|upload| *upload),
+                remesh_disabled_reason,
+                remesh_bounds,
+            ),
             (
                 BackgroundTask::Import { .. },
                 WorkerResult::Import {
@@ -1025,44 +1375,319 @@ impl SculptLiteApp {
                     }
                 }
             }
+            (
+                BackgroundTask::VoxelRemesh {
+                    started,
+                    dirty_before,
+                    settings,
+                    ..
+                },
+                WorkerResult::VoxelRemeshCheckpoint(recovery),
+            ) => {
+                self.background_task = Some(BackgroundTask::VoxelRemesh {
+                    started,
+                    recovery: Some(recovery),
+                    dirty_before,
+                    settings,
+                });
+            }
+            (
+                BackgroundTask::VoxelRemesh { started, .. },
+                WorkerResult::VoxelRemesh {
+                    original,
+                    source,
+                    result,
+                },
+            ) => {
+                let result = *result;
+                let result = source
+                    .ok_or_else(|| "The remesh history snapshot is unavailable".to_owned())
+                    .and_then(|source| result.map(|prepared| (source, prepared)));
+                match result {
+                    Ok((source, (output, upload, remesh_disabled_reason, remesh_bounds))) => {
+                        let VoxelRemeshOutput {
+                            mesh,
+                            voxel_size,
+                            source_faces,
+                            output_faces,
+                        } = output;
+                        self.install_worker_mesh(
+                            mesh,
+                            upload.map(|upload| *upload),
+                            remesh_disabled_reason,
+                            remesh_bounds,
+                            true,
+                        );
+                        let undoable = self.history.record(HistoryEntry::MeshReplacement(source));
+                        let undo_note = if undoable {
+                            String::new()
+                        } else {
+                            " · not undoable (history memory limit)".to_owned()
+                        };
+                        self.status = format!(
+                            "Voxel remeshed {} → {} faces in {:.1}s · voxel {:.6}{undo_note}",
+                            grouped(source_faces),
+                            grouped(output_faces),
+                            started.elapsed().as_secs_f32(),
+                            voxel_size,
+                        );
+                        drop(original);
+                    }
+                    Err(error) => {
+                        if let Some(document) = self.document.as_mut() {
+                            document.mesh = Some(*original);
+                        }
+                        self.status =
+                            "Voxel remesh failed; the original mesh was left unchanged".to_owned();
+                        self.error = Some(format!("Could not voxel remesh the mesh\n\n{error}"));
+                    }
+                }
+            }
+            (
+                BackgroundTask::RestoreSnapshot {
+                    started,
+                    dirty_before,
+                    pending,
+                    ..
+                },
+                WorkerResult::RestoreSnapshotCheckpoint(recovery),
+            ) => {
+                self.background_task = Some(BackgroundTask::RestoreSnapshot {
+                    started,
+                    recovery: Some(recovery),
+                    dirty_before,
+                    pending,
+                });
+            }
+            (
+                BackgroundTask::RestoreSnapshot {
+                    started,
+                    dirty_before,
+                    pending,
+                    ..
+                },
+                WorkerResult::RestoreSnapshot {
+                    original,
+                    inverse,
+                    result,
+                },
+            ) => {
+                let direction = pending.direction();
+                let result = inverse
+                    .ok_or_else(|| "The inverse history snapshot is unavailable".to_owned())
+                    .and_then(|inverse| result.map(|prepared| (inverse, prepared)));
+                match result {
+                    Ok((inverse, (mesh, upload, remesh_disabled_reason, remesh_bounds))) => {
+                        match self.history.complete_mesh_replacement(pending, inverse) {
+                            Ok(opposite_saved) => {
+                                self.install_worker_mesh(
+                                    *mesh,
+                                    upload.map(|upload| *upload),
+                                    remesh_disabled_reason,
+                                    remesh_bounds,
+                                    true,
+                                );
+                                let label = history_direction_label(direction);
+                                let memory_note = if opposite_saved {
+                                    ""
+                                } else {
+                                    " · opposite history unavailable (memory limit)"
+                                };
+                                self.status = format!(
+                                    "{label} in {:.1}s{memory_note}",
+                                    started.elapsed().as_secs_f32()
+                                );
+                                drop(original);
+                            }
+                            Err(error) => {
+                                self.history.clear();
+                                if let Some(document) = self.document.as_mut() {
+                                    document.mesh = Some(*original);
+                                    document.dirty = dirty_before;
+                                }
+                                self.error = Some(format!(
+                                    "Could not complete {}\n\n{error}",
+                                    history_direction_label(direction).to_lowercase()
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if let Err(history_error) = self.history.cancel_mesh_replacement(pending) {
+                            self.history.clear();
+                            self.worker_error = Some(history_error.to_string());
+                        }
+                        if let Some(document) = self.document.as_mut() {
+                            document.mesh = Some(*original);
+                            document.dirty = dirty_before;
+                        }
+                        self.status = format!(
+                            "{} failed; the mesh was left unchanged",
+                            history_direction_label(direction)
+                        );
+                        self.error = Some(format!(
+                            "Could not prepare {}\n\n{error}",
+                            history_direction_label(direction).to_lowercase()
+                        ));
+                    }
+                }
+            }
+            (
+                BackgroundTask::RecoverSnapshot {
+                    dirty,
+                    status,
+                    after,
+                    ..
+                },
+                WorkerResult::RecoverSnapshot { result },
+            ) => match result {
+                Ok((mesh, upload, remesh_disabled_reason, remesh_bounds)) => {
+                    self.install_worker_mesh(
+                        *mesh,
+                        upload.map(|upload| *upload),
+                        remesh_disabled_reason,
+                        remesh_bounds,
+                        dirty,
+                    );
+                    self.pending_action = after;
+                    self.status = status;
+                }
+                Err(error) => {
+                    self.pending_action = after;
+                    self.error = Some(format!(
+                        "Could not restore the editable mesh on the replacement worker\n\n{error}"
+                    ));
+                }
+            },
             (task, _) => {
-                let recovery = self.recover_background_task(task);
-                self.error = Some(format!(
-                    "The mesh worker returned an unexpected result.\n\n{recovery}"
+                let recovery = self.recover_background_task(task, context, false);
+                self.error = Some(recovery.map_or_else(
+                    || {
+                        "The mesh worker returned an unexpected result; recovery is in progress"
+                            .to_owned()
+                    },
+                    |recovery| {
+                        format!("The mesh worker returned an unexpected result.\n\n{recovery}")
+                    },
                 ));
             }
         }
     }
 
-    fn recover_background_task(&mut self, task: BackgroundTask) -> String {
-        match task {
-            BackgroundTask::Import { .. } => {
-                "The mesh worker stopped before finishing the import".to_owned()
+    fn recover_background_task(
+        &mut self,
+        task: BackgroundTask,
+        context: &egui::Context,
+        restart_worker: bool,
+    ) -> Option<String> {
+        if matches!(&task, BackgroundTask::Import { .. }) {
+            if restart_worker && let Err(error) = self.restart_worker(context) {
+                return Some(format!(
+                    "The mesh worker stopped before finishing the import, and its replacement could not start: {error}"
+                ));
             }
+            return Some("The mesh worker stopped before finishing the import".to_owned());
+        }
+
+        let (recovery, dirty, status, after) = match task {
+            BackgroundTask::Import { .. } => unreachable!("imports returned above"),
             BackgroundTask::Export {
                 recovery,
                 dirty_before,
                 after,
                 ..
+            } => (
+                recovery,
+                dirty_before,
+                "The export stopped; the editable mesh was restored".to_owned(),
+                after,
+            ),
+            BackgroundTask::VoxelRemesh {
+                recovery,
+                dirty_before,
+                ..
+            } => (
+                recovery,
+                dirty_before,
+                "The voxel remesh stopped; the original mesh was restored".to_owned(),
+                None,
+            ),
+            BackgroundTask::RestoreSnapshot {
+                recovery,
+                dirty_before,
+                pending,
+                ..
             } => {
-                if let Some(recovery) = recovery {
-                    self.restore_recovery(&recovery, dirty_before);
+                let direction = pending.direction();
+                if let Err(error) = self.history.cancel_mesh_replacement(pending) {
+                    self.history.clear();
+                    self.worker_error = Some(error.to_string());
                 }
+                (
+                    recovery,
+                    dirty_before,
+                    format!(
+                        "The {} stopped; the editable mesh was restored",
+                        history_direction_label(direction).to_lowercase()
+                    ),
+                    None,
+                )
+            }
+            BackgroundTask::RecoverSnapshot {
+                recovery,
+                dirty,
+                status,
+                after,
+                ..
+            } => (Some(recovery), dirty, status, after),
+        };
+
+        let Some(recovery) = recovery else {
+            self.pending_action = after;
+            return Some(
+                "The mesh worker stopped before supplying an editable-mesh recovery snapshot"
+                    .to_owned(),
+            );
+        };
+        if restart_worker && let Err(error) = self.restart_worker(context) {
+            self.pending_action = after;
+            return Some(format!(
+                "The mesh worker stopped, and its replacement could not start: {error}"
+            ));
+        }
+        let Some(worker) = &self.worker else {
+            self.pending_action = after;
+            return Some("The mesh worker is unavailable for recovery".to_owned());
+        };
+        match worker.sender.send(WorkerJob::RecoverSnapshot {
+            snapshot: Arc::clone(&recovery),
+        }) {
+            Ok(()) => {
+                self.background_task = Some(BackgroundTask::RecoverSnapshot {
+                    started: Instant::now(),
+                    recovery,
+                    dirty,
+                    status,
+                    after,
+                });
+                self.status = "Restoring the editable mesh on the replacement worker".to_owned();
+                context.request_repaint();
+                None
+            }
+            Err(_) => {
                 self.pending_action = after;
-                "The export stopped; the editable mesh was restored".to_owned()
+                Some("The replacement mesh worker stopped before recovery began".to_owned())
             }
         }
     }
 
-    fn restore_recovery(&mut self, recovery: &MeshSnapshot, dirty: bool) {
-        let mut mesh = Mesh::default();
-        recovery.restore(&mut mesh);
-        if let Some(document) = self.document.as_mut() {
-            document.mesh = Some(mesh);
-            document.bounds = document.mesh.as_ref().and_then(MeshBounds::from_mesh);
-            document.dirty = dirty;
-        }
-        self.upload_mesh();
+    fn restart_worker(&mut self, context: &egui::Context) -> Result<(), String> {
+        let mesh_preparer = self.renderer.as_ref().map(ViewportRenderer::mesh_preparer);
+        let worker = BackgroundWorker::start(context.clone(), mesh_preparer)
+            .map_err(|error| error.to_string())?;
+        self.worker = Some(worker);
+        self.worker_error = None;
+        Ok(())
     }
 
     fn export_as(&mut self, after: Option<PendingAction>, context: &egui::Context) -> bool {
@@ -1153,14 +1778,118 @@ impl SculptLiteApp {
         }
     }
 
-    fn upload_mesh(&self) {
-        if let (Some(renderer), Some(mesh)) = (
-            &self.renderer,
-            self.document
-                .as_ref()
-                .and_then(|document| document.mesh.as_ref()),
-        ) {
-            renderer.update_mesh(mesh);
+    fn start_voxel_remesh(&mut self, context: &egui::Context) {
+        if self.background_task.is_some() || self.sculpt.is_stroking() {
+            return;
+        }
+        if let Some(reason) = self
+            .document
+            .as_ref()
+            .and_then(|document| document.remesh_disabled_reason.as_deref())
+        {
+            self.status = reason.to_owned();
+            return;
+        }
+        let dirty_before = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.dirty);
+        let Some(mesh) = self
+            .document
+            .as_mut()
+            .and_then(|document| document.mesh.take())
+        else {
+            return;
+        };
+        self.release_fly(context);
+        let Some(worker) = &self.worker else {
+            if let Some(document) = self.document.as_mut() {
+                document.mesh = Some(mesh);
+            }
+            self.error = Some("The mesh worker is unavailable".to_owned());
+            return;
+        };
+        let settings = self.voxel_remesh_settings;
+        match worker.sender.send(WorkerJob::VoxelRemesh {
+            mesh: Box::new(mesh),
+            settings,
+        }) {
+            Ok(()) => {
+                self.background_task = Some(BackgroundTask::VoxelRemesh {
+                    started: Instant::now(),
+                    recovery: None,
+                    dirty_before,
+                    settings,
+                });
+                self.status = "Sampling the signed-distance field".to_owned();
+                context.request_repaint();
+            }
+            Err(error) => {
+                let WorkerJob::VoxelRemesh { mesh, .. } = error.0 else {
+                    unreachable!("the submitted worker job remains a voxel remesh")
+                };
+                if let Some(document) = self.document.as_mut() {
+                    document.mesh = Some(*mesh);
+                }
+                self.worker_error = Some("The mesh worker stopped unexpectedly".to_owned());
+            }
+        }
+    }
+
+    fn start_snapshot_restore(&mut self, pending: PendingMeshReplacement, context: &egui::Context) {
+        let direction = pending.direction();
+        let target = Arc::clone(pending.target());
+        let dirty_before = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.dirty);
+        let Some(mesh) = self
+            .document
+            .as_mut()
+            .and_then(|document| document.mesh.take())
+        else {
+            if self.history.cancel_mesh_replacement(pending).is_err() {
+                self.history.clear();
+            }
+            return;
+        };
+        self.release_fly(context);
+        let Some(worker) = &self.worker else {
+            if let Some(document) = self.document.as_mut() {
+                document.mesh = Some(mesh);
+            }
+            if self.history.cancel_mesh_replacement(pending).is_err() {
+                self.history.clear();
+            }
+            self.error = Some("The mesh worker is unavailable".to_owned());
+            return;
+        };
+        match worker.sender.send(WorkerJob::RestoreSnapshot {
+            mesh: Box::new(mesh),
+            target,
+        }) {
+            Ok(()) => {
+                self.background_task = Some(BackgroundTask::RestoreSnapshot {
+                    started: Instant::now(),
+                    recovery: None,
+                    dirty_before,
+                    pending,
+                });
+                self.status = format!("Preparing {}", history_direction_label(direction));
+                context.request_repaint();
+            }
+            Err(error) => {
+                let WorkerJob::RestoreSnapshot { mesh, .. } = error.0 else {
+                    unreachable!("the submitted worker job remains a snapshot restoration")
+                };
+                if let Some(document) = self.document.as_mut() {
+                    document.mesh = Some(*mesh);
+                }
+                if self.history.cancel_mesh_replacement(pending).is_err() {
+                    self.history.clear();
+                }
+                self.worker_error = Some("The mesh worker stopped unexpectedly".to_owned());
+            }
         }
     }
 
@@ -1212,6 +1941,10 @@ impl SculptLiteApp {
     fn refresh_document_bounds(&mut self) {
         if let Some(document) = self.document.as_mut() {
             document.bounds = document.mesh.as_ref().and_then(MeshBounds::from_mesh);
+            document.remesh_bounds = document
+                .mesh
+                .as_ref()
+                .and_then(MeshBounds::from_referenced_mesh);
         }
     }
 
@@ -1221,6 +1954,7 @@ impl SculptLiteApp {
         };
         let Some(mesh) = document.mesh.as_ref() else {
             document.bounds = None;
+            document.remesh_bounds = None;
             return;
         };
         if let Some(bounds) = document.bounds.as_mut() {
@@ -1228,9 +1962,14 @@ impl SculptLiteApp {
         } else {
             document.bounds = MeshBounds::from_mesh(mesh);
         }
+        if let Some(bounds) = document.remesh_bounds.as_mut() {
+            bounds.update_referenced(mesh, changed_vertices);
+        } else {
+            document.remesh_bounds = MeshBounds::from_referenced_mesh(mesh);
+        }
     }
 
-    fn undo(&mut self, _context: &egui::Context) {
+    fn undo(&mut self, context: &egui::Context) {
         if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
@@ -1249,10 +1988,13 @@ impl SculptLiteApp {
                 self.refresh_document_bounds();
                 self.status = "Undo".to_owned();
             }
+            HistoryAction::MeshReplacement(pending) => {
+                self.start_snapshot_restore(pending, context);
+            }
         }
     }
 
-    fn redo(&mut self, _context: &egui::Context) {
+    fn redo(&mut self, context: &egui::Context) {
         if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
@@ -1270,6 +2012,9 @@ impl SculptLiteApp {
                 self.upload_vertices_partial(&changed_vertices);
                 self.refresh_document_bounds();
                 self.status = "Redo".to_owned();
+            }
+            HistoryAction::MeshReplacement(pending) => {
+                self.start_snapshot_restore(pending, context);
             }
         }
     }
@@ -1791,6 +2536,7 @@ impl SculptLiteApp {
                                 )
                             },
                         );
+                        let mut remesh_requested = false;
                         egui::CollapsingHeader::new(RichText::new(mesh_heading).strong())
                             .id_salt("mesh_section")
                             .default_open(false)
@@ -1817,7 +2563,55 @@ impl SculptLiteApp {
                                 } else {
                                     ui.label("Import an STL mesh to begin sculpting.");
                                 }
+
+                                ui.separator();
+                                ui.label(format!(
+                                    "Voxel resolution (default {DEFAULT_REMESH_RESOLUTION})"
+                                ));
+                                ui.add_enabled(
+                                    mesh_ready,
+                                    egui::Slider::new(
+                                        &mut self.voxel_remesh_settings.resolution,
+                                        MIN_REMESH_RESOLUTION..=MAX_REMESH_RESOLUTION,
+                                    )
+                                    .suffix(" cells"),
+                                );
+                                if let Some((minimum, maximum)) = self
+                                    .document
+                                    .as_ref()
+                                    .and_then(|document| document.remesh_bounds)
+                                    .map(MeshBounds::min_max)
+                                {
+                                    let longest_axis = (maximum - minimum).max_element();
+                                    let size = longest_axis
+                                        / self.voxel_remesh_settings.resolution as f32;
+                                    ui.small(format!("Voxel size: {size:.6}"));
+                                }
+                                ui.small(
+                                    RichText::new(
+                                        "Sub-voxel features can disappear or merge. This replaces the whole mesh.",
+                                    )
+                                    .color(Color32::YELLOW),
+                                );
+
+                                let disabled_reason = self
+                                    .document
+                                    .as_ref()
+                                    .and_then(|document| document.remesh_disabled_reason.as_deref());
+                                if let Some(reason) = disabled_reason {
+                                    ui.small(RichText::new(reason).color(Color32::LIGHT_RED));
+                                }
+                                let button = ui.add_enabled(
+                                    mesh_ready && disabled_reason.is_none(),
+                                    egui::Button::new("Voxel remesh"),
+                                );
+                                if button.clicked() {
+                                    remesh_requested = true;
+                                }
                             });
+                        if remesh_requested {
+                            self.start_voxel_remesh(ui.ctx());
+                        }
                     });
 
                 ui.separator();
@@ -2343,12 +3137,10 @@ impl SculptLiteApp {
                 format!("{} stroke (undo memory limit reached)", self.tool.label())
             };
         }
-        if self
-            .document
-            .as_ref()
-            .and_then(|document| document.bounds)
-            .is_some_and(|bounds| !bounds.exact)
-        {
+        if self.document.as_ref().is_some_and(|document| {
+            document.bounds.is_some_and(|bounds| !bounds.exact)
+                || document.remesh_bounds.is_some_and(|bounds| !bounds.exact)
+        }) {
             self.refresh_document_bounds();
         }
         self.stroke_sampler = None;
@@ -2563,6 +3355,138 @@ fn two_column_item_width(available_width: f32, item_spacing: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn closed_tetrahedron(scale: f32) -> Mesh {
+        Mesh::new(
+            vec![
+                Vec3::new(1.0, 1.0, 1.0) * scale,
+                Vec3::new(-1.0, -1.0, 1.0) * scale,
+                Vec3::new(-1.0, 1.0, -1.0) * scale,
+                Vec3::new(1.0, -1.0, -1.0) * scale,
+            ],
+            vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn voxel_worker_failure_returns_the_exact_original() {
+        let worker = BackgroundWorker::start(egui::Context::default(), None).unwrap();
+        let source = Mesh::new(vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![[0, 1, 2]]).unwrap();
+        let expected = MeshSnapshot::capture(&source);
+        worker
+            .sender
+            .send(WorkerJob::VoxelRemesh {
+                mesh: Box::new(source),
+                settings: VoxelRemeshSettings { resolution: 32 },
+            })
+            .unwrap();
+
+        let checkpoint = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let WorkerResult::VoxelRemeshCheckpoint(checkpoint) = checkpoint else {
+            panic!("remesh checkpoint expected");
+        };
+        assert_eq!(checkpoint.as_ref(), &expected);
+
+        let result = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let WorkerResult::VoxelRemesh {
+            original,
+            source,
+            result,
+        } = result
+        else {
+            panic!("remesh result expected");
+        };
+        assert!(result.is_err());
+        assert_eq!(MeshSnapshot::capture(&original), expected);
+        assert_eq!(source.unwrap().as_ref(), &expected);
+    }
+
+    #[test]
+    fn snapshot_restore_worker_prepares_an_exact_transaction() {
+        let worker = BackgroundWorker::start(egui::Context::default(), None).unwrap();
+        let mut current = closed_tetrahedron(1.0);
+        current.mask = vec![0.0, 0.25, 0.5, 1.0];
+        let current_snapshot = MeshSnapshot::capture(&current);
+        let mut target = closed_tetrahedron(2.0);
+        target.mask = vec![1.0, 0.5, 0.25, 0.0];
+        let target_snapshot = Arc::new(MeshSnapshot::capture(&target));
+        worker
+            .sender
+            .send(WorkerJob::RestoreSnapshot {
+                mesh: Box::new(current),
+                target: Arc::clone(&target_snapshot),
+            })
+            .unwrap();
+
+        let checkpoint = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let WorkerResult::RestoreSnapshotCheckpoint(checkpoint) = checkpoint else {
+            panic!("restore checkpoint expected");
+        };
+        assert_eq!(checkpoint.as_ref(), &current_snapshot);
+
+        let result = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let WorkerResult::RestoreSnapshot {
+            original,
+            inverse,
+            result,
+        } = result
+        else {
+            panic!("restore result expected");
+        };
+        assert_eq!(MeshSnapshot::capture(&original), current_snapshot);
+        assert_eq!(inverse.unwrap().as_ref(), &current_snapshot);
+        let (restored, upload, disabled_reason, remesh_bounds) = result.unwrap();
+        assert!(upload.is_none());
+        assert!(disabled_reason.is_none());
+        assert!(remesh_bounds.is_some_and(|bounds| {
+            let (minimum, maximum) = bounds.min_max();
+            (maximum - minimum).max_element() > 0.0
+        }));
+        assert_eq!(MeshSnapshot::capture(&restored), *target_snapshot);
+    }
+
+    #[test]
+    fn recovery_job_rebuilds_and_prepares_a_snapshot_off_thread() {
+        let worker = BackgroundWorker::start(egui::Context::default(), None).unwrap();
+        let mut source = closed_tetrahedron(1.0);
+        source.mask = vec![0.0, 0.2, 0.6, 1.0];
+        let snapshot = Arc::new(MeshSnapshot::capture(&source));
+        worker
+            .sender
+            .send(WorkerJob::RecoverSnapshot {
+                snapshot: Arc::clone(&snapshot),
+            })
+            .unwrap();
+
+        let result = worker
+            .receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let WorkerResult::RecoverSnapshot { result } = result else {
+            panic!("recovery result expected");
+        };
+        let (restored, upload, disabled_reason, remesh_bounds) = result.unwrap();
+        assert!(upload.is_none());
+        assert!(disabled_reason.is_none());
+        assert!(remesh_bounds.is_some_and(|bounds| {
+            let (minimum, maximum) = bounds.min_max();
+            (maximum - minimum).max_element() > 0.0
+        }));
+        assert_eq!(MeshSnapshot::capture(&restored), *snapshot);
+    }
 
     #[test]
     fn grouped_formats_face_counts() {
@@ -3090,5 +4014,29 @@ mod tests {
         assert!(!bounds.exact);
         bounds = MeshBounds::from_mesh(&mesh).unwrap();
         assert_eq!(bounds.min_max(), mesh.bounds().unwrap());
+    }
+
+    #[test]
+    fn remesh_bounds_track_only_referenced_vertices() {
+        let mut mesh = Mesh::new(
+            vec![
+                Vec3::ZERO,
+                Vec3::X,
+                Vec3::Y,
+                Vec3::new(10_000.0, 10_000.0, 10_000.0),
+            ],
+            vec![[0, 1, 2]],
+        )
+        .unwrap();
+        let mut bounds = MeshBounds::from_referenced_mesh(&mesh).unwrap();
+        assert_eq!(bounds.min_max(), (Vec3::ZERO, Vec3::ONE - Vec3::Z));
+
+        mesh.positions[3] = Vec3::splat(20_000.0);
+        bounds.update_referenced(&mesh, &[3]);
+        assert_eq!(bounds.min_max(), (Vec3::ZERO, Vec3::ONE - Vec3::Z));
+
+        mesh.positions[1].x = 2.0;
+        bounds.update_referenced(&mesh, &[1]);
+        assert_eq!(bounds.maximum.x, 2.0);
     }
 }

@@ -9,6 +9,7 @@ pub type EdgeKey = (u32, u32);
 
 const TRIANGLE_RELATIVE_EPSILON: f32 = 1.0e-12;
 const BVH_LEAF_SIZE: usize = 8;
+const RAY_BARYCENTRIC_AMBIGUITY_EPSILON: f64 = 1.0e-10;
 
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum MeshError {
@@ -28,6 +29,12 @@ pub enum MeshError {
     NormalCountMismatch { actual: usize, expected: usize },
     #[error("mask count {actual} does not match vertex count {expected}")]
     MaskCountMismatch { actual: usize, expected: usize },
+    #[error("triangle {triangle} is degenerate")]
+    DegenerateTriangle { triangle: usize },
+    #[error("triangle {triangle} duplicates an earlier face")]
+    DuplicateTriangle { triangle: usize },
+    #[error("mask value {index} is non-finite or outside the inclusive range 0 to 1")]
+    InvalidMask { index: usize },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -54,6 +61,25 @@ pub struct RayHit {
     pub triangle: u32,
     pub distance: f32,
     pub barycentric: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClosestSurfacePoint {
+    pub triangle: u32,
+    pub point: Vec3,
+    pub barycentric: Vec3,
+    pub distance: f32,
+}
+
+/// The result of counting every forward intersection along a ray.
+///
+/// An edge or vertex hit is deliberately reported as ambiguous instead of
+/// assigning ownership to one incident triangle. Callers performing parity
+/// tests can retry with another deterministic direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RayIntersectionCount {
+    pub intersections: usize,
+    pub ambiguous: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +404,57 @@ impl TriangleSoupBuilder {
 }
 
 impl Mesh {
+    /// Builds a mesh from already-indexed geometry without repairing or
+    /// otherwise rewriting the supplied positions, triangles, or mask.
+    ///
+    /// This is the installation path for generated geometry whose topology has
+    /// already been validated. Unlike [`Mesh::rebuild`], invalid or duplicate
+    /// faces are rejected instead of being removed silently.
+    pub(crate) fn from_indexed(
+        positions: Vec<Vec3>,
+        triangles: Vec<[u32; 3]>,
+        mask: Vec<f32>,
+    ) -> Result<Self, MeshError> {
+        validate_positions_and_indices(&positions, &triangles)?;
+        if mask.len() != positions.len() {
+            return Err(MeshError::MaskCountMismatch {
+                actual: mask.len(),
+                expected: positions.len(),
+            });
+        }
+        if let Some(index) = mask
+            .iter()
+            .position(|weight| !weight.is_finite() || !(0.0..=1.0).contains(weight))
+        {
+            return Err(MeshError::InvalidMask { index });
+        }
+
+        let mut unique_faces = HashSet::with_capacity(triangles.len());
+        for (triangle_index, &triangle) in triangles.iter().enumerate() {
+            if !triangle_is_valid(&positions, triangle) {
+                return Err(MeshError::DegenerateTriangle {
+                    triangle: triangle_index,
+                });
+            }
+            if !unique_faces.insert(sorted_triangle(triangle)) {
+                return Err(MeshError::DuplicateTriangle {
+                    triangle: triangle_index,
+                });
+            }
+        }
+
+        let topology = MeshTopology::build(&positions, &triangles);
+        let mut mesh = Self {
+            normals: vec![Vec3::ZERO; positions.len()],
+            positions,
+            triangles,
+            mask,
+            topology,
+        };
+        mesh.recompute_normals_without_bvh_refit();
+        Ok(mesh)
+    }
+
     #[cfg(test)]
     pub fn new(positions: Vec<Vec3>, triangles: Vec<[u32; 3]>) -> Result<Self, MeshError> {
         validate_positions_and_indices(&positions, &triangles)?;
@@ -418,6 +495,13 @@ impl Mesh {
                 actual: self.mask.len(),
                 expected: self.positions.len(),
             });
+        }
+        if let Some(index) = self
+            .mask
+            .iter()
+            .position(|weight| !weight.is_finite() || !(0.0..=1.0).contains(weight))
+        {
+            return Err(MeshError::InvalidMask { index });
         }
         Ok(())
     }
@@ -625,13 +709,37 @@ impl Mesh {
         )
     }
 
-    pub fn nearest_triangle(&self, point: Vec3) -> Option<u32> {
+    /// Returns the nearest point on the surface, choosing the lowest triangle
+    /// index when multiple faces are exactly equidistant.
+    pub fn closest_surface_point(&self, point: Vec3) -> Option<ClosestSurfacePoint> {
         if !point.is_finite() {
             return None;
         }
         self.topology
             .bvh
-            .nearest_triangle(&self.positions, &self.triangles, point)
+            .closest_surface_point(&self.positions, &self.triangles, point)
+    }
+
+    pub fn nearest_triangle(&self, point: Vec3) -> Option<u32> {
+        self.closest_surface_point(point)
+            .map(|closest| closest.triangle)
+    }
+
+    pub(crate) fn ray_intersection_count(
+        &self,
+        origin: Vec3,
+        direction: Vec3,
+    ) -> Option<RayIntersectionCount> {
+        let direction = direction.try_normalize()?;
+        if !origin.is_finite() {
+            return None;
+        }
+        Some(self.topology.bvh.ray_intersection_count(
+            &self.positions,
+            &self.triangles,
+            origin,
+            direction,
+        ))
     }
 
     pub(crate) fn connected_front_facing_vertices(
@@ -884,7 +992,8 @@ impl MeshBvh {
         if self.root == u32::MAX {
             return None;
         }
-        let mut stack = Vec::from([self.root]);
+        let mut stack = SmallVec::<[u32; 64]>::new();
+        stack.push(self.root);
         let mut best: Option<RayHit> = None;
         while let Some(node_index) = stack.pop() {
             let node = self.nodes[node_index as usize];
@@ -950,31 +1059,43 @@ impl MeshBvh {
         best
     }
 
-    fn nearest_triangle(
+    fn closest_surface_point(
         &self,
         positions: &[Vec3],
         triangles: &[[u32; 3]],
         point: Vec3,
-    ) -> Option<u32> {
+    ) -> Option<ClosestSurfacePoint> {
         if self.root == u32::MAX {
             return None;
         }
-        let mut stack = Vec::from([self.root]);
-        let mut best_triangle = None;
-        let mut best_distance = f32::INFINITY;
+        let mut stack = SmallVec::<[u32; 64]>::new();
+        stack.push(self.root);
+        let mut best = None;
+        let mut best_distance_squared = f32::INFINITY;
         while let Some(node_index) = stack.pop() {
             let node = self.nodes[node_index as usize];
-            if point_aabb_distance_squared(point, node.min, node.max) > best_distance {
+            if point_aabb_distance_squared(point, node.min, node.max) > best_distance_squared {
                 continue;
             }
             if node.is_leaf() {
                 for &triangle_index in &self.leaf_faces[node.leaf as usize] {
                     let triangle = triangles[triangle_index as usize];
                     let vertices = triangle.map(|index| positions[index as usize]);
-                    let distance = point_triangle_distance_squared(point, vertices);
-                    if distance < best_distance {
-                        best_distance = distance;
-                        best_triangle = Some(triangle_index);
+                    let (surface_point, barycentric) = closest_point_on_triangle(point, vertices);
+                    let distance_squared = point.distance_squared(surface_point);
+                    let replaces_best = distance_squared < best_distance_squared
+                        || (distance_squared == best_distance_squared
+                            && best.is_none_or(|closest: ClosestSurfacePoint| {
+                                triangle_index < closest.triangle
+                            }));
+                    if replaces_best {
+                        best_distance_squared = distance_squared;
+                        best = Some(ClosestSurfacePoint {
+                            triangle: triangle_index,
+                            point: surface_point,
+                            barycentric,
+                            distance: distance_squared.sqrt(),
+                        });
                     }
                 }
             } else {
@@ -983,23 +1104,67 @@ impl MeshBvh {
                 let left_distance = point_aabb_distance_squared(point, left.min, left.max);
                 let right_distance = point_aabb_distance_squared(point, right.min, right.max);
                 if left_distance < right_distance {
-                    if right_distance <= best_distance {
+                    if right_distance <= best_distance_squared {
                         stack.push(node.right);
                     }
-                    if left_distance <= best_distance {
+                    if left_distance <= best_distance_squared {
                         stack.push(node.left);
                     }
                 } else {
-                    if left_distance <= best_distance {
+                    if left_distance <= best_distance_squared {
                         stack.push(node.left);
                     }
-                    if right_distance <= best_distance {
+                    if right_distance <= best_distance_squared {
                         stack.push(node.right);
                     }
                 }
             }
         }
-        best_triangle
+        best
+    }
+
+    fn ray_intersection_count(
+        &self,
+        positions: &[Vec3],
+        triangles: &[[u32; 3]],
+        origin: Vec3,
+        direction: Vec3,
+    ) -> RayIntersectionCount {
+        if self.root == u32::MAX {
+            return RayIntersectionCount::default();
+        }
+
+        let mut result = RayIntersectionCount::default();
+        let mut stack = SmallVec::<[u32; 64]>::new();
+        stack.push(self.root);
+        while let Some(node_index) = stack.pop() {
+            let node = self.nodes[node_index as usize];
+            if ray_aabb(origin, direction, node.min, node.max).is_none() {
+                continue;
+            }
+            if node.is_leaf() {
+                for &triangle_index in &self.leaf_faces[node.leaf as usize] {
+                    let triangle = triangles[triangle_index as usize];
+                    let vertices = triangle.map(|index| positions[index as usize]);
+                    match ray_triangle_for_parity(origin, direction, vertices) {
+                        ParityRayIntersection::Miss => {}
+                        ParityRayIntersection::Ambiguous => result.ambiguous = true,
+                        ParityRayIntersection::Hit {
+                            distance,
+                            minimum_barycentric,
+                        } => {
+                            result.intersections += 1;
+                            result.ambiguous |= distance == 0.0
+                                || minimum_barycentric <= RAY_BARYCENTRIC_AMBIGUITY_EPSILON;
+                        }
+                    }
+                }
+            } else {
+                stack.push(node.left);
+                stack.push(node.right);
+            }
+        }
+        result
     }
 }
 
@@ -1206,6 +1371,76 @@ fn ray_triangle(origin: Vec3, direction: Vec3, [a, b, c]: [Vec3; 3]) -> Option<(
     Some((distance, Vec3::new(u_weight, v_weight, w_weight)))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ParityRayIntersection {
+    Miss,
+    Ambiguous,
+    Hit {
+        distance: f64,
+        minimum_barycentric: f64,
+    },
+}
+
+/// A parity-specific ray/triangle test evaluated in f64.
+///
+/// Picking uses a scale-aware parallel threshold for stable viewport behavior,
+/// but containment parity must not silently discard a valid shallow crossing.
+/// Exact or numerically coplanar rays are marked ambiguous so the caller can
+/// retry a deterministic fallback direction.
+fn ray_triangle_for_parity(
+    origin: Vec3,
+    direction: Vec3,
+    [a, b, c]: [Vec3; 3],
+) -> ParityRayIntersection {
+    let origin = origin.as_dvec3();
+    let direction = direction.as_dvec3();
+    let a = a.as_dvec3();
+    let edge_ab = b.as_dvec3() - a;
+    let edge_ac = c.as_dvec3() - a;
+    let perpendicular = direction.cross(edge_ac);
+    let determinant = edge_ab.dot(perpendicular);
+    let determinant_scale = edge_ab.length() * perpendicular.length();
+    if determinant.abs() <= determinant_scale * f64::EPSILON * 16.0 {
+        let normal = edge_ab.cross(edge_ac);
+        let origin_offset = origin - a;
+        let plane_scale = normal.length()
+            * origin_offset
+                .length()
+                .max(edge_ab.length())
+                .max(edge_ac.length());
+        return if origin_offset.dot(normal).abs() <= plane_scale * f64::EPSILON * 16.0 {
+            ParityRayIntersection::Ambiguous
+        } else {
+            ParityRayIntersection::Miss
+        };
+    }
+
+    let inverse = determinant.recip();
+    let origin_offset = origin - a;
+    let v_weight = origin_offset.dot(perpendicular) * inverse;
+    let cross = origin_offset.cross(edge_ab);
+    let w_weight = direction.dot(cross) * inverse;
+    let u_weight = 1.0 - v_weight - w_weight;
+    const BARYCENTRIC_TOLERANCE: f64 = 1.0e-12;
+    if u_weight < -BARYCENTRIC_TOLERANCE
+        || v_weight < -BARYCENTRIC_TOLERANCE
+        || w_weight < -BARYCENTRIC_TOLERANCE
+        || u_weight > 1.0 + BARYCENTRIC_TOLERANCE
+        || v_weight > 1.0 + BARYCENTRIC_TOLERANCE
+        || w_weight > 1.0 + BARYCENTRIC_TOLERANCE
+    {
+        return ParityRayIntersection::Miss;
+    }
+    let distance = edge_ac.dot(cross) * inverse;
+    if distance < 0.0 || !distance.is_finite() {
+        return ParityRayIntersection::Miss;
+    }
+    ParityRayIntersection::Hit {
+        distance,
+        minimum_barycentric: u_weight.min(v_weight).min(w_weight),
+    }
+}
+
 fn point_aabb_distance_squared(point: Vec3, min: Vec3, max: Vec3) -> f32 {
     let below = (min - point).max(Vec3::ZERO);
     let above = (point - max).max(Vec3::ZERO);
@@ -1262,6 +1497,7 @@ fn closest_point_on_triangle(point: Vec3, [a, b, c]: [Vec3; 3]) -> (Vec3, Vec3) 
     (a + ab * v + ac * w, Vec3::new(1.0 - v - w, v, w))
 }
 
+#[cfg(test)]
 fn point_triangle_distance_squared(point: Vec3, triangle: [Vec3; 3]) -> f32 {
     point.distance_squared(closest_point_on_triangle(point, triangle).0)
 }
@@ -1317,6 +1553,12 @@ mod tests {
         assert!(matches!(
             Mesh::new(vec![Vec3::ZERO; 3], vec![[0, 1, 3]]),
             Err(MeshError::IndexOutOfBounds { .. })
+        ));
+        let mut mesh = square();
+        mesh.mask[0] = f32::NAN;
+        assert!(matches!(
+            mesh.validate(),
+            Err(MeshError::InvalidMask { index: 0 })
         ));
     }
 
@@ -1431,6 +1673,115 @@ mod tests {
         .unwrap();
         assert_eq!(mesh.nearest_triangle(Vec3::new(10.2, 0.2, 3.0)), Some(1));
         assert_eq!(mesh.nearest_triangle(Vec3::new(0.2, 0.2, 3.0)), Some(0));
+    }
+
+    #[test]
+    fn closest_surface_point_reports_face_edge_and_vertex_barycentrics() {
+        let mesh = Mesh::new(vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![[0, 1, 2]]).unwrap();
+
+        let face = mesh
+            .closest_surface_point(Vec3::new(0.25, 0.25, 2.0))
+            .unwrap();
+        assert_eq!(face.triangle, 0);
+        assert!(face.point.abs_diff_eq(Vec3::new(0.25, 0.25, 0.0), 1.0e-6));
+        assert!(
+            face.barycentric
+                .abs_diff_eq(Vec3::new(0.5, 0.25, 0.25), 1.0e-6)
+        );
+        assert!((face.distance - 2.0).abs() < 1.0e-6);
+
+        let edge = mesh
+            .closest_surface_point(Vec3::new(0.75, 0.75, 0.0))
+            .unwrap();
+        assert!(edge.point.abs_diff_eq(Vec3::new(0.5, 0.5, 0.0), 1.0e-6));
+        assert!(
+            edge.barycentric
+                .abs_diff_eq(Vec3::new(0.0, 0.5, 0.5), 1.0e-6)
+        );
+
+        let vertex = mesh
+            .closest_surface_point(Vec3::new(-1.0, -1.0, 0.0))
+            .unwrap();
+        assert_eq!(vertex.point, Vec3::ZERO);
+        assert_eq!(vertex.barycentric, Vec3::X);
+    }
+
+    #[test]
+    fn closest_surface_point_breaks_exact_ties_by_triangle_index() {
+        let mesh = Mesh::new(
+            vec![
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 1.0),
+                Vec3::new(0.0, 1.0, 1.0),
+                Vec3::new(0.0, 0.0, -1.0),
+                Vec3::new(1.0, 0.0, -1.0),
+                Vec3::new(0.0, 1.0, -1.0),
+            ],
+            vec![[0, 1, 2], [3, 4, 5]],
+        )
+        .unwrap();
+
+        let closest = mesh
+            .closest_surface_point(Vec3::new(0.25, 0.25, 0.0))
+            .unwrap();
+        assert_eq!(closest.triangle, 0);
+        assert_eq!(mesh.nearest_triangle(Vec3::new(0.25, 0.25, 0.0)), Some(0));
+    }
+
+    #[test]
+    fn ray_intersection_count_marks_edge_and_vertex_hits_ambiguous() {
+        let mesh = square();
+        let interior = mesh
+            .ray_intersection_count(Vec3::new(0.5, 0.25, 1.0), Vec3::NEG_Z)
+            .unwrap();
+        assert_eq!(interior.intersections, 1);
+        assert!(!interior.ambiguous);
+
+        let shared_edge = mesh
+            .ray_intersection_count(Vec3::new(0.0, 0.0, 1.0), Vec3::NEG_Z)
+            .unwrap();
+        assert_eq!(shared_edge.intersections, 2);
+        assert!(shared_edge.ambiguous);
+
+        let vertex = mesh
+            .ray_intersection_count(Vec3::new(1.0, 1.0, 1.0), Vec3::NEG_Z)
+            .unwrap();
+        assert!(vertex.intersections >= 1);
+        assert!(vertex.ambiguous);
+    }
+
+    #[test]
+    fn ray_intersection_count_keeps_valid_shallow_crossings() {
+        let mesh = Mesh::new(vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![[0, 1, 2]]).unwrap();
+        let direction = Vec3::new(1.0, 0.0, -5.0e-8).normalize();
+        let intersection = mesh
+            .ray_intersection_count(Vec3::new(0.1, 0.25, 1.0e-8), direction)
+            .unwrap();
+
+        assert_eq!(intersection.intersections, 1);
+        assert!(!intersection.ambiguous);
+    }
+
+    #[test]
+    fn indexed_constructor_rejects_faces_instead_of_repairing_them() {
+        let duplicate = Mesh::from_indexed(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            vec![[0, 1, 2], [2, 1, 0]],
+            vec![0.0, 0.5, 1.0],
+        );
+        assert!(matches!(
+            duplicate,
+            Err(MeshError::DuplicateTriangle { triangle: 1 })
+        ));
+
+        let mesh = Mesh::from_indexed(
+            vec![Vec3::ZERO, Vec3::X, Vec3::Y],
+            vec![[0, 2, 1]],
+            vec![0.0, 0.5, 1.0],
+        )
+        .unwrap();
+        assert_eq!(mesh.triangles, vec![[0, 2, 1]]);
+        assert_eq!(mesh.mask, vec![0.0, 0.5, 1.0]);
     }
 
     #[test]

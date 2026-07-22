@@ -6,6 +6,7 @@ mod renderer;
 mod sculpt;
 mod stl;
 mod stroke;
+mod voxel_remesh;
 
 fn main() -> eframe::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();

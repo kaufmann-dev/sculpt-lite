@@ -1,12 +1,18 @@
 # SculptLite
 
-SculptLite is a native Linux desktop application for importing, sculpting, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes including Clay and Crease, non-accumulating distance-spaced strokes, time-budgeted path processing that preserves captured input, optional accumulating Airbrush buildup, symmetry, undo and redo, a wireframe overlay, and STL export.
+SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes including Clay and Crease, non-accumulating distance-spaced strokes, time-budgeted path processing that preserves captured input, optional accumulating Airbrush buildup, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
 
 ## Viewport controls
 
 Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle modes. In Orbit, right-drag pans, middle-drag orbits, and the wheel zooms. Fly defaults to **Level** movement, where `W`/`S` and `A`/`D` stay horizontal regardless of look pitch; choose **Free flight** beside the Fly button to make `W`/`S` follow the look direction instead. In either Fly style, hold RMB to capture the pointer, look with the mouse, move down with Shift, move up with Space, and use the wheel to adjust flight speed. Release RMB or press Escape to release the pointer. Press `F` to frame the mesh and return to Orbit.
 
 With the pointer released, a left click applies one dab and left-drag sculpts from either viewpoint. Spatial dabs only apply newly increased brush influence while the button remains held, so retracing the same area does not keep building it up; release the button to begin a fresh stroke. Enable Airbrush when intentional timed buildup is desired. The usual Shift-to-Smooth and Ctrl-to-Invert modifiers work throughout a stroke.
+
+## Voxel remeshing
+
+Open **Mesh** in the tool panel to replace the complete object with a uniform voxel-derived surface. Resolution is measured across the longest object axis, ranges from 32 to 192 cells, and defaults to 96; the panel shows the resulting world-space voxel size. Features smaller than a voxel can disappear, and nearby components can merge.
+
+Voxel remeshing requires a closed two-manifold source. Open or non-manifold STL files remain importable, sculptable, and exportable, but the panel explains why remeshing is unavailable. The operation runs on the mesh worker while the original remains intact. A validated manifold replacement and its GPU upload are installed together; failures leave the original mesh unchanged. Masks are reprojected from the nearest source triangles, the camera is preserved, and the status bar reports elapsed time plus old and new face counts. Replacement undo and redo are also prepared on the worker. If the required whole-mesh snapshot exceeds the 512 MiB history budget, remeshing still completes and incompatible history is cleared.
 
 ## Run from source
 
@@ -63,6 +69,7 @@ Large-mesh performance probes are ignored by the normal test suite. Run them ind
 cargo test --release --bin sculpt-lite million_face_fixed_sculpt_sample -- --ignored --nocapture --test-threads=1
 cargo test --release --bin sculpt-lite million_face_mesh_build_pick_and_deform_refresh -- --ignored --nocapture --test-threads=1
 cargo test --release --bin sculpt-lite half_million_vertex_deformation_pack -- --ignored --nocapture --test-threads=1
+cargo test --release --bin sculpt-lite resolution_96_remesh_probe -- --ignored --nocapture --test-threads=1
 ```
 
 ## Packages

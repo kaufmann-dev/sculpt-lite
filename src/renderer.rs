@@ -83,21 +83,6 @@ impl ViewportRenderer {
         })
     }
 
-    /// Uploads the public geometry representation used by the mesh core. Invalid
-    /// triangle indices are skipped instead of reaching wgpu validation.
-    pub fn update_mesh(&self, mesh: &Mesh) {
-        let mut input = self
-            .shared
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        input.mesh = MeshUpload::from_mesh(mesh);
-        input.prepared_gpu = None;
-        input.full_vertex_upload = true;
-        input.dirty_vertices.clear();
-        input.vertex_revision = input.vertex_revision.wrapping_add(1);
-        input.topology_revision = input.topology_revision.wrapping_add(1);
-    }
-
     /// Returns a cloneable device-backed preparer for the mesh worker.
     #[must_use]
     pub(crate) fn mesh_preparer(&self) -> MeshGpuPreparer {
