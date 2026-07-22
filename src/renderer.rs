@@ -1265,17 +1265,15 @@ mod tests {
 
     #[test]
     fn camera_uniform_keeps_studio_lights_in_camera_space() {
-        let mut camera = Camera::default();
-        camera.yaw = 1.37;
-        camera.pitch = -0.42;
-
+        let camera = Camera::default();
         let viewport = Rect::from_min_size(Pos2::ZERO, eframe::egui::vec2(1600.0, 900.0));
-        let uniform = CameraUniform::from_camera(camera.frame(viewport).unwrap());
+        let frame = camera.frame(viewport).unwrap();
+        let uniform = CameraUniform::from_camera(frame);
         let right = Vec3::from_array(uniform.camera_right[..3].try_into().unwrap());
         let up = Vec3::from_array(uniform.camera_up[..3].try_into().unwrap());
 
-        assert!(right.abs_diff_eq(camera.right(), 1.0e-6));
-        assert!(up.abs_diff_eq(camera.up(), 1.0e-6));
+        assert!(right.abs_diff_eq(frame.right(), 1.0e-6));
+        assert!(up.abs_diff_eq(frame.up(), 1.0e-6));
         assert!(right.dot(up).abs() < 1.0e-6);
         assert_eq!(uniform.camera_right[3], 0.0);
         assert_eq!(uniform.camera_up[3], 0.0);

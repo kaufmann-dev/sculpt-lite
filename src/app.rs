@@ -16,7 +16,7 @@ use eframe::egui::{
 use glam::Vec3;
 
 use crate::{
-    camera::{Camera, CameraFrame},
+    camera::{Camera, CameraFrame, CameraMode, FlyMovement},
     history::{History, HistoryAction, HistoryEntry, LocalEdit, MaskChange, MeshSnapshot},
     mesh::{Mesh, MeshChangeSet, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
@@ -84,6 +84,8 @@ const DEFAULT_ADAPTIVE_DETAIL: f32 = 0.12;
 const MOUSE_PRESSURE: f32 = 1.0;
 const SCULPT_FRAME_BUDGET: Duration = Duration::from_millis(8);
 const BRUSH_VALUE_STEP: f32 = 0.05;
+const WHEEL_POINTS_PER_LINE: f32 = 40.0;
+const MAX_FLY_WHEEL_POINTS: f32 = 240.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShortcutDirection {
@@ -98,6 +100,7 @@ enum ShortcutAction {
     Undo,
     Redo,
     Frame,
+    ToggleCameraMode,
     ToggleWireframe,
     SelectTool(SculptTool),
     AdjustRadius(ShortcutDirection),
@@ -124,7 +127,7 @@ const fn shortcut(modifiers: Modifiers, key: Key, action: ShortcutAction) -> Sho
     }
 }
 
-const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
+const SHORTCUT_BINDINGS: [ShortcutBinding; 32] = [
     // Put shortcuts with required Shift modifiers before their less-specific
     // variants because egui permits extra Shift for logical key matching.
     shortcut(
@@ -143,6 +146,7 @@ const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
     shortcut(Modifiers::CTRL, Key::Backspace, ShortcutAction::ClearMask),
     shortcut(Modifiers::CTRL, Key::I, ShortcutAction::InvertMask),
     shortcut(Modifiers::NONE, Key::F, ShortcutAction::Frame),
+    shortcut(Modifiers::NONE, Key::V, ShortcutAction::ToggleCameraMode),
     shortcut(Modifiers::NONE, Key::W, ShortcutAction::ToggleWireframe),
     shortcut(
         Modifiers::NONE,
@@ -265,6 +269,7 @@ fn shortcut_is_enabled(action: ShortcutAction, availability: ShortcutAvailabilit
         ShortcutAction::Redo => availability.mesh_ready && availability.can_redo,
         ShortcutAction::Export
         | ShortcutAction::Frame
+        | ShortcutAction::ToggleCameraMode
         | ShortcutAction::SelectTool(_)
         | ShortcutAction::AdjustRadius(_)
         | ShortcutAction::AdjustStrength(_)
@@ -429,8 +434,103 @@ fn navigation_action(button: PointerButton) -> Option<NavigationAction> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FlyKeyState {
+    w: bool,
+    s: bool,
+    a: bool,
+    d: bool,
+    q: bool,
+    e: bool,
+    boost: bool,
+}
+
+fn fly_movement(keys: FlyKeyState) -> FlyMovement {
+    let axis = |positive: bool, negative: bool| {
+        f32::from(u8::from(positive)) - f32::from(u8::from(negative))
+    };
+    FlyMovement {
+        forward: axis(keys.w, keys.s),
+        right: axis(keys.d, keys.a),
+        up: axis(keys.e, keys.q),
+        boost: keys.boost,
+    }
+}
+
+fn fly_look_delta(raw_motion: Option<Vec2>, pointer_delta: Vec2, pixels_per_point: f32) -> Vec2 {
+    raw_motion.map_or(pointer_delta, |motion| {
+        if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            motion / pixels_per_point
+        } else {
+            motion
+        }
+    })
+}
+
+fn wheel_delta_points(unit: egui::MouseWheelUnit, delta_y: f32, viewport_height: f32) -> f32 {
+    let scale = match unit {
+        egui::MouseWheelUnit::Point => 1.0,
+        egui::MouseWheelUnit::Line => WHEEL_POINTS_PER_LINE,
+        egui::MouseWheelUnit::Page => viewport_height.max(0.0),
+    };
+    delta_y * scale
+}
+
+fn fly_wheel_points(events: &[egui::Event], viewport_height: f32) -> f32 {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::MouseWheel { unit, delta, .. } => {
+                Some(wheel_delta_points(*unit, delta.y, viewport_height))
+            }
+            _ => None,
+        })
+        .filter(|delta| delta.is_finite())
+        .sum::<f32>()
+        .clamp(-MAX_FLY_WHEEL_POINTS, MAX_FLY_WHEEL_POINTS)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FlyCaptureEligibility {
+    mode: CameraMode,
+    viewport_hovered: bool,
+    focused: bool,
+    has_mesh: bool,
+    stroke_active: bool,
+    mesh_job_active: bool,
+    modal_active: bool,
+}
+
+fn fly_capture_eligible(state: FlyCaptureEligibility) -> bool {
+    state.mode == CameraMode::Fly
+        && state.viewport_hovered
+        && state.focused
+        && state.has_mesh
+        && !state.stroke_active
+        && !state.mesh_job_active
+        && !state.modal_active
+}
+
+fn fly_shortcuts_suppressed(mode: CameraMode, captured: bool, secondary_button_down: bool) -> bool {
+    captured || (mode == CameraMode::Fly && secondary_button_down)
+}
+
+fn fly_capture_should_release(
+    captured: bool,
+    secondary_button_down: bool,
+    escape_pressed: bool,
+    focused: bool,
+    state_valid: bool,
+) -> bool {
+    captured && (!secondary_button_down || escape_pressed || !focused || !state_valid)
+}
+
 fn viewport_sense() -> Sense {
     Sense::drag()
+}
+
+fn sculpting_allowed(fly_captured: bool) -> bool {
+    !fly_captured
 }
 
 fn effective_tool(tool: SculptTool, modifiers: Modifiers) -> SculptTool {
@@ -595,6 +695,7 @@ pub struct SculptLiteApp {
     renderer: Option<ViewportRenderer>,
     renderer_error: Option<String>,
     camera: Camera,
+    fly_captured: bool,
     document: Option<MeshDocument>,
     history: History,
     sculpt: SculptEngine,
@@ -646,6 +747,7 @@ impl SculptLiteApp {
             renderer,
             renderer_error,
             camera: Camera::default(),
+            fly_captured: false,
             document: None,
             history: History::default(),
             sculpt: SculptEngine::default(),
@@ -675,6 +777,71 @@ impl SculptLiteApp {
         app
     }
 
+    fn capture_fly(&mut self, context: &egui::Context) {
+        if self.fly_captured {
+            return;
+        }
+        self.fly_captured = true;
+        context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::Locked,
+        ));
+        context.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+        context.request_repaint();
+    }
+
+    fn release_fly(&mut self, context: &egui::Context) {
+        if !self.fly_captured {
+            return;
+        }
+        self.fly_captured = false;
+        context.send_viewport_cmd(egui::ViewportCommand::CursorGrab(
+            egui::viewport::CursorGrab::None,
+        ));
+        context.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+        context.request_repaint();
+    }
+
+    fn set_camera_mode(&mut self, mode: CameraMode, context: &egui::Context) {
+        if self.camera.mode() == mode {
+            return;
+        }
+        self.release_fly(context);
+        self.camera.set_mode(mode);
+    }
+
+    fn enforce_fly_release(&mut self, context: &egui::Context) {
+        if !self.fly_captured {
+            return;
+        }
+        let has_mesh = self
+            .document
+            .as_ref()
+            .is_some_and(|document| document.mesh.is_some());
+        let state_valid = self.camera.mode() == CameraMode::Fly
+            && has_mesh
+            && !self.sculpt.is_stroking()
+            && self.background_task.is_none()
+            && self.pending_action.is_none()
+            && self.error.is_none()
+            && !context.input(|input| input.viewport().close_requested());
+        let (secondary_button_down, escape_pressed, focused) = context.input(|input| {
+            (
+                input.pointer.button_down(PointerButton::Secondary),
+                input.key_pressed(Key::Escape),
+                input.focused,
+            )
+        });
+        if fly_capture_should_release(
+            self.fly_captured,
+            secondary_button_down,
+            escape_pressed,
+            focused,
+            state_valid,
+        ) {
+            self.release_fly(context);
+        }
+    }
+
     fn request_action(&mut self, action: PendingAction, context: &egui::Context) {
         if self.background_task.is_some() || self.sculpt.is_stroking() {
             self.status = "Wait for the current mesh operation to finish".to_owned();
@@ -685,6 +852,7 @@ impl SculptLiteApp {
             .as_ref()
             .is_some_and(|document| document.dirty)
         {
+            self.release_fly(context);
             self.pending_action = Some(action);
         } else {
             self.perform_action(action, context);
@@ -694,6 +862,7 @@ impl SculptLiteApp {
     fn perform_action(&mut self, action: PendingAction, context: &egui::Context) {
         match action {
             PendingAction::OpenDialog => {
+                self.release_fly(context);
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("STL mesh", &["stl"])
                     .set_title("Import STL")
@@ -704,6 +873,7 @@ impl SculptLiteApp {
             }
             PendingAction::Import(path) => self.start_import(path, context),
             PendingAction::Close => {
+                self.release_fly(context);
                 self.allow_close = true;
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -711,6 +881,8 @@ impl SculptLiteApp {
     }
 
     fn start_import(&mut self, path: PathBuf, context: &egui::Context) {
+        self.release_fly(context);
+        self.camera.set_mode(CameraMode::Orbit);
         let Some(worker) = &self.worker else {
             self.error = Some(
                 self.worker_error
@@ -911,6 +1083,7 @@ impl SculptLiteApp {
                 || "sculpted.stl".to_owned(),
                 |name| format!("{name}-sculpted.stl"),
             );
+        self.release_fly(context);
         let Some(mut path) = rfd::FileDialog::new()
             .add_filter("STL mesh", &["stl"])
             .set_title("Export STL As")
@@ -932,6 +1105,7 @@ impl SculptLiteApp {
         after: Option<PendingAction>,
         context: &egui::Context,
     ) -> bool {
+        self.release_fly(context);
         let dirty_before = self
             .document
             .as_ref()
@@ -1045,7 +1219,9 @@ impl SculptLiteApp {
         context.request_repaint();
     }
 
-    fn frame_mesh(&mut self) {
+    fn frame_mesh(&mut self, context: &egui::Context) {
+        self.release_fly(context);
+        self.camera.set_mode(CameraMode::Orbit);
         let bounds = self
             .document
             .as_ref()
@@ -1223,7 +1399,14 @@ impl SculptLiteApp {
             }
             ShortcutAction::Undo => self.undo(context),
             ShortcutAction::Redo => self.redo(context),
-            ShortcutAction::Frame => self.frame_mesh(),
+            ShortcutAction::Frame => self.frame_mesh(context),
+            ShortcutAction::ToggleCameraMode => {
+                let mode = match self.camera.mode() {
+                    CameraMode::Orbit => CameraMode::Fly,
+                    CameraMode::Fly => CameraMode::Orbit,
+                };
+                self.set_camera_mode(mode, context);
+            }
             ShortcutAction::ToggleWireframe => self.wireframe = !self.wireframe,
             ShortcutAction::SelectTool(tool) => self.tool = tool,
             ShortcutAction::AdjustRadius(direction) => match direction {
@@ -1255,7 +1438,10 @@ impl SculptLiteApp {
     }
 
     fn handle_shortcuts(&mut self, context: &egui::Context) {
-        if context.egui_wants_keyboard_input()
+        let secondary_button_down =
+            context.input(|input| input.pointer.button_down(PointerButton::Secondary));
+        if fly_shortcuts_suppressed(self.camera.mode(), self.fly_captured, secondary_button_down)
+            || context.egui_wants_keyboard_input()
             || self.pending_action.is_some()
             || self.error.is_some()
         {
@@ -1326,7 +1512,29 @@ impl SculptLiteApp {
                     .on_hover_text(shortcut_tooltip(context, &[ShortcutAction::Frame]))
                     .clicked()
                 {
-                    self.frame_mesh();
+                    self.frame_mesh(context);
+                }
+                let camera_shortcut =
+                    shortcut_tooltip(context, &[ShortcutAction::ToggleCameraMode]);
+                if ui
+                    .add_enabled(
+                        mesh_ready,
+                        egui::Button::selectable(self.camera.mode() == CameraMode::Orbit, "Orbit"),
+                    )
+                    .on_hover_text(&camera_shortcut)
+                    .clicked()
+                {
+                    self.set_camera_mode(CameraMode::Orbit, context);
+                }
+                if ui
+                    .add_enabled(
+                        mesh_ready,
+                        egui::Button::selectable(self.camera.mode() == CameraMode::Fly, "Fly"),
+                    )
+                    .on_hover_text(&camera_shortcut)
+                    .clicked()
+                {
+                    self.set_camera_mode(CameraMode::Fly, context);
                 }
                 let wireframe_label =
                     shortcut_label(context, "Wireframe", &[ShortcutAction::ToggleWireframe]);
@@ -1703,7 +1911,14 @@ impl SculptLiteApp {
                     let budget_mib = self.history.byte_budget() as f64 / (1024.0 * 1024.0);
                     ui.small(format!("Undo: {mib:.1} / {budget_mib:.0} MiB"));
                     ui.small("Shift: smooth · Ctrl: invert");
-                    ui.small("RMB: pan · MMB: orbit · Wheel: zoom");
+                    match self.camera.mode() {
+                        CameraMode::Orbit => {
+                            ui.small("RMB: pan · MMB: orbit · Wheel: zoom");
+                        }
+                        CameraMode::Fly => {
+                            ui.small("Hold RMB: look/fly · WASD + Q/E: move · Wheel: speed");
+                        }
+                    }
                 });
             });
     }
@@ -1747,7 +1962,21 @@ impl SculptLiteApp {
                                 ui.vertical(|ui| {
                                     ui.label(RichText::new("Quick controls").strong());
                                     ui.small("Left drag: sculpt · Shift: smooth · Ctrl: invert");
-                                    ui.small("Right drag: pan · Middle drag: orbit · Wheel: zoom");
+                                    match self.camera.mode() {
+                                        CameraMode::Orbit => {
+                                            ui.small(
+                                                "Right drag: pan · Middle drag: orbit · Wheel: zoom",
+                                            );
+                                        }
+                                        CameraMode::Fly => {
+                                            ui.small(
+                                                "Hold RMB: look · W/S: forward/back · A/D: strafe · Q/E: down/up",
+                                            );
+                                            ui.small(
+                                                "Shift: 4× speed · Wheel: adjust speed · Esc: release",
+                                            );
+                                        }
+                                    }
                                 });
                                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                     dismiss = ui.small_button("Dismiss").clicked();
@@ -1799,25 +2028,80 @@ impl SculptLiteApp {
                 let pointer = response
                     .hover_pos()
                     .or_else(|| context.pointer_latest_pos());
-                let pointer_delta = context.input(|input| input.pointer.delta());
-                let navigation = if response.dragged_by(PointerButton::Secondary) {
-                    navigation_action(PointerButton::Secondary)
-                } else if response.dragged_by(PointerButton::Middle) {
-                    navigation_action(PointerButton::Middle)
-                } else {
-                    None
-                };
-                match navigation {
-                    Some(NavigationAction::Pan) => {
-                        self.camera.pan(pointer_delta, rect.height());
+                match self.camera.mode() {
+                    CameraMode::Orbit => {
+                        let pointer_delta = context.input(|input| input.pointer.delta());
+                        let navigation = if response.dragged_by(PointerButton::Secondary) {
+                            navigation_action(PointerButton::Secondary)
+                        } else if response.dragged_by(PointerButton::Middle) {
+                            navigation_action(PointerButton::Middle)
+                        } else {
+                            None
+                        };
+                        match navigation {
+                            Some(NavigationAction::Pan) => {
+                                self.camera.pan(pointer_delta, rect.height());
+                            }
+                            Some(NavigationAction::Orbit) => self.camera.orbit(pointer_delta),
+                            None => {}
+                        }
+                        if response.hovered() {
+                            let scroll = context.input(|input| input.smooth_scroll_delta.y);
+                            if scroll != 0.0 {
+                                self.camera.zoom(scroll);
+                            }
+                        }
                     }
-                    Some(NavigationAction::Orbit) => self.camera.orbit(pointer_delta),
-                    None => {}
-                }
-                if response.hovered() {
-                    let scroll = context.input(|input| input.smooth_scroll_delta.y);
-                    if scroll != 0.0 {
-                        self.camera.zoom(scroll);
+                    CameraMode::Fly => {
+                        let (focused, secondary_pressed) = context.input(|input| {
+                            (
+                                input.focused,
+                                input.pointer.button_pressed(PointerButton::Secondary),
+                            )
+                        });
+                        if secondary_pressed
+                            && fly_capture_eligible(FlyCaptureEligibility {
+                                mode: self.camera.mode(),
+                                viewport_hovered: response.hovered(),
+                                focused,
+                                has_mesh,
+                                stroke_active: self.sculpt.is_stroking(),
+                                mesh_job_active: self.background_task.is_some(),
+                                modal_active: self.pending_action.is_some()
+                                    || self.error.is_some(),
+                            })
+                        {
+                            self.capture_fly(context);
+                        }
+                        if self.fly_captured {
+                            let (look_delta, movement, wheel_points, delta_seconds) =
+                                context.input(|input| {
+                                    let keys = FlyKeyState {
+                                        w: input.key_down(Key::W),
+                                        s: input.key_down(Key::S),
+                                        a: input.key_down(Key::A),
+                                        d: input.key_down(Key::D),
+                                        q: input.key_down(Key::Q),
+                                        e: input.key_down(Key::E),
+                                        boost: input.modifiers.shift,
+                                    };
+                                    (
+                                        fly_look_delta(
+                                            input.pointer.motion(),
+                                            input.pointer.delta(),
+                                            input.pixels_per_point(),
+                                        ),
+                                        fly_movement(keys),
+                                        fly_wheel_points(&input.events, rect.height()),
+                                        input.stable_dt,
+                                    )
+                                });
+                            self.camera.fly_look(look_delta);
+                            self.camera.fly_move(movement, delta_seconds);
+                            if wheel_points != 0.0 {
+                                self.camera.adjust_fly_speed(wheel_points);
+                            }
+                        }
                     }
                 }
 
@@ -1825,7 +2109,9 @@ impl SculptLiteApp {
                     return;
                 };
                 let modifiers = context.input(|input| input.modifiers);
-                let cursor = pointer
+                let cursor = (!self.fly_captured)
+                    .then_some(pointer)
+                    .flatten()
                     .filter(|position| rect.contains(*position))
                     .map(|position| {
                         let mut cursor = BrushCursor::new(position, self.brush_radius_points);
@@ -1841,8 +2127,27 @@ impl SculptLiteApp {
                         .rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 25));
                 }
 
-                let badge_color = brush_cursor_color(self.tool, self.brush.invert, modifiers);
-                let badge_text = active_tool_text(self.tool, self.brush.invert, modifiers);
+                let (badge_color, badge_text) = match self.camera.mode() {
+                    CameraMode::Orbit => (
+                        brush_cursor_color(self.tool, self.brush.invert, modifiers),
+                        active_tool_text(self.tool, self.brush.invert, modifiers),
+                    ),
+                    CameraMode::Fly if self.fly_captured => (
+                        Color32::from_rgb(255, 198, 92),
+                        format!(
+                            "Fly · active · {:.3} radii/s · Esc to release",
+                            self.camera.fly_speed()
+                        ),
+                    ),
+                    CameraMode::Fly => (
+                        brush_cursor_color(self.tool, self.brush.invert, modifiers),
+                        format!(
+                            "Fly · hold RMB · {:.3} radii/s · {}",
+                            self.camera.fly_speed(),
+                            active_tool_text(self.tool, self.brush.invert, modifiers)
+                        ),
+                    ),
+                };
                 let badge_galley = ui.painter().layout_no_wrap(
                     badge_text,
                     egui::FontId::proportional(14.0),
@@ -1860,7 +2165,8 @@ impl SculptLiteApp {
                     .galley(badge_rect.min + badge_padding, badge_galley, badge_color);
 
                 let mut began_stroke = false;
-                if self.background_task.is_none()
+                if sculpting_allowed(self.fly_captured)
+                    && self.background_task.is_none()
                     && response.drag_started_by(PointerButton::Primary)
                     && let Some(position) = pointer
                     && let Some(pointer_hit) = self.hit_at(position, camera_frame)
@@ -1898,7 +2204,10 @@ impl SculptLiteApp {
                     began_stroke = true;
                 }
 
-                if !began_stroke && self.sculpt.is_stroking() {
+                if sculpting_allowed(self.fly_captured)
+                    && !began_stroke
+                    && self.sculpt.is_stroking()
+                {
                     let stopped = response.drag_stopped_by(PointerButton::Primary);
                     let primary_down =
                         context.input(|input| input.pointer.button_down(PointerButton::Primary));
@@ -2221,6 +2530,7 @@ impl eframe::App for SculptLiteApp {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root_ui.ctx().clone();
         self.poll_background_task(&context);
+        self.enforce_fly_release(&context);
         if context.input(|input| input.viewport().close_requested()) && !self.allow_close {
             if self
                 .background_task
@@ -2297,6 +2607,9 @@ impl eframe::App for SculptLiteApp {
         if self.background_task.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
+        if self.fly_captured {
+            context.request_repaint();
+        }
     }
 }
 
@@ -2360,6 +2673,140 @@ mod tests {
             Some(NavigationAction::Orbit)
         );
         assert_eq!(navigation_action(PointerButton::Primary), None);
+    }
+
+    #[test]
+    fn fly_key_mapping_uses_expected_signed_axes() {
+        assert_eq!(
+            fly_movement(FlyKeyState {
+                w: true,
+                a: true,
+                e: true,
+                boost: true,
+                ..FlyKeyState::default()
+            }),
+            FlyMovement {
+                forward: 1.0,
+                right: -1.0,
+                up: 1.0,
+                boost: true,
+            }
+        );
+        assert_eq!(
+            fly_movement(FlyKeyState {
+                w: true,
+                s: true,
+                a: true,
+                d: true,
+                q: true,
+                e: true,
+                ..FlyKeyState::default()
+            }),
+            FlyMovement::default()
+        );
+    }
+
+    #[test]
+    fn fly_wheel_units_convert_to_points_and_clamp_spikes() {
+        assert_eq!(
+            wheel_delta_points(egui::MouseWheelUnit::Point, 3.5, 600.0),
+            3.5
+        );
+        assert_eq!(
+            wheel_delta_points(egui::MouseWheelUnit::Line, 2.0, 600.0),
+            80.0
+        );
+        assert_eq!(
+            wheel_delta_points(egui::MouseWheelUnit::Page, -0.5, 600.0),
+            -300.0
+        );
+        let events = [egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Page,
+            delta: Vec2::new(0.0, 20.0),
+            phase: egui::TouchPhase::Move,
+            modifiers: Modifiers::NONE,
+        }];
+        assert_eq!(fly_wheel_points(&events, 600.0), MAX_FLY_WHEEL_POINTS);
+    }
+
+    #[test]
+    fn fly_look_prefers_raw_motion_with_pointer_fallback() {
+        assert_eq!(
+            fly_look_delta(Some(Vec2::new(8.0, 4.0)), Vec2::new(1.0, 2.0), 2.0),
+            Vec2::new(4.0, 2.0)
+        );
+        assert_eq!(
+            fly_look_delta(None, Vec2::new(1.0, 2.0), 2.0),
+            Vec2::new(1.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn fly_capture_eligibility_rejects_strokes_mesh_jobs_and_modals() {
+        let ready = FlyCaptureEligibility {
+            mode: CameraMode::Fly,
+            viewport_hovered: true,
+            focused: true,
+            has_mesh: true,
+            stroke_active: false,
+            mesh_job_active: false,
+            modal_active: false,
+        };
+        assert!(fly_capture_eligible(ready));
+        assert!(!fly_capture_eligible(FlyCaptureEligibility {
+            stroke_active: true,
+            ..ready
+        }));
+        assert!(!fly_capture_eligible(FlyCaptureEligibility {
+            mesh_job_active: true,
+            ..ready
+        }));
+        assert!(!fly_capture_eligible(FlyCaptureEligibility {
+            modal_active: true,
+            ..ready
+        }));
+        assert!(!fly_capture_eligible(FlyCaptureEligibility {
+            viewport_hovered: false,
+            ..ready
+        }));
+        assert!(!fly_capture_eligible(FlyCaptureEligibility {
+            mode: CameraMode::Orbit,
+            ..ready
+        }));
+    }
+
+    #[test]
+    fn active_flight_suppresses_shortcuts_and_releases_on_escape_or_focus_loss() {
+        assert!(fly_shortcuts_suppressed(CameraMode::Fly, true, true));
+        assert!(fly_shortcuts_suppressed(CameraMode::Fly, false, true));
+        assert!(!fly_shortcuts_suppressed(CameraMode::Orbit, false, true));
+        assert!(fly_capture_should_release(true, true, true, true, true));
+        assert!(fly_capture_should_release(true, true, false, false, true));
+        assert!(fly_capture_should_release(true, false, false, true, true));
+        assert!(fly_capture_should_release(true, true, false, true, false));
+        assert!(!fly_capture_should_release(true, true, false, true, true));
+    }
+
+    #[test]
+    fn releasing_flight_restores_existing_sculpt_interactions() {
+        assert!(!sculpting_allowed(true));
+        assert!(sculpting_allowed(false));
+        assert_eq!(
+            effective_tool(SculptTool::Draw, Modifiers::NONE),
+            SculptTool::Draw
+        );
+        assert_eq!(
+            effective_tool(SculptTool::Grab, Modifiers::NONE),
+            SculptTool::Grab
+        );
+        assert_eq!(
+            effective_tool(SculptTool::Draw, Modifiers::SHIFT),
+            SculptTool::Smooth
+        );
+        assert_eq!(
+            active_tool_text(SculptTool::Draw, false, Modifiers::CTRL),
+            "Draw · inverted"
+        );
     }
 
     #[test]
@@ -2502,6 +2949,10 @@ mod tests {
         assert_eq!(
             shortcuts_for(ShortcutAction::InvertMask).collect::<Vec<_>>(),
             [KeyboardShortcut::new(Modifiers::CTRL, Key::I)]
+        );
+        assert_eq!(
+            shortcuts_for(ShortcutAction::ToggleCameraMode).collect::<Vec<_>>(),
+            [KeyboardShortcut::new(Modifiers::NONE, Key::V)]
         );
     }
 
