@@ -30,6 +30,8 @@ pub enum SculptTool {
     Grab,
     #[default]
     Draw,
+    Clay,
+    Crease,
     Inflate,
     Smooth,
     Pinch,
@@ -38,9 +40,11 @@ pub enum SculptTool {
 }
 
 impl SculptTool {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 9] = [
         Self::Grab,
         Self::Draw,
+        Self::Clay,
+        Self::Crease,
         Self::Inflate,
         Self::Smooth,
         Self::Pinch,
@@ -53,6 +57,8 @@ impl SculptTool {
         match self {
             Self::Grab => "Grab",
             Self::Draw => "Draw",
+            Self::Clay => "Clay",
+            Self::Crease => "Crease",
             Self::Inflate => "Inflate / Deflate",
             Self::Smooth => "Smooth",
             Self::Pinch => "Pinch",
@@ -366,6 +372,8 @@ impl SculptEngine {
             || !settings.strength.is_finite()
             || settings.strength.abs() <= f32::EPSILON
             || !sample.center.is_finite()
+            || !sample.pressure.is_finite()
+            || sample.pressure.clamp(0.0, 1.0) <= 0.0
         {
             return false;
         }
@@ -1303,6 +1311,18 @@ fn apply_pass(
     let inverted = settings.invert ^ pass.sample.invert_modifier;
     let direction = if inverted { -1.0 } else { 1.0 };
     let brush_normal = pass.sample.normal.normalize_or_zero();
+    let clay_plane = if tool == SculptTool::Clay {
+        clay_surface_plane(
+            mesh,
+            settings,
+            pass,
+            source_positions,
+            brush_normal,
+            direction,
+        )
+    } else {
+        None
+    };
     let mut changed = false;
 
     for &vertex in &pass.vertices {
@@ -1342,6 +1362,19 @@ fn apply_pass(
         let displacement = match tool {
             SculptTool::Grab => pass.sample.drag_delta * influence,
             SculptTool::Draw => brush_normal * (direction * radius * 0.15 * influence),
+            SculptTool::Clay => {
+                let Some((plane_point, plane_normal)) = clay_plane else {
+                    continue;
+                };
+                let signed_plane_distance = (plane_point - position).dot(plane_normal);
+                plane_normal * signed_plane_distance * influence.min(1.0)
+            }
+            SculptTool::Crease => {
+                let to_center = pass.sample.center - position;
+                let tangent = to_center - brush_normal * to_center.dot(brush_normal);
+                brush_normal * (direction * radius * 0.15 * influence)
+                    + tangent * ((2.0 / 3.0) * influence.min(1.0))
+            }
             SculptTool::Inflate => {
                 let mut normal = mesh
                     .normals
@@ -1401,6 +1434,54 @@ fn apply_pass(
     }
 
     changed
+}
+
+fn clay_surface_plane(
+    mesh: &Mesh,
+    settings: &BrushSettings,
+    pass: &PreparedPass,
+    source_positions: &HashMap<u32, Vec3>,
+    brush_normal: Vec3,
+    direction: f32,
+) -> Option<(Vec3, Vec3)> {
+    let mut weighted_position = Vec3::ZERO;
+    let mut weighted_normal = Vec3::ZERO;
+    let mut weight_sum = 0.0;
+    for &vertex in &pass.vertices {
+        let index = vertex as usize;
+        let Some(&position) = source_positions.get(&vertex) else {
+            continue;
+        };
+        let weight = brush_falloff(
+            position.distance(pass.sample.center) / settings.radius,
+            settings.falloff,
+        );
+        if weight <= f32::EPSILON {
+            continue;
+        }
+        let mut normal = mesh
+            .normals
+            .get(index)
+            .copied()
+            .unwrap_or(brush_normal)
+            .normalize_or_zero();
+        if normal.dot(brush_normal) < 0.0 {
+            normal = -normal;
+        }
+        weighted_position += position * weight;
+        weighted_normal += normal * weight;
+        weight_sum += weight;
+    }
+    if weight_sum <= f32::EPSILON {
+        return None;
+    }
+    let plane_normal = weighted_normal.normalize_or_zero();
+    if plane_normal == Vec3::ZERO {
+        return None;
+    }
+    let plane_point =
+        weighted_position / weight_sum + plane_normal * (direction * settings.radius * 0.15);
+    Some((plane_point, plane_normal))
 }
 
 /// Smooth radial brush weight with an optional hard inner core.
@@ -1463,7 +1544,8 @@ fn triangle_is_near(mesh: &Mesh, triangle: u32, point: Vec3, radius: f32) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
+    use crate::history::{History, HistoryAction, HistoryEntry};
+    use std::{sync::Arc, time::Instant};
 
     fn grid() -> Mesh {
         let positions = vec![
@@ -1488,6 +1570,30 @@ mod tests {
             [4, 8, 7],
         ];
         Mesh::new(positions, triangles).expect("valid grid")
+    }
+
+    fn octahedron() -> Mesh {
+        Mesh::new(
+            vec![
+                Vec3::X,
+                Vec3::Y,
+                Vec3::NEG_X,
+                Vec3::NEG_Y,
+                Vec3::Z,
+                Vec3::NEG_Z,
+            ],
+            vec![
+                [4, 0, 1],
+                [4, 1, 2],
+                [4, 2, 3],
+                [4, 3, 0],
+                [5, 1, 0],
+                [5, 2, 1],
+                [5, 3, 2],
+                [5, 0, 3],
+            ],
+        )
+        .expect("valid octahedron")
     }
 
     fn sample(center: Vec3, seed_triangle: u32) -> BrushSample {
@@ -1523,6 +1629,12 @@ mod tests {
             steps += 1;
         }
         steps
+    }
+
+    fn assert_editable_mesh_eq(actual: &Mesh, expected: &Mesh) {
+        assert_eq!(actual.positions, expected.positions);
+        assert_eq!(actual.triangles, expected.triangles);
+        assert_eq!(actual.mask, expected.mask);
     }
 
     #[test]
@@ -1601,6 +1713,268 @@ mod tests {
 
         assert!(outward.positions[4].z > 0.0);
         assert_eq!(outward.positions[4].z, -inward.positions[4].z);
+    }
+
+    #[test]
+    fn clay_adds_and_subtracts_while_flattening_to_its_local_plane() {
+        let mut added = grid();
+        let mut subtracted = grid();
+        let mut settings = test_settings();
+        settings.radius = 0.75;
+        settings.strength = 0.5;
+        let mut add_engine = SculptEngine::default();
+        let mut subtract_engine = SculptEngine::default();
+        add_engine.begin_stroke(&added);
+        subtract_engine.begin_stroke(&subtracted);
+        let add_sample = sample(Vec3::ZERO, 0);
+        let mut subtract_sample = add_sample;
+        subtract_sample.invert_modifier = true;
+
+        assert!(add_engine.apply_sample(&mut added, SculptTool::Clay, &settings, add_sample,));
+        assert!(subtract_engine.apply_sample(
+            &mut subtracted,
+            SculptTool::Clay,
+            &settings,
+            subtract_sample,
+        ));
+        assert!(added.positions[4].z > 0.0);
+        assert_eq!(added.positions[4].z, -subtracted.positions[4].z);
+
+        let mut uneven = grid();
+        uneven.positions[4].z = 0.4;
+        let _ = uneven.rebuild();
+        let mut planar_settings = test_settings();
+        planar_settings.falloff = 0.95;
+        let center = uneven.positions[4];
+        let mut engine = SculptEngine::default();
+        engine.begin_stroke(&uneven);
+        assert!(engine.apply_sample(
+            &mut uneven,
+            SculptTool::Clay,
+            &planar_settings,
+            sample(center, 0),
+        ));
+        let minimum = uneven
+            .positions
+            .iter()
+            .map(|position| position.z)
+            .fold(f32::INFINITY, f32::min);
+        let maximum = uneven
+            .positions
+            .iter()
+            .map(|position| position.z)
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(maximum - minimum < 1.0e-5);
+    }
+
+    #[test]
+    fn crease_builds_ridges_and_grooves_while_always_pinching_inward() {
+        let mut ridge = grid();
+        let mut groove = grid();
+        let mut settings = test_settings();
+        settings.radius = 1.1;
+        settings.strength = 0.2;
+        settings.falloff = 0.95;
+        let mut ridge_engine = SculptEngine::default();
+        let mut groove_engine = SculptEngine::default();
+        ridge_engine.begin_stroke(&ridge);
+        groove_engine.begin_stroke(&groove);
+        let ridge_sample = sample(Vec3::ZERO, 0);
+        let mut groove_sample = ridge_sample;
+        groove_sample.invert_modifier = true;
+
+        assert!(
+            ridge_engine.apply_sample(&mut ridge, SculptTool::Crease, &settings, ridge_sample,)
+        );
+        assert!(groove_engine.apply_sample(
+            &mut groove,
+            SculptTool::Crease,
+            &settings,
+            groove_sample,
+        ));
+        assert!(ridge.positions[4].z > 0.0);
+        assert_eq!(ridge.positions[4].z, -groove.positions[4].z);
+        assert!(ridge.positions[5].x < 1.0);
+        assert!(groove.positions[5].x < 1.0);
+        assert_eq!(ridge.positions[5].x, groove.positions[5].x);
+    }
+
+    #[test]
+    fn clay_and_crease_scale_linearly_with_pressure() {
+        for tool in [SculptTool::Clay, SculptTool::Crease] {
+            let mut low = grid();
+            let mut high = grid();
+            let mut settings = test_settings();
+            settings.radius = 0.75;
+            settings.strength = 1.0;
+            let mut low_engine = SculptEngine::default();
+            let mut high_engine = SculptEngine::default();
+            low_engine.begin_stroke(&low);
+            high_engine.begin_stroke(&high);
+            let mut low_sample = sample(Vec3::ZERO, 0);
+            low_sample.pressure = 0.25;
+            let mut high_sample = low_sample;
+            high_sample.pressure = 0.5;
+
+            assert!(low_engine.apply_sample(&mut low, tool, &settings, low_sample));
+            assert!(high_engine.apply_sample(&mut high, tool, &settings, high_sample));
+            assert!((high.positions[4].z - low.positions[4].z * 2.0).abs() < 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn ineffective_pressure_cannot_deform_or_start_adaptive_topology() {
+        for tool in [SculptTool::Clay, SculptTool::Crease] {
+            for pressure in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+                let mut mesh = octahedron();
+                let before = mesh.clone();
+                let mut settings = test_settings();
+                settings.radius = 1.2;
+                settings.remesh_target_edge_length = Some(0.24);
+                let mut brush_sample = sample(Vec3::splat(1.0 / 3.0), 0);
+                brush_sample.pressure = pressure;
+                let mut engine = SculptEngine::default();
+                engine.begin_stroke(&mesh);
+
+                assert!(!engine.apply_sample(&mut mesh, tool, &settings, brush_sample));
+                assert!(!engine.has_pending_sample());
+                assert!(!engine.take_sample_committed());
+                assert!(engine.take_mesh_changes().is_none());
+                assert_editable_mesh_eq(&mesh, &before);
+                assert_eq!(engine.end_stroke(&mesh), StrokeOutcome::default());
+            }
+        }
+    }
+
+    #[test]
+    fn clay_and_crease_respect_full_partial_masks_and_symmetry() {
+        for tool in [SculptTool::Clay, SculptTool::Crease] {
+            let mut fully_masked = grid();
+            fully_masked.mask[4] = 1.0;
+            let before = fully_masked.positions.clone();
+            let mut settings = test_settings();
+            settings.radius = 0.75;
+            settings.strength = 0.5;
+            let mut engine = SculptEngine::default();
+            engine.begin_stroke(&fully_masked);
+            assert!(!engine.apply_sample(
+                &mut fully_masked,
+                tool,
+                &settings,
+                sample(Vec3::ZERO, 0),
+            ));
+            assert_eq!(fully_masked.positions, before);
+
+            let mut unmasked = grid();
+            let mut partially_masked = grid();
+            partially_masked.mask[4] = 0.5;
+            let mut unmasked_engine = SculptEngine::default();
+            let mut partial_engine = SculptEngine::default();
+            unmasked_engine.begin_stroke(&unmasked);
+            partial_engine.begin_stroke(&partially_masked);
+            assert!(unmasked_engine.apply_sample(
+                &mut unmasked,
+                tool,
+                &settings,
+                sample(Vec3::ZERO, 0),
+            ));
+            assert!(partial_engine.apply_sample(
+                &mut partially_masked,
+                tool,
+                &settings,
+                sample(Vec3::ZERO, 0),
+            ));
+            assert!(
+                (partially_masked.positions[4].z - unmasked.positions[4].z * 0.5).abs() < 1.0e-6
+            );
+
+            let mut symmetric = grid();
+            let mut symmetry_settings = settings;
+            symmetry_settings.radius = 0.8;
+            symmetry_settings.symmetry = Some(SymmetryAxis::X);
+            let mut symmetry_engine = SculptEngine::default();
+            symmetry_engine.begin_stroke(&symmetric);
+            assert!(symmetry_engine.apply_sample(
+                &mut symmetric,
+                tool,
+                &symmetry_settings,
+                sample(Vec3::X * 0.8, 2),
+            ));
+            assert!(symmetric.positions[5].z > 0.0);
+            assert_eq!(symmetric.positions[3].z, symmetric.positions[5].z);
+            assert_eq!(symmetric.positions[3].x, -symmetric.positions[5].x);
+        }
+    }
+
+    #[test]
+    fn clay_and_crease_fixed_strokes_have_exact_undo_and_redo() {
+        for tool in [SculptTool::Clay, SculptTool::Crease] {
+            let mut mesh = grid();
+            let before = mesh.clone();
+            let mut settings = test_settings();
+            settings.radius = 0.75;
+            settings.strength = 0.5;
+            let mut engine = SculptEngine::default();
+            engine.begin_stroke(&mesh);
+            assert!(engine.apply_sample(&mut mesh, tool, &settings, sample(Vec3::ZERO, 0),));
+            let outcome = engine.end_stroke(&mesh);
+            assert!(outcome.topology.is_none());
+            assert!(!outcome.edit.is_empty());
+            let after = mesh.clone();
+            let mut history = History::default();
+            assert!(history.record(HistoryEntry::Local(outcome.edit)));
+
+            assert!(matches!(
+                history.undo(&mut mesh),
+                HistoryAction::Local { .. }
+            ));
+            assert_editable_mesh_eq(&mesh, &before);
+            assert!(matches!(
+                history.redo(&mut mesh),
+                HistoryAction::Local { .. }
+            ));
+            assert_editable_mesh_eq(&mesh, &after);
+        }
+    }
+
+    #[test]
+    fn adaptive_clay_and_crease_finish_valid_and_have_exact_undo_and_redo() {
+        for tool in [SculptTool::Clay, SculptTool::Crease] {
+            let mut mesh = octahedron();
+            let before = mesh.clone();
+            let mut settings = test_settings();
+            settings.radius = 1.2;
+            settings.strength = 1.0;
+            settings.remesh_target_edge_length = Some(0.24);
+            let center = Vec3::splat(1.0 / 3.0);
+            let mut engine = SculptEngine::default();
+            engine.begin_stroke(&mesh);
+
+            engine.apply_sample(&mut mesh, tool, &settings, sample(center, 0));
+            drain_pending_sample(&mut engine, &mut mesh);
+            assert!(engine.take_sample_committed());
+            mesh.validate().unwrap();
+            let faces = (0..mesh.triangles.len() as u32).collect::<Vec<_>>();
+            assert!(!mesh.faces_have_self_intersections(&faces));
+            let outcome = engine.end_stroke(&mesh);
+            let topology = outcome
+                .topology
+                .expect("adaptive brush records topology history");
+            let after = mesh.clone();
+            let mut history = History::default();
+            assert!(history.record(HistoryEntry::Topology(Arc::new(topology))));
+
+            assert!(matches!(
+                history.undo(&mut mesh),
+                HistoryAction::Topology { .. }
+            ));
+            assert_editable_mesh_eq(&mesh, &before);
+            assert!(matches!(
+                history.redo(&mut mesh),
+                HistoryAction::Topology { .. }
+            ));
+            assert_editable_mesh_eq(&mesh, &after);
+        }
     }
 
     #[test]

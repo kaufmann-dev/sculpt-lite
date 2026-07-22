@@ -10,6 +10,7 @@ pub const MAX_DABS_PER_FRAME: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StrokePoint<T> {
     pub position: Pos2,
+    pub pressure: f32,
     pub modifiers: Modifiers,
     pub spacing: f32,
     pub context: T,
@@ -20,6 +21,7 @@ pub struct StrokeSampler<T> {
     initial_dab: Option<StrokePoint<T>>,
     observed_pointer: StrokePoint<T>,
     path_pointer: Pos2,
+    path_pressure: f32,
     pending_path: VecDeque<StrokePoint<T>>,
     distance_since_dab: f32,
     elapsed_since_dab: Duration,
@@ -31,6 +33,7 @@ impl<T: Copy> StrokeSampler<T> {
     #[must_use]
     pub fn begin(
         pointer: Pos2,
+        pressure: f32,
         modifiers: Modifiers,
         spacing: f32,
         context: T,
@@ -38,6 +41,7 @@ impl<T: Copy> StrokeSampler<T> {
     ) -> Self {
         let pointer = StrokePoint {
             position: pointer,
+            pressure,
             modifiers,
             spacing,
             context,
@@ -46,6 +50,7 @@ impl<T: Copy> StrokeSampler<T> {
             initial_dab: Some(pointer),
             observed_pointer: pointer,
             path_pointer: pointer.position,
+            path_pressure: pointer.pressure,
             pending_path: VecDeque::new(),
             distance_since_dab: 0.0,
             elapsed_since_dab: Duration::ZERO,
@@ -62,27 +67,28 @@ impl<T: Copy> StrokeSampler<T> {
     pub fn enqueue_pointer(
         &mut self,
         position: Pos2,
+        pressure: f32,
         modifiers: Modifiers,
         spacing: f32,
         context: T,
     ) {
         let pointer = StrokePoint {
             position,
+            pressure,
             modifiers,
             spacing,
             context,
         };
-        if position != self.observed_pointer.position {
-            self.observed_pointer = pointer;
-            if self.pending_path.back().map(|point| point.position) == Some(position) {
-                if let Some(last) = self.pending_path.back_mut() {
-                    *last = pointer;
-                }
-            } else {
-                self.pending_path.push_back(pointer);
+        let moved = position != self.observed_pointer.position;
+        self.observed_pointer = pointer;
+        if self.pending_path.back().map(|point| point.position) == Some(position) {
+            if let Some(last) = self.pending_path.back_mut() {
+                *last = pointer;
             }
-        } else {
-            self.observed_pointer = pointer;
+        } else if moved {
+            self.pending_path.push_back(pointer);
+        } else if self.pending_path.is_empty() && self.path_pointer == position {
+            self.path_pressure = pressure;
         }
     }
 
@@ -95,6 +101,7 @@ impl<T: Copy> StrokeSampler<T> {
             let length = segment.length();
             if length <= f32::EPSILON {
                 self.path_pointer = target.position;
+                self.path_pressure = target.pressure;
                 self.pending_path.pop_front();
                 continue;
             }
@@ -103,25 +110,30 @@ impl<T: Copy> StrokeSampler<T> {
             if length + f32::EPSILON < distance_to_dab {
                 self.distance_since_dab += length;
                 self.path_pointer = target.position;
+                self.path_pressure = target.pressure;
                 self.pending_path.pop_front();
                 continue;
             }
 
-            self.path_pointer += segment / length * distance_to_dab;
+            let segment_fraction = distance_to_dab / length;
+            self.path_pointer += segment * segment_fraction;
+            self.path_pressure += (target.pressure - self.path_pressure) * segment_fraction;
             self.distance_since_dab = 0.0;
             return Some(StrokePoint {
                 position: self.path_pointer,
+                pressure: self.path_pressure,
                 ..target
             });
         }
     }
 
     #[must_use]
-    pub fn consume_grab_delta(&mut self, pointer: Pos2) -> Option<Vec2> {
+    pub fn consume_grab_delta(&mut self, pointer: Pos2, pressure: f32) -> Option<Vec2> {
         if self.has_pending_path() {
             let previous = self.observed_pointer;
             self.enqueue_pointer(
                 pointer,
+                pressure,
                 previous.modifiers,
                 previous.spacing,
                 previous.context,
@@ -130,7 +142,9 @@ impl<T: Copy> StrokeSampler<T> {
         }
         let delta = pointer - self.observed_pointer.position;
         self.observed_pointer.position = pointer;
+        self.observed_pointer.pressure = pressure;
         self.path_pointer = pointer;
+        self.path_pressure = pressure;
         self.distance_since_dab = 0.0;
         Some(delta)
     }
@@ -192,7 +206,7 @@ mod tests {
     }
 
     fn sampler(pointer: Pos2) -> StrokeSampler<u8> {
-        StrokeSampler::begin(pointer, Modifiers::NONE, 10.0, 0, Instant::now())
+        StrokeSampler::begin(pointer, 1.0, Modifiers::NONE, 10.0, 0, Instant::now())
     }
 
     fn drain(sampler: &mut StrokeSampler<u8>, limit: usize) -> Vec<StrokePoint<u8>> {
@@ -204,11 +218,11 @@ mod tests {
     #[test]
     fn movement_below_spacing_accumulates_until_one_dab_is_due() {
         let mut sampler = sampler(Pos2::ZERO);
-        sampler.enqueue_pointer(Pos2::new(4.0, 0.0), Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(4.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
         assert!(drain(&mut sampler, 64).is_empty());
-        sampler.enqueue_pointer(Pos2::new(9.0, 0.0), Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(9.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
         assert!(drain(&mut sampler, 64).is_empty());
-        sampler.enqueue_pointer(Pos2::new(12.0, 0.0), Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(12.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
 
         assert_eq!(positions(&drain(&mut sampler, 64)), [[10.0, 0.0]]);
     }
@@ -222,6 +236,7 @@ mod tests {
             sampler.take_initial_dab(),
             Some(StrokePoint {
                 position: pointer,
+                pressure: 1.0,
                 modifiers: Modifiers::NONE,
                 spacing: 10.0,
                 context: 0,
@@ -233,13 +248,13 @@ mod tests {
     #[test]
     fn event_partitioning_does_not_change_spatial_dabs() {
         let mut one_segment = sampler(Pos2::ZERO);
-        one_segment.enqueue_pointer(Pos2::new(35.0, 0.0), Modifiers::NONE, 10.0, 0);
+        one_segment.enqueue_pointer(Pos2::new(35.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
         let one_segment = drain(&mut one_segment, 64);
 
         let mut many_segments = sampler(Pos2::ZERO);
         let mut many_dabs = Vec::new();
         for x in [3.0, 11.0, 17.0, 26.0, 35.0] {
-            many_segments.enqueue_pointer(Pos2::new(x, 0.0), Modifiers::NONE, 10.0, 0);
+            many_segments.enqueue_pointer(Pos2::new(x, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
             many_dabs.extend(drain(&mut many_segments, 64));
         }
 
@@ -253,7 +268,7 @@ mod tests {
     #[test]
     fn work_budget_retains_the_unprocessed_path() {
         let mut sampler = sampler(Pos2::ZERO);
-        sampler.enqueue_pointer(Pos2::new(100.0, 0.0), Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(100.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
 
         assert_eq!(drain(&mut sampler, 3).len(), 3);
         assert!(sampler.has_pending_path());
@@ -275,7 +290,7 @@ mod tests {
     #[test]
     fn releasing_a_stroke_does_not_discard_queued_path() {
         let mut sampler = sampler(Pos2::ZERO);
-        sampler.enqueue_pointer(Pos2::new(100.0, 0.0), Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(100.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
         sampler.release();
 
         assert_eq!(drain(&mut sampler, 2).len(), 2);
@@ -286,7 +301,7 @@ mod tests {
     #[test]
     fn airbrush_waits_for_rate_and_does_not_catch_up() {
         let started = Instant::now();
-        let mut sampler = StrokeSampler::begin(Pos2::ZERO, Modifiers::NONE, 10.0, 0, started);
+        let mut sampler = StrokeSampler::begin(Pos2::ZERO, 1.0, Modifiers::NONE, 10.0, 0, started);
         let interval = Duration::from_millis(100);
         sampler.advance_to(started + Duration::from_millis(99));
         assert!(!sampler.airbrush_due(interval));
@@ -301,10 +316,10 @@ mod tests {
     #[test]
     fn airbrush_dab_restarts_spatial_spacing_at_current_pointer() {
         let mut sampler = sampler(Pos2::ZERO);
-        sampler.enqueue_pointer(Pos2::new(9.0, 0.0), Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(9.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
         assert!(drain(&mut sampler, 64).is_empty());
         sampler.record_airbrush_dab();
-        sampler.enqueue_pointer(Pos2::new(11.0, 0.0), Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(11.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
 
         assert!(drain(&mut sampler, 64).is_empty());
     }
@@ -314,7 +329,7 @@ mod tests {
         let mut sampler = sampler(Pos2::new(2.0, 3.0));
 
         assert_eq!(
-            sampler.consume_grab_delta(Pos2::new(25.0, 8.0)),
+            sampler.consume_grab_delta(Pos2::new(25.0, 8.0), 1.0),
             Some(Vec2::new(23.0, 5.0))
         );
         assert!(!sampler.has_pending_path());
@@ -323,11 +338,11 @@ mod tests {
     #[test]
     fn switching_to_grab_preserves_the_queued_semantic_path() {
         let mut sampler = sampler(Pos2::ZERO);
-        sampler.enqueue_pointer(Pos2::new(40.0, 0.0), Modifiers::SHIFT, 10.0, 7);
+        sampler.enqueue_pointer(Pos2::new(40.0, 0.0), 1.0, Modifiers::SHIFT, 10.0, 7);
         assert!(sampler.next_spatial_dab().is_some());
         assert!(sampler.has_pending_path());
 
-        assert_eq!(sampler.consume_grab_delta(Pos2::new(50.0, 0.0)), None);
+        assert_eq!(sampler.consume_grab_delta(Pos2::new(50.0, 0.0), 1.0), None);
         let queued = drain(&mut sampler, 8);
 
         assert_eq!(
@@ -336,7 +351,7 @@ mod tests {
         );
         assert!(queued.iter().all(|dab| dab.context == 7));
         assert_eq!(
-            sampler.consume_grab_delta(Pos2::new(55.0, 0.0)),
+            sampler.consume_grab_delta(Pos2::new(55.0, 0.0), 1.0),
             Some(Vec2::new(5.0, 0.0))
         );
     }
@@ -348,7 +363,7 @@ mod tests {
             ctrl: true,
             ..Modifiers::NONE
         };
-        sampler.enqueue_pointer(Pos2::new(20.0, 0.0), control, 10.0, 7);
+        sampler.enqueue_pointer(Pos2::new(20.0, 0.0), 1.0, control, 10.0, 7);
 
         let dabs = drain(&mut sampler, 2);
 
@@ -360,11 +375,42 @@ mod tests {
     #[test]
     fn queued_segments_keep_their_own_spacing_and_context() {
         let mut sampler = sampler(Pos2::ZERO);
-        sampler.enqueue_pointer(Pos2::new(24.0, 0.0), Modifiers::NONE, 8.0, 3);
+        sampler.enqueue_pointer(Pos2::new(24.0, 0.0), 1.0, Modifiers::NONE, 8.0, 3);
 
         let dabs = drain(&mut sampler, 8);
 
         assert_eq!(positions(&dabs), [[8.0, 0.0], [16.0, 0.0], [24.0, 0.0]]);
         assert!(dabs.iter().all(|dab| dab.context == 3));
+    }
+
+    #[test]
+    fn spatial_dabs_interpolate_pressure_linearly_across_queued_segments() {
+        let mut sampler =
+            StrokeSampler::begin(Pos2::ZERO, 0.0, Modifiers::NONE, 10.0, 0, Instant::now());
+        sampler.enqueue_pointer(Pos2::new(20.0, 0.0), 0.5, Modifiers::NONE, 10.0, 0);
+        sampler.enqueue_pointer(Pos2::new(40.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
+
+        let first = sampler.next_spatial_dab().unwrap();
+        let queued = drain(&mut sampler, 8);
+
+        assert!((first.pressure - 0.25).abs() < 1.0e-6);
+        assert_eq!(
+            queued.iter().map(|dab| dab.pressure).collect::<Vec<_>>(),
+            [0.5, 0.75, 1.0]
+        );
+        assert!(!sampler.has_pending_path());
+    }
+
+    #[test]
+    fn airbrush_and_grab_keep_the_latest_pressure() {
+        let mut sampler = sampler(Pos2::ZERO);
+        sampler.enqueue_pointer(Pos2::ZERO, 0.35, Modifiers::NONE, 10.0, 0);
+        assert_eq!(sampler.pointer().pressure, 0.35);
+
+        assert_eq!(
+            sampler.consume_grab_delta(Pos2::new(5.0, 2.0), 0.6),
+            Some(Vec2::new(5.0, 2.0))
+        );
+        assert_eq!(sampler.pointer().pressure, 0.6);
     }
 }

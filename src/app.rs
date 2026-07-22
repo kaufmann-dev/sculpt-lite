@@ -81,6 +81,7 @@ const MIN_AIRBRUSH_DABS_PER_SECOND: f32 = 2.0;
 const MAX_AIRBRUSH_DABS_PER_SECOND: f32 = 30.0;
 const BRUSH_SPACING_RADIUS_FRACTION: f32 = 0.15;
 const DEFAULT_ADAPTIVE_DETAIL: f32 = 0.12;
+const MOUSE_PRESSURE: f32 = 1.0;
 const SCULPT_FRAME_BUDGET: Duration = Duration::from_millis(8);
 
 fn adaptive_target_edge_length(radius: f32, detail: f32, units_per_point: f32) -> f32 {
@@ -1331,6 +1332,7 @@ impl SculptLiteApp {
                     let sculpt_input = self.sculpt_input(camera_frame);
                     self.stroke_sampler = Some(StrokeSampler::begin(
                         position,
+                        MOUSE_PRESSURE,
                         modifiers,
                         self.brush_spacing(),
                         sculpt_input,
@@ -1347,6 +1349,7 @@ impl SculptLiteApp {
                                 initial_dab.context,
                                 initial_dab.position,
                                 Vec2::ZERO,
+                                initial_dab.pressure,
                                 initial_dab.modifiers,
                                 Some(pointer_hit),
                             );
@@ -1370,13 +1373,16 @@ impl SculptLiteApp {
                             let delta = self
                                 .stroke_sampler
                                 .as_mut()
-                                .and_then(|sampler| sampler.consume_grab_delta(position))
+                                .and_then(|sampler| {
+                                    sampler.consume_grab_delta(position, MOUSE_PRESSURE)
+                                })
                                 .unwrap_or(Vec2::ZERO);
                             if delta.length_sq() > f32::EPSILON {
                                 self.apply_pointer_sample(
                                     sculpt_input,
                                     position,
                                     delta,
+                                    MOUSE_PRESSURE,
                                     modifiers,
                                     None,
                                 );
@@ -1387,6 +1393,7 @@ impl SculptLiteApp {
                         } else if let Some(sampler) = self.stroke_sampler.as_mut() {
                             sampler.enqueue_pointer(
                                 position,
+                                MOUSE_PRESSURE,
                                 modifiers,
                                 brush_spacing,
                                 sculpt_input,
@@ -1461,7 +1468,14 @@ impl SculptLiteApp {
             let Some(dab) = dab else {
                 break;
             };
-            self.apply_pointer_sample(dab.context, dab.position, Vec2::ZERO, dab.modifiers, None);
+            self.apply_pointer_sample(
+                dab.context,
+                dab.position,
+                Vec2::ZERO,
+                dab.pressure,
+                dab.modifiers,
+                None,
+            );
             processed += 1;
             if self.sculpt.has_pending_sample() || started.elapsed() >= SCULPT_FRAME_BUDGET {
                 break;
@@ -1485,7 +1499,14 @@ impl SculptLiteApp {
         let Some(dab) = dab else {
             return;
         };
-        self.apply_pointer_sample(dab.context, dab.position, Vec2::ZERO, dab.modifiers, None);
+        self.apply_pointer_sample(
+            dab.context,
+            dab.position,
+            Vec2::ZERO,
+            dab.pressure,
+            dab.modifiers,
+            None,
+        );
         if let Some(sampler) = self.stroke_sampler.as_mut() {
             sampler.record_airbrush_dab();
         }
@@ -1537,6 +1558,7 @@ impl SculptLiteApp {
         input: SculptInput,
         pointer: Pos2,
         pointer_delta: Vec2,
+        pressure: f32,
         modifiers: Modifiers,
         pointer_hit: Option<PointerHit>,
     ) {
@@ -1565,7 +1587,7 @@ impl SculptLiteApp {
             &hit,
             world_drag,
             pointer_hit.view_direction,
-            1.0,
+            pressure,
             modifiers.ctrl,
         );
 
@@ -1803,6 +1825,11 @@ mod tests {
     }
 
     #[test]
+    fn mouse_samples_use_full_pressure() {
+        assert_eq!(MOUSE_PRESSURE, 1.0);
+    }
+
+    #[test]
     fn frame_render_batch_preserves_fixed_edits_around_topology_edits() {
         let mut batch = FrameRenderBatch::default();
         batch.queue(vec![1, 2], None);
@@ -1834,9 +1861,15 @@ mod tests {
             adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             radius_points: 55.0,
         };
-        let mut sampler =
-            StrokeSampler::begin(Pos2::ZERO, Modifiers::NONE, 10.0, original, Instant::now());
-        sampler.enqueue_pointer(Pos2::new(20.0, 0.0), Modifiers::NONE, 10.0, original);
+        let mut sampler = StrokeSampler::begin(
+            Pos2::ZERO,
+            1.0,
+            Modifiers::NONE,
+            10.0,
+            original,
+            Instant::now(),
+        );
+        sampler.enqueue_pointer(Pos2::new(20.0, 0.0), 1.0, Modifiers::NONE, 10.0, original);
 
         camera.orbit(Vec2::new(80.0, 20.0));
         let navigated = camera.frame(viewport).unwrap();
