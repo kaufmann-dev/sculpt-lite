@@ -441,6 +441,29 @@ fn effective_tool(tool: SculptTool, modifiers: Modifiers) -> SculptTool {
     }
 }
 
+fn active_tool_text(tool: SculptTool, brush_invert: bool, modifiers: Modifiers) -> String {
+    let effective = effective_tool(tool, modifiers);
+    let mut text = if effective != tool {
+        format!("{} · temporary", effective.label())
+    } else {
+        effective.label().to_owned()
+    };
+    if brush_invert ^ modifiers.ctrl {
+        text.push_str(" · inverted");
+    }
+    text
+}
+
+fn brush_cursor_color(tool: SculptTool, brush_invert: bool, modifiers: Modifiers) -> Color32 {
+    if brush_invert ^ modifiers.ctrl {
+        Color32::from_rgb(238, 128, 92)
+    } else if effective_tool(tool, modifiers) != tool {
+        Color32::from_rgb(166, 132, 245)
+    } else {
+        Color32::from_rgb(115, 205, 255)
+    }
+}
+
 #[derive(Clone)]
 enum PendingAction {
     OpenDialog,
@@ -583,6 +606,7 @@ pub struct SculptLiteApp {
     airbrush_dabs_per_second: f32,
     brush_radius_points: f32,
     wireframe: bool,
+    show_quick_controls: bool,
     stroke_sampler: Option<StrokeSampler<SculptInput>>,
     frame_render: FrameRenderBatch,
     pending_action: Option<PendingAction>,
@@ -633,6 +657,7 @@ impl SculptLiteApp {
             airbrush_dabs_per_second: DEFAULT_AIRBRUSH_DABS_PER_SECOND,
             brush_radius_points: INITIAL_BRUSH_RADIUS_POINTS,
             wireframe: false,
+            show_quick_controls: true,
             stroke_sampler: None,
             frame_render: FrameRenderBatch::default(),
             pending_action: None,
@@ -1316,255 +1341,363 @@ impl SculptLiteApp {
     fn tool_panel(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::left("tools")
             .resizable(false)
-            .default_size(228.0)
+            .default_size(240.0)
             .show(root_ui, |ui| {
                 ui.heading("Sculpt");
-                ui.add_space(4.0);
                 let mesh_ready = self.background_task.is_none()
                     && !self.sculpt.is_stroking()
                     && self
                         .document
                         .as_ref()
                         .is_some_and(|document| document.mesh.is_some());
-                ui.add_enabled_ui(mesh_ready, |ui| {
-                    egui::Grid::new("tool_grid")
-                        .num_columns(2)
-                        .spacing([6.0, 6.0])
-                        .show(ui, |ui| {
-                            for (index, tool) in SculptTool::ALL.into_iter().enumerate() {
-                                let action = ShortcutAction::SelectTool(tool);
-                                let label = shortcut_label(ui.ctx(), tool.label(), &[action]);
-                                if ui
-                                    .add(egui::Button::selectable(self.tool == tool, label))
-                                    .clicked()
-                                {
-                                    self.tool = tool;
-                                }
-                                if index % 2 == 1 {
-                                    ui.end_row();
-                                }
-                            }
-                        });
-
-                    ui.separator();
-                    ui.label(shortcut_label(
-                        ui.ctx(),
-                        "Radius",
-                        &[
-                            ShortcutAction::AdjustRadius(ShortcutDirection::Decrease),
-                            ShortcutAction::AdjustRadius(ShortcutDirection::Increase),
-                        ],
-                    ));
-                    ui.add(
-                        egui::Slider::new(
-                            &mut self.brush_radius_points,
-                            MIN_BRUSH_RADIUS_POINTS..=MAX_BRUSH_RADIUS_POINTS,
-                        )
-                        .suffix(" px")
-                        .logarithmic(true),
-                    );
-                    ui.label(shortcut_label(
-                        ui.ctx(),
-                        "Strength",
-                        &[
-                            ShortcutAction::AdjustStrength(ShortcutDirection::Decrease),
-                            ShortcutAction::AdjustStrength(ShortcutDirection::Increase),
-                        ],
-                    ));
-                    ui.add(egui::Slider::new(&mut self.brush.strength, 0.01..=1.0));
-                    ui.label(shortcut_label(
-                        ui.ctx(),
-                        "Hardness",
-                        &[
-                            ShortcutAction::AdjustHardness(ShortcutDirection::Decrease),
-                            ShortcutAction::AdjustHardness(ShortcutDirection::Increase),
-                        ],
-                    ));
-                    ui.add(egui::Slider::new(&mut self.brush.falloff, 0.0..=0.95));
-                    ui.add_enabled_ui(self.tool != SculptTool::Grab, |ui| {
-                        let label =
-                            shortcut_label(ui.ctx(), "Airbrush", &[ShortcutAction::ToggleAirbrush]);
-                        ui.checkbox(&mut self.airbrush, label);
-                        if self.airbrush {
-                            ui.label("Rate");
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.airbrush_dabs_per_second,
-                                    MIN_AIRBRUSH_DABS_PER_SECOND..=MAX_AIRBRUSH_DABS_PER_SECOND,
-                                )
-                                .suffix(" dabs/s"),
-                            );
-                        }
-                    });
-                    ui.add_enabled_ui(self.tool != SculptTool::Mask, |ui| {
-                        let label = shortcut_label(
-                            ui.ctx(),
-                            "Adaptive topology",
-                            &[ShortcutAction::ToggleAdaptiveTopology],
-                        );
-                        ui.checkbox(&mut self.adaptive_topology, label);
-                        if self.adaptive_topology {
-                            ui.small("Updates topology continuously inside the brush region.");
-                            ui.label("Detail");
-                            ui.add(
-                                egui::Slider::new(&mut self.adaptive_detail, 0.03..=0.35)
-                                    .logarithmic(true),
-                            );
-                        }
-                    });
-                    let invert_label = shortcut_label(
-                        ui.ctx(),
-                        "Invert brush",
-                        &[ShortcutAction::ToggleBrushInvert],
-                    );
-                    ui.checkbox(&mut self.brush.invert, invert_label);
-
-                    ui.separator();
-                    ui.label("Symmetry");
-                    egui::ComboBox::from_id_salt("symmetry")
-                        .selected_text(match self.brush.symmetry {
-                            None => shortcut_label(
-                                ui.ctx(),
-                                "Off",
-                                &[ShortcutAction::SetSymmetry(None)],
-                            ),
-                            Some(SymmetryAxis::X) => shortcut_label(
-                                ui.ctx(),
-                                "X axis",
-                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::X))],
-                            ),
-                            Some(SymmetryAxis::Y) => shortcut_label(
-                                ui.ctx(),
-                                "Y axis",
-                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Y))],
-                            ),
-                            Some(SymmetryAxis::Z) => shortcut_label(
-                                ui.ctx(),
-                                "Z axis",
-                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Z))],
-                            ),
-                        })
-                        .show_ui(ui, |ui| {
-                            let off_label = shortcut_label(
-                                ui.ctx(),
-                                "Off",
-                                &[ShortcutAction::SetSymmetry(None)],
-                            );
-                            ui.selectable_value(&mut self.brush.symmetry, None, off_label);
-                            let x_label = shortcut_label(
-                                ui.ctx(),
-                                "X axis",
-                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::X))],
-                            );
-                            ui.selectable_value(
-                                &mut self.brush.symmetry,
-                                Some(SymmetryAxis::X),
-                                x_label,
-                            );
-                            let y_label = shortcut_label(
-                                ui.ctx(),
-                                "Y axis",
-                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Y))],
-                            );
-                            ui.selectable_value(
-                                &mut self.brush.symmetry,
-                                Some(SymmetryAxis::Y),
-                                y_label,
-                            );
-                            let z_label = shortcut_label(
-                                ui.ctx(),
-                                "Z axis",
-                                &[ShortcutAction::SetSymmetry(Some(SymmetryAxis::Z))],
-                            );
-                            ui.selectable_value(
-                                &mut self.brush.symmetry,
-                                Some(SymmetryAxis::Z),
-                                z_label,
-                            );
-                        });
-
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button("Clear mask")
-                            .on_hover_text(shortcut_tooltip(ui.ctx(), &[ShortcutAction::ClearMask]))
-                            .clicked()
-                        {
-                            self.edit_mask(false);
-                        }
-                        if ui
-                            .button("Invert mask")
-                            .on_hover_text(shortcut_tooltip(
-                                ui.ctx(),
-                                &[ShortcutAction::InvertMask],
-                            ))
-                            .clicked()
-                        {
-                            self.edit_mask(true);
-                        }
-                    });
-                });
-
                 ui.separator();
-                if let Some(document) = &self.document {
-                    ui.label(RichText::new("Mesh").strong());
-                    if let Some(mesh) = &document.mesh {
-                        ui.label(format!(
-                            "{} vertices · {} faces",
-                            grouped(mesh.positions.len()),
-                            grouped(mesh.triangles.len())
-                        ));
-                        if let Some((minimum, maximum)) = document.bounds.map(MeshBounds::min_max) {
-                            let size = maximum - minimum;
-                            ui.label(format!("{:.1} × {:.1} × {:.1}", size.x, size.y, size.z));
-                        }
-                    } else {
-                        ui.label("Mesh operation in progress");
-                    }
-                    egui::CollapsingHeader::new("Import details")
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            let report = document.report;
-                            let removed = report.removed_invalid_faces
-                                + report.removed_degenerate_faces
-                                + report.removed_duplicate_faces;
-                            let topology =
-                                if report.boundary_edges == 0 && report.non_manifold_edges == 0 {
-                                    "Closed · manifold".to_owned()
-                                } else {
-                                    format!(
-                                        "{} boundary · {} non-manifold",
-                                        grouped(report.boundary_edges),
-                                        grouped(report.non_manifold_edges)
-                                    )
-                                };
-                            egui::Grid::new("import_details_grid")
+
+                let footer_height = 50.0;
+                egui::ScrollArea::vertical()
+                    .max_height((ui.available_height() - footer_height).max(0.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Tools").strong());
+                        ui.add_enabled_ui(mesh_ready, |ui| {
+                            let spacing = 6.0;
+                            let button_width = ((ui.available_width() - spacing) / 2.0).max(1.0);
+                            egui::Grid::new("tool_grid")
                                 .num_columns(2)
-                                .spacing([10.0, 3.0])
+                                .spacing([spacing, 6.0])
                                 .show(ui, |ui| {
-                                    ui.small("Source");
-                                    ui.small(format!(
-                                        "{} triangles",
-                                        grouped(report.source_triangles)
-                                    ));
-                                    ui.end_row();
-                                    ui.small("Welded");
-                                    ui.small(format!(
-                                        "{} vertices",
-                                        grouped(report.welded_vertices)
-                                    ));
-                                    ui.end_row();
-                                    ui.small("Removed");
-                                    ui.small(format!("{} faces", grouped(removed)));
-                                    ui.end_row();
-                                    ui.small("Topology");
-                                    ui.small(topology);
-                                    ui.end_row();
+                                    for (index, tool) in SculptTool::ALL.into_iter().enumerate() {
+                                        let action = ShortcutAction::SelectTool(tool);
+                                        let key = shortcut_hint(ui.ctx(), &[action]);
+                                        let selected = self.tool == tool;
+                                        let mut text =
+                                            RichText::new(format!("{key}  {}", tool.label()));
+                                        if selected {
+                                            text = text.strong();
+                                        }
+                                        let mut button = egui::Button::selectable(selected, text);
+                                        if selected {
+                                            button = button
+                                                .fill(ui.visuals().selection.bg_fill)
+                                                .stroke(ui.visuals().selection.stroke);
+                                        }
+                                        if ui
+                                            .add_sized([button_width, 30.0], button)
+                                            .on_hover_text(format!(
+                                                "{}\nShortcut: {key}",
+                                                tool.description()
+                                            ))
+                                            .clicked()
+                                        {
+                                            self.tool = tool;
+                                        }
+                                        if index % 2 == 1 {
+                                            ui.end_row();
+                                        }
+                                    }
                                 });
                         });
-                } else {
-                    ui.label("No mesh loaded");
-                }
 
+                        ui.separator();
+                        egui::CollapsingHeader::new(RichText::new("Brush").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.add_enabled_ui(mesh_ready, |ui| {
+                                    ui.label(shortcut_label(
+                                        ui.ctx(),
+                                        "Radius",
+                                        &[
+                                            ShortcutAction::AdjustRadius(
+                                                ShortcutDirection::Decrease,
+                                            ),
+                                            ShortcutAction::AdjustRadius(
+                                                ShortcutDirection::Increase,
+                                            ),
+                                        ],
+                                    ));
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.brush_radius_points,
+                                            MIN_BRUSH_RADIUS_POINTS..=MAX_BRUSH_RADIUS_POINTS,
+                                        )
+                                        .suffix(" px")
+                                        .logarithmic(true),
+                                    );
+                                    ui.label(shortcut_label(
+                                        ui.ctx(),
+                                        "Strength",
+                                        &[
+                                            ShortcutAction::AdjustStrength(
+                                                ShortcutDirection::Decrease,
+                                            ),
+                                            ShortcutAction::AdjustStrength(
+                                                ShortcutDirection::Increase,
+                                            ),
+                                        ],
+                                    ));
+                                    ui.add(egui::Slider::new(
+                                        &mut self.brush.strength,
+                                        0.01..=1.0,
+                                    ));
+                                    ui.label(shortcut_label(
+                                        ui.ctx(),
+                                        "Hardness",
+                                        &[
+                                            ShortcutAction::AdjustHardness(
+                                                ShortcutDirection::Decrease,
+                                            ),
+                                            ShortcutAction::AdjustHardness(
+                                                ShortcutDirection::Increase,
+                                            ),
+                                        ],
+                                    ));
+                                    ui.add(egui::Slider::new(
+                                        &mut self.brush.falloff,
+                                        0.0..=0.95,
+                                    ));
+                                    let invert_label = shortcut_label(
+                                        ui.ctx(),
+                                        "Invert brush",
+                                        &[ShortcutAction::ToggleBrushInvert],
+                                    );
+                                    ui.checkbox(&mut self.brush.invert, invert_label);
+                                });
+                            });
+
+                        ui.separator();
+                        egui::CollapsingHeader::new(RichText::new("Stroke & topology").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.add_enabled_ui(mesh_ready, |ui| {
+                                    let supports_airbrush = self.tool != SculptTool::Grab;
+                                    ui.add_enabled_ui(supports_airbrush, |ui| {
+                                        let label = shortcut_label(
+                                            ui.ctx(),
+                                            "Airbrush",
+                                            &[ShortcutAction::ToggleAirbrush],
+                                        );
+                                        ui.checkbox(&mut self.airbrush, label)
+                                            .on_hover_text("Build up the brush effect while the pointer is held still.");
+                                    });
+                                    ui.label("Rate");
+                                    ui.add_enabled(
+                                        supports_airbrush && self.airbrush,
+                                        egui::Slider::new(
+                                            &mut self.airbrush_dabs_per_second,
+                                            MIN_AIRBRUSH_DABS_PER_SECOND
+                                                ..=MAX_AIRBRUSH_DABS_PER_SECOND,
+                                        )
+                                        .suffix(" dabs/s"),
+                                    );
+
+                                    ui.add_space(4.0);
+                                    let supports_topology = self.tool != SculptTool::Mask;
+                                    ui.add_enabled_ui(supports_topology, |ui| {
+                                        let label = shortcut_label(
+                                            ui.ctx(),
+                                            "Adaptive topology",
+                                            &[ShortcutAction::ToggleAdaptiveTopology],
+                                        );
+                                        ui.checkbox(&mut self.adaptive_topology, label)
+                                            .on_hover_text("Continuously adjusts topology inside the brush region.");
+                                    });
+                                    ui.label("Detail");
+                                    ui.add_enabled(
+                                        supports_topology && self.adaptive_topology,
+                                        egui::Slider::new(
+                                            &mut self.adaptive_detail,
+                                            0.03..=0.35,
+                                        )
+                                        .logarithmic(true),
+                                    );
+                                });
+                            });
+
+                        ui.separator();
+                        egui::CollapsingHeader::new(RichText::new("Symmetry").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.add_enabled_ui(mesh_ready, |ui| {
+                                    egui::ComboBox::from_id_salt("symmetry")
+                                        .width(ui.available_width())
+                                        .selected_text(match self.brush.symmetry {
+                                            None => shortcut_label(
+                                                ui.ctx(),
+                                                "Off",
+                                                &[ShortcutAction::SetSymmetry(None)],
+                                            ),
+                                            Some(SymmetryAxis::X) => shortcut_label(
+                                                ui.ctx(),
+                                                "X axis",
+                                                &[ShortcutAction::SetSymmetry(Some(
+                                                    SymmetryAxis::X,
+                                                ))],
+                                            ),
+                                            Some(SymmetryAxis::Y) => shortcut_label(
+                                                ui.ctx(),
+                                                "Y axis",
+                                                &[ShortcutAction::SetSymmetry(Some(
+                                                    SymmetryAxis::Y,
+                                                ))],
+                                            ),
+                                            Some(SymmetryAxis::Z) => shortcut_label(
+                                                ui.ctx(),
+                                                "Z axis",
+                                                &[ShortcutAction::SetSymmetry(Some(
+                                                    SymmetryAxis::Z,
+                                                ))],
+                                            ),
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for (symmetry, label) in [
+                                                (None, "Off"),
+                                                (Some(SymmetryAxis::X), "X axis"),
+                                                (Some(SymmetryAxis::Y), "Y axis"),
+                                                (Some(SymmetryAxis::Z), "Z axis"),
+                                            ] {
+                                                let action =
+                                                    ShortcutAction::SetSymmetry(symmetry);
+                                                let label = shortcut_label(
+                                                    ui.ctx(),
+                                                    label,
+                                                    &[action],
+                                                );
+                                                ui.selectable_value(
+                                                    &mut self.brush.symmetry,
+                                                    symmetry,
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                });
+                            });
+
+                        ui.separator();
+                        egui::CollapsingHeader::new(RichText::new("Mask").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                ui.add_enabled_ui(mesh_ready, |ui| {
+                                    if self.tool == SculptTool::Mask {
+                                        ui.colored_label(
+                                            ui.visuals().selection.bg_fill,
+                                            "Mask painting active",
+                                        );
+                                        ui.small("Paint to protect the surface; hold Ctrl to erase.");
+                                    } else {
+                                        ui.small("Masks protect the surface from sculpting tools.");
+                                    }
+                                    ui.horizontal(|ui| {
+                                        let width = ((ui.available_width() - 6.0) / 2.0).max(1.0);
+                                        if ui
+                                            .add_sized([width, 26.0], egui::Button::new("Clear"))
+                                            .on_hover_text(shortcut_tooltip(
+                                                ui.ctx(),
+                                                &[ShortcutAction::ClearMask],
+                                            ))
+                                            .clicked()
+                                        {
+                                            self.edit_mask(false);
+                                        }
+                                        if ui
+                                            .add_sized([width, 26.0], egui::Button::new("Invert"))
+                                            .on_hover_text(shortcut_tooltip(
+                                                ui.ctx(),
+                                                &[ShortcutAction::InvertMask],
+                                            ))
+                                            .clicked()
+                                        {
+                                            self.edit_mask(true);
+                                        }
+                                    });
+                                });
+                            });
+
+                        ui.separator();
+                        let mesh_heading = self.document.as_ref().map_or_else(
+                            || "Mesh · none".to_owned(),
+                            |document| {
+                                document.mesh.as_ref().map_or_else(
+                                    || "Mesh · working…".to_owned(),
+                                    |mesh| {
+                                        format!("Mesh · {} faces", grouped(mesh.triangles.len()))
+                                    },
+                                )
+                            },
+                        );
+                        egui::CollapsingHeader::new(RichText::new(mesh_heading).strong())
+                            .id_salt("mesh_section")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                if let Some(document) = &self.document {
+                                    if let Some(mesh) = &document.mesh {
+                                        ui.label(format!(
+                                            "{} vertices · {} faces",
+                                            grouped(mesh.positions.len()),
+                                            grouped(mesh.triangles.len())
+                                        ));
+                                        if let Some((minimum, maximum)) =
+                                            document.bounds.map(MeshBounds::min_max)
+                                        {
+                                            let size = maximum - minimum;
+                                            ui.label(format!(
+                                                "{:.1} × {:.1} × {:.1}",
+                                                size.x, size.y, size.z
+                                            ));
+                                        }
+                                    } else {
+                                        ui.label("Mesh operation in progress");
+                                    }
+                                    egui::CollapsingHeader::new("Import details")
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            let report = document.report;
+                                            let removed = report.removed_invalid_faces
+                                                + report.removed_degenerate_faces
+                                                + report.removed_duplicate_faces;
+                                            let topology = if report.boundary_edges == 0
+                                                && report.non_manifold_edges == 0
+                                            {
+                                                "Closed · manifold".to_owned()
+                                            } else {
+                                                format!(
+                                                    "{} boundary · {} non-manifold",
+                                                    grouped(report.boundary_edges),
+                                                    grouped(report.non_manifold_edges)
+                                                )
+                                            };
+                                            egui::Grid::new("import_details_grid")
+                                                .num_columns(2)
+                                                .spacing([10.0, 3.0])
+                                                .show(ui, |ui| {
+                                                    ui.small("Source");
+                                                    ui.small(format!(
+                                                        "{} triangles",
+                                                        grouped(report.source_triangles)
+                                                    ));
+                                                    ui.end_row();
+                                                    ui.small("Welded");
+                                                    ui.small(format!(
+                                                        "{} vertices",
+                                                        grouped(report.welded_vertices)
+                                                    ));
+                                                    ui.end_row();
+                                                    ui.small("Removed");
+                                                    ui.small(format!(
+                                                        "{} faces",
+                                                        grouped(removed)
+                                                    ));
+                                                    ui.end_row();
+                                                    ui.small("Topology");
+                                                    ui.small(topology);
+                                                    ui.end_row();
+                                                });
+                                        });
+                                } else {
+                                    ui.label("Import an STL mesh to begin sculpting.");
+                                }
+                            });
+                    });
+
+                ui.separator();
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     let mib = self.history.bytes_used() as f64 / (1024.0 * 1024.0);
                     let budget_mib = self.history.byte_budget() as f64 / (1024.0 * 1024.0);
@@ -1601,6 +1734,32 @@ impl SculptLiteApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(25, 27, 31)))
             .show(root_ui, |ui| {
+                let has_mesh = self
+                    .document
+                    .as_ref()
+                    .is_some_and(|document| document.mesh.is_some());
+                if self.show_quick_controls && has_mesh {
+                    let mut dismiss = false;
+                    egui::Frame::group(ui.style())
+                        .fill(Color32::from_rgb(35, 39, 47))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new("Quick controls").strong());
+                                    ui.small("Left drag: sculpt · Shift: smooth · Ctrl: invert");
+                                    ui.small("Right drag: pan · Middle drag: orbit · Wheel: zoom");
+                                });
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    dismiss = ui.small_button("Dismiss").clicked();
+                                });
+                            });
+                        });
+                    if dismiss {
+                        self.show_quick_controls = false;
+                    }
+                    ui.add_space(6.0);
+                }
+
                 let rect = ui.available_rect_before_wrap();
                 let response = ui.allocate_rect(rect, viewport_sense());
                 if let Some(sampler) = self.stroke_sampler.as_mut() {
@@ -1665,16 +1824,13 @@ impl SculptLiteApp {
                 let Some(camera_frame) = self.camera.frame(rect) else {
                     return;
                 };
+                let modifiers = context.input(|input| input.modifiers);
                 let cursor = pointer
                     .filter(|position| rect.contains(*position))
                     .map(|position| {
                         let mut cursor = BrushCursor::new(position, self.brush_radius_points);
                         cursor.active = self.sculpt.is_stroking();
-                        cursor.color = if context.input(|input| input.modifiers.ctrl) {
-                            Color32::from_rgb(238, 128, 92)
-                        } else {
-                            Color32::from_rgb(115, 205, 255)
-                        };
+                        cursor.color = brush_cursor_color(self.tool, self.brush.invert, modifiers);
                         cursor
                     });
                 if let Some(renderer) = &self.renderer {
@@ -1684,6 +1840,24 @@ impl SculptLiteApp {
                     ui.painter()
                         .rect_filled(rect, 0.0, Color32::from_rgb(20, 22, 25));
                 }
+
+                let badge_color = brush_cursor_color(self.tool, self.brush.invert, modifiers);
+                let badge_text = active_tool_text(self.tool, self.brush.invert, modifiers);
+                let badge_galley = ui.painter().layout_no_wrap(
+                    badge_text,
+                    egui::FontId::proportional(14.0),
+                    badge_color,
+                );
+                let badge_padding = Vec2::new(10.0, 6.0);
+                let badge_size = badge_galley.size() + badge_padding * 2.0;
+                let badge_rect = Rect::from_min_size(
+                    Pos2::new(rect.right() - badge_size.x - 12.0, rect.top() + 12.0),
+                    badge_size,
+                );
+                ui.painter()
+                    .rect_filled(badge_rect, 5.0, Color32::from_black_alpha(190));
+                ui.painter()
+                    .galley(badge_rect.min + badge_padding, badge_galley, badge_color);
 
                 let mut began_stroke = false;
                 if self.background_task.is_none()
@@ -2186,6 +2360,79 @@ mod tests {
             Some(NavigationAction::Orbit)
         );
         assert_eq!(navigation_action(PointerButton::Primary), None);
+    }
+
+    #[test]
+    fn active_tool_feedback_explains_temporary_modifiers() {
+        assert_eq!(
+            active_tool_text(SculptTool::Clay, false, Modifiers::NONE),
+            "Clay"
+        );
+        assert_eq!(
+            active_tool_text(SculptTool::Clay, false, Modifiers::SHIFT),
+            "Smooth · temporary"
+        );
+        assert_eq!(
+            active_tool_text(SculptTool::Clay, false, Modifiers::CTRL),
+            "Clay · inverted"
+        );
+        assert_eq!(
+            active_tool_text(
+                SculptTool::Clay,
+                false,
+                Modifiers::SHIFT.plus(Modifiers::CTRL)
+            ),
+            "Smooth · temporary · inverted"
+        );
+        assert_eq!(
+            active_tool_text(SculptTool::Mask, false, Modifiers::SHIFT),
+            "Mask"
+        );
+        assert_eq!(
+            active_tool_text(SculptTool::Clay, true, Modifiers::NONE),
+            "Clay · inverted"
+        );
+        assert_eq!(
+            active_tool_text(SculptTool::Clay, true, Modifiers::CTRL),
+            "Clay"
+        );
+    }
+
+    #[test]
+    fn cursor_color_tracks_temporary_brush_behavior() {
+        let normal = brush_cursor_color(SculptTool::Clay, false, Modifiers::NONE);
+        let smooth = brush_cursor_color(SculptTool::Clay, false, Modifiers::SHIFT);
+        let inverted = brush_cursor_color(SculptTool::Clay, false, Modifiers::CTRL);
+
+        assert_ne!(normal, smooth);
+        assert_ne!(normal, inverted);
+        assert_eq!(
+            brush_cursor_color(
+                SculptTool::Clay,
+                false,
+                Modifiers::SHIFT.plus(Modifiers::CTRL)
+            ),
+            inverted
+        );
+        assert_eq!(
+            brush_cursor_color(SculptTool::Mask, false, Modifiers::SHIFT),
+            normal
+        );
+        assert_eq!(
+            brush_cursor_color(SculptTool::Clay, true, Modifiers::NONE),
+            inverted
+        );
+        assert_eq!(
+            brush_cursor_color(SculptTool::Clay, true, Modifiers::CTRL),
+            normal
+        );
+    }
+
+    #[test]
+    fn every_sculpt_tool_has_help_text() {
+        for tool in SculptTool::ALL {
+            assert!(!tool.description().is_empty(), "missing help for {tool}");
+        }
     }
 
     #[test]

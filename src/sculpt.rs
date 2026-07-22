@@ -59,11 +59,26 @@ impl SculptTool {
             Self::Draw => "Draw",
             Self::Clay => "Clay",
             Self::Crease => "Crease",
-            Self::Inflate => "Inflate / Deflate",
+            Self::Inflate => "Inflate",
             Self::Smooth => "Smooth",
             Self::Pinch => "Pinch",
             Self::Flatten => "Flatten",
             Self::Mask => "Mask",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Grab => "Pull a region of the surface with the pointer.",
+            Self::Draw => "Raise the surface, or lower it while inverted.",
+            Self::Clay => "Build or trim broad forms against a local surface plane.",
+            Self::Crease => "Cut or raise a sharp line while pinching its sides together.",
+            Self::Inflate => "Expand the surface along its normals, or deflate it while inverted.",
+            Self::Smooth => "Relax surface variation without changing the overall form quickly.",
+            Self::Pinch => "Pull nearby surface points toward the brush center.",
+            Self::Flatten => "Move the surface toward the brush's local plane.",
+            Self::Mask => "Paint protection that limits the effect of sculpting tools.",
         }
     }
 }
