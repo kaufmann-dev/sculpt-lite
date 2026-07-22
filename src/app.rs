@@ -1568,7 +1568,8 @@ impl SculptLiteApp {
                         ui.label(RichText::new("Tools").strong());
                         ui.add_enabled_ui(mesh_ready, |ui| {
                             let spacing = 6.0;
-                            let button_width = ((ui.available_width() - spacing) / 2.0).max(1.0);
+                            let button_width =
+                                two_column_item_width(ui.available_width(), spacing);
                             egui::Grid::new("tool_grid")
                                 .num_columns(2)
                                 .spacing([spacing, 6.0])
@@ -1794,7 +1795,10 @@ impl SculptLiteApp {
                                         ui.small("Masks protect the surface from sculpting tools.");
                                     }
                                     ui.horizontal(|ui| {
-                                        let width = ((ui.available_width() - 6.0) / 2.0).max(1.0);
+                                        let width = two_column_item_width(
+                                            ui.available_width(),
+                                            ui.spacing().item_spacing.x,
+                                        );
                                         if ui
                                             .add_sized([width, 26.0], egui::Button::new("Clear"))
                                             .on_hover_text(shortcut_tooltip(
@@ -2635,6 +2639,10 @@ fn grouped(value: usize) -> String {
     output
 }
 
+fn two_column_item_width(available_width: f32, item_spacing: f32) -> f32 {
+    ((available_width - item_spacing) / 2.0).max(1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2660,6 +2668,51 @@ mod tests {
         assert_eq!(grouped(999), "999");
         assert_eq!(grouped(1_000), "1,000");
         assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn two_column_row_does_not_grow_its_panel_across_frames() {
+        let context = egui::Context::default();
+
+        for frame in 0..16 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1_280.0, 800.0))),
+                time: Some(f64::from(frame) / 60.0),
+                ..Default::default()
+            };
+            let mut panel_width = 0.0;
+            let _ = context.run_ui(input, |root_ui| {
+                let panel = egui::Panel::left("tools")
+                    .resizable(false)
+                    .default_size(240.0)
+                    .show(root_ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                egui::CollapsingHeader::new("Mask").default_open(true).show(
+                                    ui,
+                                    |ui| {
+                                        ui.horizontal(|ui| {
+                                            let width = two_column_item_width(
+                                                ui.available_width(),
+                                                ui.spacing().item_spacing.x,
+                                            );
+                                            ui.add_sized([width, 26.0], egui::Button::new("Clear"));
+                                            ui.add_sized(
+                                                [width, 26.0],
+                                                egui::Button::new("Invert"),
+                                            );
+                                        });
+                                    },
+                                );
+                            });
+                    });
+                panel_width = panel.response.rect.width();
+                egui::CentralPanel::default().show(root_ui, |_| {});
+            });
+
+            assert_eq!(panel_width, 240.0, "panel grew on frame {frame}");
+        }
     }
 
     #[test]
