@@ -317,7 +317,7 @@ fn shortcut_hint(context: &egui::Context, actions: &[ShortcutAction]) -> String 
 }
 
 fn shortcut_label(context: &egui::Context, label: &str, actions: &[ShortcutAction]) -> String {
-    format!("{label}  {}", shortcut_hint(context, actions))
+    format!("{label} ({})", shortcut_hint(context, actions))
 }
 
 fn shortcut_tooltip(context: &egui::Context, actions: &[ShortcutAction]) -> String {
@@ -1587,8 +1587,11 @@ impl SculptLiteApp {
                                         let action = ShortcutAction::SelectTool(tool);
                                         let key = shortcut_hint(ui.ctx(), &[action]);
                                         let selected = self.tool == tool;
-                                        let mut text =
-                                            RichText::new(format!("{key}  {}", tool.label()));
+                                        let mut text = RichText::new(shortcut_label(
+                                            ui.ctx(),
+                                            tool.label(),
+                                            &[action],
+                                        ));
                                         if selected {
                                             text = text.strong();
                                         }
@@ -2975,6 +2978,23 @@ mod tests {
                 [KeyboardShortcut::new(Modifiers::NONE, key)]
             );
         }
+    }
+
+    #[test]
+    fn inline_shortcut_labels_put_the_key_after_the_label_in_parentheses() {
+        let context = egui::Context::default();
+        assert_eq!(
+            shortcut_label(
+                &context,
+                "Draw",
+                &[ShortcutAction::SelectTool(SculptTool::Draw)]
+            ),
+            "Draw (1)"
+        );
+        assert_eq!(
+            shortcut_label(&context, "Off", &[ShortcutAction::SetSymmetry(None)]),
+            "Off (0)"
+        );
     }
 
     #[test]
