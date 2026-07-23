@@ -1,6 +1,6 @@
 # SculptLite
 
-SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive sculpting brushes with area-weighted surface frames, stabilized plane brushes, low-shrink smoothing, configurable capped, accumulating, and Airbrush strokes, symmetry, local adaptive topology, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
+SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes with area-weighted surface frames, stabilized plane brushes, low-shrink smoothing, configurable capped, accumulating, and Airbrush strokes, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
 
 ## Viewport controls
 
@@ -9,8 +9,6 @@ Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle mode
 With the pointer released, a left click applies one dab and left-drag sculpts from either viewpoint. Choose **Capped** to apply only newly increased brush influence until the button is released, **Accumulate** to build up with every distance-spaced dab while moving, or **Airbrush** to add the same spatial buildup plus timed dabs while held still. Press `A` to cycle these choices. The choice is remembered separately for each sculpt tool and captured when a stroke begins. Grab remains movement-driven: it anchors the affected region on press and keeps moving that region even when the pointer leaves the surface. The usual Shift-to-Smooth and Ctrl-to-Invert modifiers work throughout a stroke.
 
 Draw, Crease, and Pinch derive their working direction from the brush footprint instead of a single triangle. Clay and Flatten additionally stabilize their surface plane over the stroke, while Smooth uses a two-pass correction that loses substantially less volume than basic Laplacian smoothing. Geometry dabs are reduced to a safe partial step when the requested displacement would collapse or reverse a face. When a brush is too small for the local triangle spacing, the status bar warns that the result is undersampled; increase the radius or voxel-remesh a closed mesh at finer resolution for more detail.
-
-Adaptive topology is enabled by default for Draw, Clay, Crease, Inflate, Smooth, Pinch, and Flatten. It is intentionally unavailable for Grab and Mask. Press `T` or use the brush control to toggle it globally; **Detail** ranges from `0.03` to `0.35` of the brush radius and defaults to `0.12`, with smaller values producing denser topology. Each adaptive dab runs as one background transaction: topology preparation, deformation, and intersection checks must all succeed before the result is shown. An unsafe dab is rolled back completely and the remaining queued stroke is stopped, while earlier successful dabs remain undoable.
 
 ## Voxel remeshing
 
@@ -70,8 +68,8 @@ packaging/linux/smoke-x11.sh target/release/sculpt-lite
 Large-mesh performance probes are ignored by the normal test suite. Run them individually in release mode so parallel tests do not distort their timings:
 
 ```sh
-cargo test --release --bin sculpt-lite million_face_fixed_and_adaptive_sculpt_samples -- --ignored --nocapture --test-threads=1
-cargo test --release --bin sculpt-lite million_face_mesh_build_pick_and_local_remesh -- --ignored --nocapture --test-threads=1
+cargo test --release --bin sculpt-lite million_face_fixed_sculpt_sample -- --ignored --nocapture --test-threads=1
+cargo test --release --bin sculpt-lite million_face_mesh_build_pick_and_deform_refresh -- --ignored --nocapture --test-threads=1
 cargo test --release --bin sculpt-lite half_million_vertex_deformation_pack -- --ignored --nocapture --test-threads=1
 cargo test --release --bin sculpt-lite resolution_96_remesh_probe -- --ignored --nocapture --test-threads=1
 ```

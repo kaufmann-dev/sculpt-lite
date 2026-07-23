@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use crate::mesh::{Mesh, MeshEditDelta, MeshError};
+use crate::mesh::{Mesh, MeshError};
 
 /// Default memory budget shared by undo and redo entries (512 MiB).
 pub const DEFAULT_HISTORY_BUDGET: usize = 512 * 1024 * 1024;
@@ -149,7 +149,6 @@ impl MeshSnapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HistoryEntry {
     Local(LocalEdit),
-    Topology(Arc<MeshEditDelta>),
     /// The complete mesh state on the other side of a topology replacement.
     ///
     /// A newly recorded replacement holds the pre-operation state. Completing
@@ -162,7 +161,6 @@ impl HistoryEntry {
     pub fn byte_len(&self) -> usize {
         match self {
             Self::Local(edit) => edit.byte_len(),
-            Self::Topology(edit) => edit.byte_len(),
             Self::MeshReplacement(snapshot) => snapshot.byte_len(),
         }
     }
@@ -180,7 +178,6 @@ pub enum HistoryAction {
     Local {
         changed_vertices: Vec<u32>,
     },
-    Topology(PendingTopologyEdit),
     /// A whole-mesh state that must be rebuilt away from the UI thread.
     ///
     /// Return the token to [`History::complete_mesh_replacement`] after the
@@ -203,27 +200,6 @@ pub struct PendingMeshReplacement {
     bytes: usize,
 }
 
-#[derive(Debug)]
-pub struct PendingTopologyEdit {
-    history_id: u64,
-    transaction_id: u64,
-    direction: HistoryDirection,
-    edit: Arc<MeshEditDelta>,
-    bytes: usize,
-}
-
-impl PendingTopologyEdit {
-    #[must_use]
-    pub fn direction(&self) -> HistoryDirection {
-        self.direction
-    }
-
-    #[must_use]
-    pub fn edit(&self) -> &Arc<MeshEditDelta> {
-        &self.edit
-    }
-}
-
 impl PendingMeshReplacement {
     #[must_use]
     pub fn direction(&self) -> HistoryDirection {
@@ -241,8 +217,6 @@ pub enum HistoryTransactionError {
     /// The token is stale or belongs to a different history instance.
     #[error("the mesh replacement history token is stale or belongs to another history")]
     InvalidMeshReplacementToken,
-    #[error("the topology history token is stale or belongs to another history")]
-    InvalidTopologyToken,
 }
 
 #[derive(Debug)]
@@ -267,17 +241,10 @@ pub struct History {
     history_id: u64,
     next_transaction_id: u64,
     pending_replacement: Option<ActiveMeshReplacement>,
-    pending_topology: Option<ActiveTopologyEdit>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ActiveMeshReplacement {
-    transaction_id: u64,
-    bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ActiveTopologyEdit {
     transaction_id: u64,
     bytes: usize,
 }
@@ -299,7 +266,6 @@ impl History {
             history_id: NEXT_HISTORY_ID.fetch_add(1, Ordering::Relaxed),
             next_transaction_id: 1,
             pending_replacement: None,
-            pending_topology: None,
         }
     }
 
@@ -312,7 +278,7 @@ impl History {
     /// replacement is not undoable. Recording is also refused while a mesh
     /// replacement transaction is pending.
     pub fn record(&mut self, entry: HistoryEntry) -> bool {
-        if self.pending_replacement.is_some() || self.pending_topology.is_some() {
+        if self.pending_replacement.is_some() {
             return false;
         }
         self.clear_redo();
@@ -338,7 +304,7 @@ impl History {
     }
 
     fn step(&mut self, direction: HistoryDirection, mesh: &mut Mesh) -> HistoryAction {
-        if self.pending_replacement.is_some() || self.pending_topology.is_some() {
+        if self.pending_replacement.is_some() {
             return HistoryAction::Empty;
         }
         let stored = match direction {
@@ -358,21 +324,6 @@ impl History {
                 };
                 self.push_opposite(direction, StoredEntry::new(HistoryEntry::Local(edit)));
                 HistoryAction::Local { changed_vertices }
-            }
-            HistoryEntry::Topology(edit) => {
-                let transaction_id = self.next_transaction_id;
-                self.next_transaction_id = self.next_transaction_id.wrapping_add(1);
-                self.pending_topology = Some(ActiveTopologyEdit {
-                    transaction_id,
-                    bytes: stored.bytes,
-                });
-                HistoryAction::Topology(PendingTopologyEdit {
-                    history_id: self.history_id,
-                    transaction_id,
-                    direction,
-                    edit,
-                    bytes: stored.bytes,
-                })
             }
             HistoryEntry::MeshReplacement(target) => {
                 let transaction_id = self.next_transaction_id;
@@ -441,60 +392,21 @@ impl History {
         Ok(())
     }
 
-    pub fn complete_topology(
-        &mut self,
-        pending: PendingTopologyEdit,
-    ) -> Result<(), HistoryTransactionError> {
-        self.validate_pending_topology(&pending)?;
-        self.pending_topology = None;
-        self.bytes_used -= pending.bytes;
-        self.push_opposite(
-            pending.direction,
-            StoredEntry {
-                entry: HistoryEntry::Topology(pending.edit),
-                bytes: pending.bytes,
-            },
-        );
-        Ok(())
-    }
-
-    pub fn cancel_topology(
-        &mut self,
-        pending: PendingTopologyEdit,
-    ) -> Result<(), HistoryTransactionError> {
-        self.validate_pending_topology(&pending)?;
-        self.pending_topology = None;
-        let restored = StoredEntry {
-            entry: HistoryEntry::Topology(pending.edit),
-            bytes: pending.bytes,
-        };
-        match pending.direction {
-            HistoryDirection::Undo => self.undo.push_back(restored),
-            HistoryDirection::Redo => self.redo.push(restored),
-        }
-        Ok(())
-    }
-
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
         self.pending_replacement = None;
-        self.pending_topology = None;
         self.bytes_used = 0;
     }
 
     #[must_use]
     pub fn can_undo(&self) -> bool {
-        self.pending_replacement.is_none()
-            && self.pending_topology.is_none()
-            && !self.undo.is_empty()
+        self.pending_replacement.is_none() && !self.undo.is_empty()
     }
 
     #[must_use]
     pub fn can_redo(&self) -> bool {
-        self.pending_replacement.is_none()
-            && self.pending_topology.is_none()
-            && !self.redo.is_empty()
+        self.pending_replacement.is_none() && !self.redo.is_empty()
     }
 
     #[cfg(test)]
@@ -533,21 +445,6 @@ impl History {
             Ok(())
         } else {
             Err(HistoryTransactionError::InvalidMeshReplacementToken)
-        }
-    }
-
-    fn validate_pending_topology(
-        &self,
-        pending: &PendingTopologyEdit,
-    ) -> Result<(), HistoryTransactionError> {
-        let matches = pending.history_id == self.history_id
-            && self.pending_topology.is_some_and(|active| {
-                active.transaction_id == pending.transaction_id && active.bytes == pending.bytes
-            });
-        if matches {
-            Ok(())
-        } else {
-            Err(HistoryTransactionError::InvalidTopologyToken)
         }
     }
 
@@ -712,35 +609,6 @@ mod tests {
             Vec3::new(2.0, 0.0, 0.0),
         ))));
         assert!(!history.can_redo());
-    }
-
-    #[test]
-    fn topology_delta_undo_and_redo_are_exact() {
-        let mut mesh = triangle();
-        let before = mesh.positions[1];
-        let after = Vec3::new(3.0, 0.0, 0.0);
-        let mut recorder = crate::mesh::MeshEditRecorder::new(&mesh);
-        recorder.record_vertex(&mesh, 1);
-        mesh.positions[1] = after;
-        mesh.update_deformed_vertices(&[1]);
-        let edit = Arc::new(recorder.finish(&mesh));
-        let mut history = History::default();
-        assert!(history.record(HistoryEntry::Topology(edit)));
-
-        let HistoryAction::Topology(pending) = history.undo(&mut mesh) else {
-            panic!("topology delta expected");
-        };
-        pending.edit().apply_before(&mut mesh);
-        history.complete_topology(pending).unwrap();
-        assert_eq!(mesh.positions[1], before);
-        assert!(history.can_redo());
-
-        let HistoryAction::Topology(pending) = history.redo(&mut mesh) else {
-            panic!("topology delta expected");
-        };
-        pending.edit().apply_after(&mut mesh);
-        history.complete_topology(pending).unwrap();
-        assert_eq!(mesh.positions[1], after);
     }
 
     #[test]

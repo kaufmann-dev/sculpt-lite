@@ -19,9 +19,9 @@ use crate::{
     camera::{Camera, CameraFrame, CameraMode, FlyMovement, FlyMovementMode},
     history::{
         History, HistoryAction, HistoryDirection, HistoryEntry, LocalEdit, MaskChange,
-        MeshSnapshot, PendingMeshReplacement, PendingTopologyEdit,
+        MeshSnapshot, PendingMeshReplacement,
     },
-    mesh::{Mesh, MeshChangeSet, MeshEditDelta, RayHit},
+    mesh::{Mesh, RayHit},
     renderer::{BrushCursor, MeshGpuPreparer, PreparedMeshUpload, ViewportRenderer},
     sculpt::{
         Accumulation, BrushSample, BrushSettings, DabKind, SculptEngine, SculptTool, SymmetryAxis,
@@ -68,8 +68,6 @@ struct SculptInput {
     camera: CameraFrame,
     tool: SculptTool,
     brush: BrushSettings,
-    adaptive_topology: bool,
-    adaptive_detail: f32,
     radius_points: f32,
 }
 
@@ -178,32 +176,18 @@ impl Default for ToolStrokeBehaviors {
 #[derive(Debug, Default)]
 struct FrameRenderBatch {
     vertices: Vec<u32>,
-    changes: MeshChangeSet,
-    has_topology: bool,
     changed: bool,
 }
 
 impl FrameRenderBatch {
     fn clear(&mut self) {
         self.vertices.clear();
-        self.changes.clear();
-        self.has_topology = false;
         self.changed = false;
     }
 
-    fn queue(&mut self, updated_vertices: Vec<u32>, mesh_changes: Option<MeshChangeSet>) {
+    fn queue(&mut self, updated_vertices: Vec<u32>) {
         self.changed = true;
-        if let Some(changes) = mesh_changes {
-            if !self.has_topology {
-                self.changes.include_vertices(self.vertices.drain(..));
-                self.has_topology = true;
-            }
-            self.changes.merge(changes);
-        } else if self.has_topology {
-            self.changes.include_vertices(updated_vertices);
-        } else {
-            self.vertices.extend(updated_vertices);
-        }
+        self.vertices.extend(updated_vertices);
     }
 }
 
@@ -214,7 +198,6 @@ const DEFAULT_AIRBRUSH_DABS_PER_SECOND: f32 = 10.0;
 const MIN_AIRBRUSH_DABS_PER_SECOND: f32 = 2.0;
 const MAX_AIRBRUSH_DABS_PER_SECOND: f32 = 30.0;
 const BRUSH_SPACING_RADIUS_FRACTION: f32 = 0.15;
-const DEFAULT_ADAPTIVE_DETAIL: f32 = 0.12;
 const MOUSE_PRESSURE: f32 = 1.0;
 const SCULPT_FRAME_BUDGET: Duration = Duration::from_millis(8);
 const BRUSH_VALUE_STEP: f32 = 0.05;
@@ -240,7 +223,6 @@ enum ShortcutAction {
     AdjustRadius(ShortcutDirection),
     AdjustStrength(ShortcutDirection),
     AdjustHardness(ShortcutDirection),
-    ToggleAdaptiveTopology,
     CycleStrokeApplication,
     ToggleBrushInvert,
     SetSymmetry(Option<SymmetryAxis>),
@@ -261,7 +243,7 @@ const fn shortcut(modifiers: Modifiers, key: Key, action: ShortcutAction) -> Sho
     }
 }
 
-const SHORTCUT_BINDINGS: [ShortcutBinding; 32] = [
+const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
     // Put shortcuts with required Shift modifiers before their less-specific
     // variants because egui permits extra Shift for logical key matching.
     shortcut(
@@ -362,11 +344,6 @@ const SHORTCUT_BINDINGS: [ShortcutBinding; 32] = [
         Key::A,
         ShortcutAction::CycleStrokeApplication,
     ),
-    shortcut(
-        Modifiers::NONE,
-        Key::T,
-        ShortcutAction::ToggleAdaptiveTopology,
-    ),
     shortcut(Modifiers::NONE, Key::I, ShortcutAction::ToggleBrushInvert),
     shortcut(
         Modifiers::NONE,
@@ -419,10 +396,6 @@ fn shortcut_is_enabled(action: ShortcutAction, availability: ShortcutAvailabilit
         ShortcutAction::CycleStrokeApplication => {
             availability.mesh_ready && availability.tool != SculptTool::Grab
         }
-        ShortcutAction::ToggleAdaptiveTopology => {
-            availability.mesh_ready
-                && !matches!(availability.tool, SculptTool::Grab | SculptTool::Mask)
-        }
     }
 }
 
@@ -461,10 +434,6 @@ fn shortcut_label(context: &egui::Context, label: &str, actions: &[ShortcutActio
 
 fn shortcut_tooltip(context: &egui::Context, actions: &[ShortcutAction]) -> String {
     format!("Shortcut: {}", shortcut_hint(context, actions))
-}
-
-fn adaptive_target_edge_length(radius: f32, detail: f32, units_per_point: f32) -> f32 {
-    (radius * detail.clamp(0.03, 0.35)).max(units_per_point)
 }
 
 struct MeshDocument {
@@ -827,86 +796,6 @@ fn history_direction_label(direction: HistoryDirection) -> &'static str {
     }
 }
 
-#[derive(Debug, Default)]
-struct AdaptiveDabOutput {
-    changed: bool,
-    committed: bool,
-    rejected: bool,
-    updated_vertices: Vec<u32>,
-    mesh_changes: Option<MeshChangeSet>,
-    warning: Option<String>,
-    error: Option<String>,
-}
-
-fn run_adaptive_dab(
-    mesh: &mut Mesh,
-    sculpt: &mut SculptEngine,
-    tool: SculptTool,
-    settings: &BrushSettings,
-    sample: BrushSample,
-    kind: DabKind,
-) -> AdaptiveDabOutput {
-    const MAX_TRANSACTION_STEPS: usize = 1_024;
-
-    let mut output = AdaptiveDabOutput::default();
-    sculpt.apply_sample(mesh, tool, settings, sample, kind);
-    let mut steps = 0;
-    while sculpt.has_pending_sample() && steps < MAX_TRANSACTION_STEPS {
-        match sculpt.continue_pending_sample_safely(mesh) {
-            Ok(_) => {}
-            Err(error) => {
-                output.error = Some(error);
-                break;
-            }
-        }
-        output.committed |= sculpt.take_sample_committed();
-        output
-            .updated_vertices
-            .extend(sculpt.take_updated_vertices());
-        if let Some(changes) = sculpt.take_mesh_changes() {
-            output
-                .mesh_changes
-                .get_or_insert_with(MeshChangeSet::default)
-                .merge(changes);
-        }
-        output.warning = sculpt.take_warning();
-        output.error = output.error.take().or_else(|| sculpt.take_error());
-        if output.error.is_some() {
-            break;
-        }
-        steps += 1;
-    }
-    if sculpt.has_pending_sample() {
-        sculpt.cancel_pending_sample(
-            mesh,
-            "Adaptive topology exceeded its transaction limit; the brush sample was rolled back",
-        );
-        output.updated_vertices.clear();
-        output.mesh_changes = None;
-        output.committed = false;
-        output.warning = None;
-        output.error = sculpt.take_error().or_else(|| {
-            Some(
-                "Adaptive topology exceeded its transaction limit; the brush sample was rolled back"
-                    .to_owned(),
-            )
-        });
-    }
-    output.rejected = !output.committed && (output.warning.is_some() || output.error.is_some());
-    output.changed = output.committed;
-    if output.changed {
-        output.updated_vertices.sort_unstable();
-        output.updated_vertices.dedup();
-        if let Some(changes) = output.mesh_changes.as_mut() {
-            changes.finalize(mesh.positions.len(), mesh.triangles.len());
-        }
-    } else {
-        output.updated_vertices.clear();
-        output.mesh_changes = None;
-    }
-    output
-}
-
 enum WorkerJob {
     Import(PathBuf),
     Export {
@@ -923,19 +812,6 @@ enum WorkerJob {
     },
     RecoverSnapshot {
         snapshot: Arc<MeshSnapshot>,
-    },
-    AdaptiveDab {
-        mesh: Box<Mesh>,
-        sculpt: Box<SculptEngine>,
-        tool: SculptTool,
-        settings: BrushSettings,
-        sample: BrushSample,
-        kind: DabKind,
-    },
-    TopologyHistory {
-        mesh: Box<Mesh>,
-        edit: Arc<MeshEditDelta>,
-        direction: HistoryDirection,
     },
 }
 
@@ -993,16 +869,6 @@ enum WorkerResult {
     },
     RecoverSnapshot {
         result: SnapshotWorkerResult,
-    },
-    AdaptiveDab {
-        mesh: Box<Mesh>,
-        sculpt: Box<SculptEngine>,
-        output: AdaptiveDabOutput,
-    },
-    TopologyHistoryCheckpoint(Arc<MeshSnapshot>),
-    TopologyHistory {
-        mesh: Box<Mesh>,
-        result: Result<MeshChangeSet, String>,
     },
 }
 
@@ -1194,55 +1060,6 @@ impl BackgroundWorker {
                             .and_then(|result| result);
                             WorkerResult::RecoverSnapshot { result }
                         }
-                        WorkerJob::AdaptiveDab {
-                            mut mesh,
-                            mut sculpt,
-                            tool,
-                            settings,
-                            sample,
-                            kind,
-                        } => {
-                            let output = run_adaptive_dab(
-                                &mut mesh,
-                                &mut sculpt,
-                                tool,
-                                &settings,
-                                sample,
-                                kind,
-                            );
-                            WorkerResult::AdaptiveDab {
-                                mesh,
-                                sculpt,
-                                output,
-                            }
-                        }
-                        WorkerJob::TopologyHistory {
-                            mut mesh,
-                            edit,
-                            direction,
-                        } => {
-                            let recovery = Arc::new(MeshSnapshot::capture(&mesh));
-                            if result_sender
-                                .send(WorkerResult::TopologyHistoryCheckpoint(Arc::clone(
-                                    &recovery,
-                                )))
-                                .is_err()
-                            {
-                                break;
-                            }
-                            context.request_repaint();
-                            let result = catch_unwind(AssertUnwindSafe(|| match direction {
-                                HistoryDirection::Undo => edit.apply_before(&mut mesh),
-                                HistoryDirection::Redo => edit.apply_after(&mut mesh),
-                            }))
-                            .map_err(panic_message);
-                            if result.is_err()
-                                && let Ok(restored) = recovery.restore_mesh()
-                            {
-                                mesh = Box::new(restored);
-                            }
-                            WorkerResult::TopologyHistory { mesh, result }
-                        }
                     };
                     if result_sender.send(result).is_err() {
                         break;
@@ -1281,12 +1098,6 @@ enum BackgroundTask {
         dirty_before: bool,
         pending: PendingMeshReplacement,
     },
-    TopologyHistory {
-        started: Instant,
-        recovery: Option<Arc<MeshSnapshot>>,
-        dirty_before: bool,
-        pending: PendingTopologyEdit,
-    },
     RecoverSnapshot {
         started: Instant,
         recovery: Arc<MeshSnapshot>,
@@ -1303,7 +1114,6 @@ impl BackgroundTask {
             Self::Export { .. }
                 | Self::VoxelRemesh { .. }
                 | Self::RestoreSnapshot { .. }
-                | Self::TopologyHistory { .. }
                 | Self::RecoverSnapshot { .. }
         )
     }
@@ -1334,22 +1144,12 @@ impl BackgroundTask {
                 };
                 (label.to_owned(), started)
             }
-            Self::TopologyHistory {
-                started, pending, ..
-            } => (
-                format!("Preparing {}", history_direction_label(pending.direction())),
-                started,
-            ),
             Self::RecoverSnapshot { started, .. } => {
                 ("Restoring the editable mesh".to_owned(), started)
             }
         };
         format!("{label}… {:.1}s", started.elapsed().as_secs_f32())
     }
-}
-
-struct AdaptiveSculptTask {
-    started: Instant,
 }
 
 pub struct SculptLiteApp {
@@ -1362,8 +1162,6 @@ pub struct SculptLiteApp {
     sculpt: SculptEngine,
     tool: SculptTool,
     brush: BrushSettings,
-    adaptive_topology: bool,
-    adaptive_detail: f32,
     stroke_behaviors: ToolStrokeBehaviors,
     active_stroke_behavior: Option<StrokeBehavior>,
     airbrush_dabs_per_second: f32,
@@ -1377,7 +1175,6 @@ pub struct SculptLiteApp {
     pending_action: Option<PendingAction>,
     worker: Option<BackgroundWorker>,
     background_task: Option<BackgroundTask>,
-    adaptive_sculpt_task: Option<AdaptiveSculptTask>,
     worker_error: Option<String>,
     allow_close: bool,
     window_title: String,
@@ -1418,8 +1215,6 @@ impl SculptLiteApp {
             sculpt: SculptEngine::default(),
             tool: SculptTool::default(),
             brush: BrushSettings::default(),
-            adaptive_topology: true,
-            adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             stroke_behaviors: ToolStrokeBehaviors::default(),
             active_stroke_behavior: None,
             airbrush_dabs_per_second: DEFAULT_AIRBRUSH_DABS_PER_SECOND,
@@ -1433,7 +1228,6 @@ impl SculptLiteApp {
             pending_action: None,
             worker,
             background_task: None,
-            adaptive_sculpt_task: None,
             worker_error,
             allow_close: false,
             window_title: "SculptLite".to_owned(),
@@ -1444,16 +1238,6 @@ impl SculptLiteApp {
             app.start_import(path, &creation_context.egui_ctx);
         }
         app
-    }
-
-    fn stroke_active(&self) -> bool {
-        self.stroke_sampler.is_some()
-            || self.sculpt.is_stroking()
-            || self.adaptive_sculpt_task.is_some()
-    }
-
-    fn mesh_task_active(&self) -> bool {
-        self.background_task.is_some() || self.adaptive_sculpt_task.is_some()
     }
 
     fn capture_fly(&mut self, context: &egui::Context) {
@@ -1495,12 +1279,11 @@ impl SculptLiteApp {
         let has_mesh = self
             .document
             .as_ref()
-            .is_some_and(|document| document.mesh.is_some())
-            || self.adaptive_sculpt_task.is_some();
+            .is_some_and(|document| document.mesh.is_some());
         let state_valid = self.camera.mode() == CameraMode::Fly
             && has_mesh
-            && !self.stroke_active()
-            && !self.mesh_task_active()
+            && !self.sculpt.is_stroking()
+            && self.background_task.is_none()
             && self.pending_action.is_none()
             && self.error.is_none()
             && !context.input(|input| input.viewport().close_requested());
@@ -1523,7 +1306,7 @@ impl SculptLiteApp {
     }
 
     fn request_action(&mut self, action: PendingAction, context: &egui::Context) {
-        if self.mesh_task_active() || self.stroke_active() {
+        if self.background_task.is_some() || self.sculpt.is_stroking() {
             self.status = "Wait for the current mesh operation to finish".to_owned();
             return;
         }
@@ -1610,7 +1393,7 @@ impl SculptLiteApp {
             renderer.install_prepared_mesh(upload);
         }
         self.status = if report.has_topology_warnings() {
-            format!("Loaded {} with protected topology regions", path.display())
+            format!("Loaded {} with topology warnings", path.display())
         } else {
             format!("Loaded {}", path.display())
         };
@@ -1652,117 +1435,6 @@ impl SculptLiteApp {
         self.grab_transform = None;
         self.active_stroke_behavior = None;
         self.frame_render = FrameRenderBatch::default();
-    }
-
-    fn start_adaptive_dab(
-        &mut self,
-        tool: SculptTool,
-        settings: BrushSettings,
-        sample: BrushSample,
-        kind: DabKind,
-    ) {
-        if self.adaptive_sculpt_task.is_some() || self.background_task.is_some() {
-            return;
-        }
-        let Some(worker) = &self.worker else {
-            self.error = Some("Adaptive topology requires the mesh worker".to_owned());
-            if let Some(sampler) = self.stroke_sampler.as_mut() {
-                sampler.abort();
-            }
-            return;
-        };
-        let Some(mesh) = self
-            .document
-            .as_mut()
-            .and_then(|document| document.mesh.take())
-        else {
-            return;
-        };
-        let sculpt = Box::new(std::mem::take(&mut self.sculpt));
-        match worker.sender.send(WorkerJob::AdaptiveDab {
-            mesh: Box::new(mesh),
-            sculpt,
-            tool,
-            settings,
-            sample,
-            kind,
-        }) {
-            Ok(()) => {
-                self.adaptive_sculpt_task = Some(AdaptiveSculptTask {
-                    started: Instant::now(),
-                });
-            }
-            Err(error) => {
-                let WorkerJob::AdaptiveDab { mesh, sculpt, .. } = error.0 else {
-                    unreachable!("the submitted worker job remains an adaptive dab")
-                };
-                if let Some(document) = self.document.as_mut() {
-                    document.mesh = Some(*mesh);
-                }
-                self.sculpt = *sculpt;
-                self.worker_error = Some("The mesh worker stopped unexpectedly".to_owned());
-                if let Some(sampler) = self.stroke_sampler.as_mut() {
-                    sampler.abort();
-                }
-            }
-        }
-    }
-
-    fn poll_adaptive_sculpt_task(&mut self, context: &egui::Context) {
-        if self.adaptive_sculpt_task.is_none() {
-            return;
-        }
-        let Some(worker) = &self.worker else {
-            return;
-        };
-        let result = match worker.receiver.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                self.adaptive_sculpt_task = None;
-                self.worker_error =
-                    Some("The mesh worker stopped during adaptive sculpting".to_owned());
-                self.error = Some(
-                    "The adaptive sculpt worker stopped before returning the editable mesh"
-                        .to_owned(),
-                );
-                if let Some(sampler) = self.stroke_sampler.as_mut() {
-                    sampler.abort();
-                }
-                return;
-            }
-        };
-        let WorkerResult::AdaptiveDab {
-            mesh,
-            sculpt,
-            output,
-        } = result
-        else {
-            self.adaptive_sculpt_task = None;
-            self.error = Some("The mesh worker returned an unexpected result".to_owned());
-            return;
-        };
-        self.adaptive_sculpt_task = None;
-        if let Some(document) = self.document.as_mut() {
-            document.mesh = Some(*mesh);
-        }
-        self.sculpt = *sculpt;
-
-        let rejected = output.rejected;
-        let rejection_notice = rejected
-            .then(|| output.error.clone().or_else(|| output.warning.clone()))
-            .flatten();
-        self.consume_adaptive_dab(output);
-        if rejected {
-            if let Some(sampler) = self.stroke_sampler.as_mut() {
-                sampler.abort();
-            }
-            self.finish_pointer_stroke();
-            if let Some(notice) = rejection_notice {
-                self.status = notice;
-            }
-        }
-        context.request_repaint();
     }
 
     fn poll_background_task(&mut self, context: &egui::Context) {
@@ -2039,85 +1711,6 @@ impl SculptLiteApp {
                     ));
                 }
             },
-            (
-                BackgroundTask::TopologyHistory {
-                    started,
-                    dirty_before,
-                    pending,
-                    ..
-                },
-                WorkerResult::TopologyHistoryCheckpoint(recovery),
-            ) => {
-                self.background_task = Some(BackgroundTask::TopologyHistory {
-                    started,
-                    recovery: Some(recovery),
-                    dirty_before,
-                    pending,
-                });
-            }
-            (
-                BackgroundTask::TopologyHistory {
-                    started,
-                    dirty_before,
-                    pending,
-                    ..
-                },
-                WorkerResult::TopologyHistory { mesh, result },
-            ) => {
-                let direction = pending.direction();
-                match result {
-                    Ok(changes) => {
-                        if let Err(error) = self.history.complete_topology(pending) {
-                            self.history.clear();
-                            if let Some(document) = self.document.as_mut() {
-                                document.mesh = Some(*mesh);
-                                document.dirty = dirty_before;
-                            }
-                            self.error = Some(format!(
-                                "Could not complete {}\n\n{error}",
-                                history_direction_label(direction).to_lowercase()
-                            ));
-                        } else {
-                            if let Some(document) = self.document.as_mut() {
-                                document.mesh = Some(*mesh);
-                                document.dirty = true;
-                            }
-                            if let Some(mesh) = self
-                                .document
-                                .as_ref()
-                                .and_then(|document| document.mesh.as_ref())
-                            {
-                                self.sculpt.reset_for_mesh(mesh);
-                            }
-                            self.upload_mesh_partial(&changes);
-                            self.refresh_document_bounds();
-                            self.status = format!(
-                                "{} in {:.1}s",
-                                history_direction_label(direction),
-                                started.elapsed().as_secs_f32()
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        if let Err(history_error) = self.history.cancel_topology(pending) {
-                            self.history.clear();
-                            self.worker_error = Some(history_error.to_string());
-                        }
-                        if let Some(document) = self.document.as_mut() {
-                            document.mesh = Some(*mesh);
-                            document.dirty = dirty_before;
-                        }
-                        self.status = format!(
-                            "{} failed; the mesh was left unchanged",
-                            history_direction_label(direction)
-                        );
-                        self.error = Some(format!(
-                            "Could not prepare {}\n\n{error}",
-                            history_direction_label(direction).to_lowercase()
-                        ));
-                    }
-                }
-            }
             (task, _) => {
                 let recovery = self.recover_background_task(task, context, false);
                 self.error = Some(recovery.map_or_else(
@@ -2192,27 +1785,6 @@ impl SculptLiteApp {
                     None,
                 )
             }
-            BackgroundTask::TopologyHistory {
-                recovery,
-                dirty_before,
-                pending,
-                ..
-            } => {
-                let direction = pending.direction();
-                if let Err(error) = self.history.cancel_topology(pending) {
-                    self.history.clear();
-                    self.worker_error = Some(error.to_string());
-                }
-                (
-                    recovery,
-                    dirty_before,
-                    format!(
-                        "The {} stopped; the editable mesh was restored",
-                        history_direction_label(direction).to_lowercase()
-                    ),
-                    None,
-                )
-            }
             BackgroundTask::RecoverSnapshot {
                 recovery,
                 dirty,
@@ -2271,7 +1843,7 @@ impl SculptLiteApp {
     }
 
     fn export_as(&mut self, after: Option<PendingAction>, context: &egui::Context) -> bool {
-        if self.mesh_task_active() || self.stroke_active() {
+        if self.background_task.is_some() || self.sculpt.is_stroking() {
             return false;
         }
         let Some(document) = self.document.as_ref() else {
@@ -2359,7 +1931,7 @@ impl SculptLiteApp {
     }
 
     fn start_voxel_remesh(&mut self, context: &egui::Context) {
-        if self.mesh_task_active() || self.stroke_active() {
+        if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
         if let Some(reason) = self
@@ -2473,64 +2045,6 @@ impl SculptLiteApp {
         }
     }
 
-    fn start_topology_history(&mut self, pending: PendingTopologyEdit, context: &egui::Context) {
-        let direction = pending.direction();
-        let edit = Arc::clone(pending.edit());
-        let dirty_before = self
-            .document
-            .as_ref()
-            .is_some_and(|document| document.dirty);
-        let Some(mesh) = self
-            .document
-            .as_mut()
-            .and_then(|document| document.mesh.take())
-        else {
-            if self.history.cancel_topology(pending).is_err() {
-                self.history.clear();
-            }
-            return;
-        };
-        self.release_fly(context);
-        let Some(worker) = &self.worker else {
-            if let Some(document) = self.document.as_mut() {
-                document.mesh = Some(mesh);
-            }
-            if self.history.cancel_topology(pending).is_err() {
-                self.history.clear();
-            }
-            self.error = Some("The mesh worker is unavailable".to_owned());
-            return;
-        };
-        match worker.sender.send(WorkerJob::TopologyHistory {
-            mesh: Box::new(mesh),
-            edit,
-            direction,
-        }) {
-            Ok(()) => {
-                self.background_task = Some(BackgroundTask::TopologyHistory {
-                    started: Instant::now(),
-                    recovery: None,
-                    dirty_before,
-                    pending,
-                });
-                self.status = format!("Preparing {}", history_direction_label(direction));
-                context.request_repaint();
-            }
-            Err(error) => {
-                let WorkerJob::TopologyHistory { mesh, .. } = error.0 else {
-                    unreachable!("the submitted worker job remains topology history")
-                };
-                if let Some(document) = self.document.as_mut() {
-                    document.mesh = Some(*mesh);
-                }
-                if self.history.cancel_topology(pending).is_err() {
-                    self.history.clear();
-                }
-                self.worker_error = Some("The mesh worker stopped unexpectedly".to_owned());
-            }
-        }
-    }
-
     fn upload_vertices_partial(&self, changed_vertices: &[u32]) {
         if let (Some(renderer), Some(mesh)) = (
             &self.renderer,
@@ -2542,48 +2056,21 @@ impl SculptLiteApp {
         }
     }
 
-    fn upload_mesh_partial(&self, changes: &MeshChangeSet) {
-        if let (Some(renderer), Some(mesh)) = (
-            &self.renderer,
-            self.document
-                .as_ref()
-                .and_then(|document| document.mesh.as_ref()),
-        ) {
-            renderer.update_mesh_partial(mesh, changes);
-        }
-    }
-
     fn begin_frame_render_batch(&mut self) {
         self.frame_render.clear();
     }
 
-    fn queue_frame_render_update(
-        &mut self,
-        updated_vertices: Vec<u32>,
-        mesh_changes: Option<MeshChangeSet>,
-    ) {
-        self.frame_render.queue(updated_vertices, mesh_changes);
+    fn queue_frame_render_update(&mut self, updated_vertices: Vec<u32>) {
+        self.frame_render.queue(updated_vertices);
     }
 
     fn flush_frame_render_batch(&mut self, context: &egui::Context) {
         if !self.frame_render.changed {
             return;
         }
-        if self.frame_render.has_topology {
-            let counts = self
-                .document
-                .as_ref()
-                .and_then(|document| document.mesh.as_ref())
-                .map(|mesh| (mesh.positions.len(), mesh.triangles.len()));
-            if let Some((vertex_count, face_count)) = counts {
-                self.frame_render.changes.finalize(vertex_count, face_count);
-                self.upload_mesh_partial(&self.frame_render.changes);
-            }
-        } else {
-            self.frame_render.vertices.sort_unstable();
-            self.frame_render.vertices.dedup();
-            self.upload_vertices_partial(&self.frame_render.vertices);
-        }
+        self.frame_render.vertices.sort_unstable();
+        self.frame_render.vertices.dedup();
+        self.upload_vertices_partial(&self.frame_render.vertices);
         context.request_repaint();
     }
 
@@ -2635,7 +2122,7 @@ impl SculptLiteApp {
     }
 
     fn undo(&mut self, context: &egui::Context) {
-        if self.mesh_task_active() || self.stroke_active() {
+        if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
         let action = self
@@ -2653,7 +2140,6 @@ impl SculptLiteApp {
                 self.refresh_document_bounds();
                 self.status = "Undo".to_owned();
             }
-            HistoryAction::Topology(pending) => self.start_topology_history(pending, context),
             HistoryAction::MeshReplacement(pending) => {
                 self.start_snapshot_restore(pending, context);
             }
@@ -2661,7 +2147,7 @@ impl SculptLiteApp {
     }
 
     fn redo(&mut self, context: &egui::Context) {
-        if self.mesh_task_active() || self.stroke_active() {
+        if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
         let action = self
@@ -2679,7 +2165,6 @@ impl SculptLiteApp {
                 self.refresh_document_bounds();
                 self.status = "Redo".to_owned();
             }
-            HistoryAction::Topology(pending) => self.start_topology_history(pending, context),
             HistoryAction::MeshReplacement(pending) => {
                 self.start_snapshot_restore(pending, context);
             }
@@ -2687,7 +2172,7 @@ impl SculptLiteApp {
     }
 
     fn edit_mask(&mut self, invert: bool) {
-        if self.mesh_task_active() || self.stroke_active() {
+        if self.background_task.is_some() || self.sculpt.is_stroking() {
             return;
         }
         let Some(document) = self.document.as_mut() else {
@@ -2742,7 +2227,7 @@ impl SculptLiteApp {
     }
 
     fn shortcut_availability(&self) -> ShortcutAvailability {
-        let actions_ready = !self.mesh_task_active() && !self.stroke_active();
+        let actions_ready = self.background_task.is_none() && !self.sculpt.is_stroking();
         let mesh_ready = actions_ready
             && self
                 .document
@@ -2796,9 +2281,6 @@ impl SculptLiteApp {
             ShortcutAction::AdjustHardness(direction) => {
                 self.brush.falloff = adjusted_brush_value(self.brush.falloff, direction, 0.0, 0.95);
             }
-            ShortcutAction::ToggleAdaptiveTopology => {
-                self.adaptive_topology = !self.adaptive_topology;
-            }
             ShortcutAction::CycleStrokeApplication => {
                 let behavior = self.stroke_behaviors.get(self.tool).next();
                 self.stroke_behaviors.set(self.tool, behavior);
@@ -2838,7 +2320,7 @@ impl SculptLiteApp {
 
     fn top_bar(&mut self, root_ui: &mut egui::Ui, context: &egui::Context) {
         egui::Panel::top("top_bar").show(root_ui, |ui| {
-            let actions_ready = !self.mesh_task_active() && !self.stroke_active();
+            let actions_ready = self.background_task.is_none() && !self.sculpt.is_stroking();
             let mesh_ready = actions_ready
                 && self
                     .document
@@ -2945,8 +2427,8 @@ impl SculptLiteApp {
             .default_size(240.0)
             .show(root_ui, |ui| {
                 ui.heading("Sculpt");
-                let mesh_ready = !self.mesh_task_active()
-                    && !self.stroke_active()
+                let mesh_ready = self.background_task.is_none()
+                    && !self.sculpt.is_stroking()
                     && self
                         .document
                         .as_ref()
@@ -3069,7 +2551,7 @@ impl SculptLiteApp {
                             });
 
                         ui.separator();
-                        egui::CollapsingHeader::new(RichText::new("Stroke & topology").strong())
+                        egui::CollapsingHeader::new(RichText::new("Stroke").strong())
                             .default_open(true)
                             .show(ui, |ui| {
                                 ui.add_enabled_ui(mesh_ready, |ui| {
@@ -3119,34 +2601,6 @@ impl SculptLiteApp {
                                                 ..=MAX_AIRBRUSH_DABS_PER_SECOND,
                                         )
                                         .suffix(" dabs/s"),
-                                    );
-
-                                    ui.add_space(4.0);
-                                    let supports_topology =
-                                        !matches!(self.tool, SculptTool::Grab | SculptTool::Mask);
-                                    let mut topology_enabled =
-                                        supports_topology && self.adaptive_topology;
-                                    ui.add_enabled_ui(supports_topology, |ui| {
-                                        let label = shortcut_label(
-                                            ui.ctx(),
-                                            "Adaptive topology",
-                                            &[ShortcutAction::ToggleAdaptiveTopology],
-                                        );
-                                        if ui.checkbox(&mut topology_enabled, label)
-                                            .on_hover_text("Adjusts topology transactionally inside the brush region.")
-                                            .changed()
-                                        {
-                                            self.adaptive_topology = topology_enabled;
-                                        }
-                                    });
-                                    ui.label("Detail");
-                                    ui.add_enabled(
-                                        supports_topology && self.adaptive_topology,
-                                        egui::Slider::new(
-                                            &mut self.adaptive_detail,
-                                            0.03..=0.35,
-                                        )
-                                        .logarithmic(true),
                                     );
                                 });
                             });
@@ -3370,13 +2824,7 @@ impl SculptLiteApp {
     fn status_bar(&mut self, root_ui: &mut egui::Ui) {
         egui::Panel::bottom("status_bar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
-                if let Some(task) = &self.adaptive_sculpt_task {
-                    ui.spinner();
-                    ui.small(format!(
-                        "Adaptive sculpt… {:.1}s",
-                        task.started.elapsed().as_secs_f32()
-                    ));
-                } else if let Some(task) = &self.background_task {
+                if let Some(task) = &self.background_task {
                     ui.spinner();
                     ui.small(task.progress_text());
                 } else {
@@ -3396,20 +2844,16 @@ impl SculptLiteApp {
 
     fn viewport(&mut self, root_ui: &mut egui::Ui, context: &egui::Context) {
         self.begin_frame_render_batch();
-        self.poll_adaptive_sculpt_task(context);
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(Color32::from_rgb(25, 27, 31)))
             .show(root_ui, |ui| {
                 let has_mesh = self
                     .document
                     .as_ref()
-                    .is_some_and(|document| document.mesh.is_some())
-                    || self.adaptive_sculpt_task.is_some();
+                    .is_some_and(|document| document.mesh.is_some());
                 let rect = ui.available_rect_before_wrap();
                 let response = ui.allocate_rect(rect, viewport_sense());
-                if self.adaptive_sculpt_task.is_none()
-                    && let Some(sampler) = self.stroke_sampler.as_mut()
-                {
+                if let Some(sampler) = self.stroke_sampler.as_mut() {
                     sampler.advance_to(Instant::now());
                 }
 
@@ -3428,11 +2872,13 @@ impl SculptLiteApp {
                     if ui
                         .put(
                             button_rect,
-                            egui::Button::new("Choose STL…").sense(if !self.mesh_task_active() {
-                                Sense::click()
-                            } else {
-                                Sense::hover()
-                            }),
+                            egui::Button::new("Choose STL…").sense(
+                                if self.background_task.is_none() {
+                                    Sense::click()
+                                } else {
+                                    Sense::hover()
+                                },
+                            ),
                         )
                         .clicked()
                     {
@@ -3481,8 +2927,8 @@ impl SculptLiteApp {
                                 viewport_hovered: response.hovered(),
                                 focused,
                                 has_mesh,
-                                stroke_active: self.stroke_active(),
-                                mesh_job_active: self.mesh_task_active(),
+                                stroke_active: self.sculpt.is_stroking(),
+                                mesh_job_active: self.background_task.is_some(),
                                 modal_active: self.pending_action.is_some() || self.error.is_some(),
                             })
                         {
@@ -3530,7 +2976,7 @@ impl SculptLiteApp {
                     .filter(|position| rect.contains(*position))
                     .map(|position| {
                         let mut cursor = BrushCursor::new(position, self.brush_radius_points);
-                        cursor.active = self.stroke_active();
+                        cursor.active = self.sculpt.is_stroking();
                         cursor.color = brush_cursor_color(self.tool, self.brush.invert, modifiers);
                         cursor
                     });
@@ -3659,8 +3105,8 @@ impl SculptLiteApp {
                         && context.layer_id_at(*position) == Some(response.layer_id)
                 });
                 if sculpting_allowed(self.fly_captured)
-                    && !self.mesh_task_active()
-                    && !self.stroke_active()
+                    && self.background_task.is_none()
+                    && !self.sculpt.is_stroking()
                     && let Some((position, modifiers)) = viewport_primary_press
                     && let Some(pointer_hit) = self.hit_at(position, camera_frame)
                     && let Some(document) = self.document.as_ref()
@@ -3731,7 +3177,7 @@ impl SculptLiteApp {
                     }
                 }
 
-                if sculpting_allowed(self.fly_captured) && self.stroke_active() {
+                if sculpting_allowed(self.fly_captured) && self.sculpt.is_stroking() {
                     let modifiers = context.input(|input| input.modifiers);
                     let sculpt_input = self.sculpt_input(camera_frame);
                     let brush_spacing = self.brush_spacing();
@@ -3784,9 +3230,7 @@ impl SculptLiteApp {
                     }
 
                     let finished = self.stroke_sampler.as_ref().is_some_and(|sampler| {
-                        sampler.is_released()
-                            && !sampler.has_pending_path()
-                            && self.adaptive_sculpt_task.is_none()
+                        sampler.is_released() && !sampler.has_pending_path()
                     });
                     if finished {
                         self.finish_pointer_stroke();
@@ -3820,8 +3264,6 @@ impl SculptLiteApp {
             camera,
             tool: self.tool,
             brush,
-            adaptive_topology: self.adaptive_topology,
-            adaptive_detail: self.adaptive_detail,
             radius_points: self.brush_radius_points,
         }
     }
@@ -3831,9 +3273,6 @@ impl SculptLiteApp {
     }
 
     fn apply_spatial_dabs(&mut self) {
-        if self.adaptive_sculpt_task.is_some() {
-            return;
-        }
         let started = Instant::now();
         let mut processed = 0;
         while processed < MAX_DABS_PER_FRAME {
@@ -3856,7 +3295,7 @@ impl SculptLiteApp {
                 },
             );
             processed += 1;
-            if self.adaptive_sculpt_task.is_some() || started.elapsed() >= SCULPT_FRAME_BUDGET {
+            if started.elapsed() >= SCULPT_FRAME_BUDGET {
                 break;
             }
         }
@@ -3868,9 +3307,6 @@ impl SculptLiteApp {
     }
 
     fn apply_airbrush_dab(&mut self) {
-        if self.adaptive_sculpt_task.is_some() {
-            return;
-        }
         let behavior = self.active_stroke_behavior.unwrap_or_default();
         let interval = self.airbrush_interval();
         let dab = self.stroke_sampler.as_ref().and_then(|sampler| {
@@ -3916,11 +3352,8 @@ impl SculptLiteApp {
             .and_then(|document| document.mesh.as_ref())
             .map(|mesh| self.sculpt.end_stroke(mesh))
             .unwrap_or_default();
-        let history_entry = outcome
-            .topology
-            .map(|edit| HistoryEntry::Topology(Arc::new(edit)))
-            .or_else(|| (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit)));
         let warning = outcome.warning;
+        let history_entry = (!outcome.edit.is_empty()).then_some(HistoryEntry::Local(outcome.edit));
         if let Some(history_entry) = history_entry {
             if let Some(document) = self.document.as_mut() {
                 document.dirty = true;
@@ -3961,16 +3394,6 @@ impl SculptLiteApp {
         let effective_tool = effective_tool(input.tool, dab.modifiers);
         let mut settings = input.brush;
         settings.radius = input.radius_points * units_per_point;
-        if matches!(effective_tool, SculptTool::Grab | SculptTool::Mask) || !input.adaptive_topology
-        {
-            settings.remesh_target_edge_length = None;
-        } else {
-            settings.remesh_target_edge_length = Some(adaptive_target_edge_length(
-                settings.radius,
-                input.adaptive_detail,
-                units_per_point,
-            ));
-        }
         let sample = BrushSample::from_hit(
             &hit,
             world_drag,
@@ -3979,10 +3402,6 @@ impl SculptLiteApp {
             dab.modifiers.ctrl,
         );
 
-        if settings.remesh_target_edge_length.is_some() {
-            self.start_adaptive_dab(effective_tool, settings, sample, dab.kind);
-            return;
-        }
         let changed = self.document.as_mut().is_some_and(|document| {
             document.mesh.as_mut().is_some_and(|mesh| {
                 self.sculpt
@@ -3995,12 +3414,8 @@ impl SculptLiteApp {
     fn consume_sculpt_step(&mut self, changed: bool, geometry_changed: bool) {
         let committed = self.sculpt.take_sample_committed();
         let updated_vertices = self.sculpt.take_updated_vertices();
-        let mesh_changes = self.sculpt.take_mesh_changes();
         if let Some(error) = self.sculpt.take_error() {
             self.error = Some(error);
-        }
-        if let Some(warning) = self.sculpt.take_warning() {
-            self.status = warning;
         }
         if committed && let Some(document) = self.document.as_mut() {
             document.dirty = true;
@@ -4009,25 +3424,7 @@ impl SculptLiteApp {
             if geometry_changed {
                 self.update_document_bounds(&updated_vertices);
             }
-            self.queue_frame_render_update(updated_vertices, mesh_changes);
-        }
-    }
-
-    fn consume_adaptive_dab(&mut self, output: AdaptiveDabOutput) {
-        if output.committed
-            && let Some(document) = self.document.as_mut()
-        {
-            document.dirty = true;
-        }
-        if output.changed {
-            self.update_document_bounds(&output.updated_vertices);
-            self.queue_frame_render_update(output.updated_vertices, output.mesh_changes);
-        }
-        if let Some(warning) = output.warning {
-            self.status = warning;
-        }
-        if let Some(error) = output.error {
-            self.error = Some(error);
+            self.queue_frame_render_update(updated_vertices);
         }
     }
 
@@ -4083,11 +3480,10 @@ impl eframe::App for SculptLiteApp {
         self.poll_background_task(&context);
         self.enforce_fly_release(&context);
         if context.input(|input| input.viewport().close_requested()) && !self.allow_close {
-            if self.adaptive_sculpt_task.is_some()
-                || self
-                    .background_task
-                    .as_ref()
-                    .is_some_and(BackgroundTask::owns_mesh)
+            if self
+                .background_task
+                .as_ref()
+                .is_some_and(BackgroundTask::owns_mesh)
             {
                 context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.status = "Wait for the current mesh operation before closing".to_owned();
@@ -4150,7 +3546,7 @@ impl eframe::App for SculptLiteApp {
         }
 
         if let Some(sampler) = &self.stroke_sampler {
-            if sampler.has_pending_path() || self.adaptive_sculpt_task.is_some() {
+            if sampler.has_pending_path() {
                 context.request_repaint();
             } else if timed_dabs_enabled(
                 self.active_stroke_behavior.unwrap_or_default(),
@@ -4160,7 +3556,7 @@ impl eframe::App for SculptLiteApp {
                 context.request_repaint_after(sampler.airbrush_wait(self.airbrush_interval()));
             }
         }
-        if self.mesh_task_active() {
+        if self.background_task.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
         if self.fly_captured {
@@ -4210,121 +3606,6 @@ mod tests {
             vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]],
         )
         .unwrap()
-    }
-
-    fn adaptive_sample(mesh: &Mesh) -> BrushSample {
-        let triangle = mesh.triangles[0];
-        let [a, b, c] = triangle.map(|vertex| mesh.positions[vertex as usize]);
-        BrushSample {
-            center: (a + b + c) / 3.0,
-            normal: (b - a).cross(c - a).normalize(),
-            drag_delta: Vec3::ZERO,
-            view_direction: -((b - a).cross(c - a).normalize()),
-            seed_triangle: 0,
-            pressure: 1.0,
-            invert_modifier: false,
-        }
-    }
-
-    #[test]
-    fn adaptive_worker_dab_commits_only_a_finished_valid_mesh() {
-        let mut mesh = closed_tetrahedron(1.0);
-        let mut sculpt = SculptEngine::default();
-        sculpt.begin_stroke(&mesh);
-        let settings = BrushSettings {
-            radius: 2.0,
-            strength: 0.2,
-            remesh_target_edge_length: Some(0.5),
-            ..BrushSettings::default()
-        };
-        let sample = adaptive_sample(&mesh);
-
-        let output = run_adaptive_dab(
-            &mut mesh,
-            &mut sculpt,
-            SculptTool::Crease,
-            &settings,
-            sample,
-            DabKind::Spatial,
-        );
-
-        assert!(output.committed);
-        assert!(output.changed);
-        assert!(!output.rejected);
-        assert!(!sculpt.has_pending_sample());
-        assert!(mesh.validate().is_ok());
-        assert!(
-            !mesh.faces_have_self_intersections(
-                &(0..mesh.triangles.len() as u32).collect::<Vec<_>>()
-            )
-        );
-    }
-
-    #[test]
-    fn adaptive_worker_rejection_restores_the_complete_dab() {
-        let mut mesh = Mesh::new(vec![Vec3::ZERO, Vec3::X, Vec3::Y], vec![[0, 1, 2]]).unwrap();
-        let before = MeshSnapshot::capture(&mesh);
-        let mut sculpt = SculptEngine::default();
-        sculpt.begin_stroke(&mesh);
-        let settings = BrushSettings {
-            radius: 0.1,
-            strength: 0.5,
-            remesh_target_edge_length: Some(0.01),
-            ..BrushSettings::default()
-        };
-        let mut sample = adaptive_sample(&mesh);
-        sample.center = mesh.positions[0];
-
-        let output = run_adaptive_dab(
-            &mut mesh,
-            &mut sculpt,
-            SculptTool::Draw,
-            &settings,
-            sample,
-            DabKind::Spatial,
-        );
-
-        assert!(output.rejected);
-        assert!(!output.committed);
-        assert!(!output.changed);
-        assert_eq!(MeshSnapshot::capture(&mesh), before);
-    }
-
-    #[test]
-    fn topology_history_worker_applies_a_delta_off_thread() {
-        let worker = BackgroundWorker::start(egui::Context::default(), None).unwrap();
-        let mut mesh = closed_tetrahedron(1.0);
-        let before = MeshSnapshot::capture(&mesh);
-        let mut recorder = crate::mesh::MeshEditRecorder::new(&mesh);
-        recorder.record_vertex(&mesh, 0);
-        mesh.positions[0] *= 1.5;
-        mesh.update_deformed_vertices(&[0]);
-        let edit = Arc::new(recorder.finish(&mesh));
-
-        worker
-            .sender
-            .send(WorkerJob::TopologyHistory {
-                mesh: Box::new(mesh),
-                edit,
-                direction: HistoryDirection::Undo,
-            })
-            .unwrap();
-        assert!(matches!(
-            worker
-                .receiver
-                .recv_timeout(Duration::from_secs(5))
-                .unwrap(),
-            WorkerResult::TopologyHistoryCheckpoint(_)
-        ));
-        let WorkerResult::TopologyHistory { mesh, result } = worker
-            .receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-        else {
-            panic!("topology history result expected");
-        };
-        assert!(result.is_ok());
-        assert_eq!(MeshSnapshot::capture(&mesh), before);
     }
 
     #[test]
@@ -4444,21 +3725,6 @@ mod tests {
             (maximum - minimum).max_element() > 0.0
         }));
         assert_eq!(MeshSnapshot::capture(&restored), *snapshot);
-    }
-
-    #[test]
-    fn adaptive_target_never_creates_subpoint_edges() {
-        let units_per_point = 0.25;
-        let radius = MIN_BRUSH_RADIUS_POINTS * units_per_point;
-
-        assert_eq!(
-            adaptive_target_edge_length(radius, 0.03, units_per_point),
-            units_per_point
-        );
-        assert_eq!(
-            adaptive_target_edge_length(radius * 100.0, 0.12, units_per_point),
-            radius * 12.0
-        );
     }
 
     #[test]
@@ -4965,10 +4231,6 @@ mod tests {
         assert!(shortcut_is_enabled(ShortcutAction::Undo, ready));
         assert!(!shortcut_is_enabled(ShortcutAction::Redo, ready));
         assert!(shortcut_is_enabled(
-            ShortcutAction::ToggleAdaptiveTopology,
-            ready
-        ));
-        assert!(shortcut_is_enabled(
             ShortcutAction::CycleStrokeApplication,
             ready
         ));
@@ -4977,13 +4239,6 @@ mod tests {
             ShortcutAction::CycleStrokeApplication,
             ShortcutAvailability {
                 tool: SculptTool::Grab,
-                ..ready
-            }
-        ));
-        assert!(!shortcut_is_enabled(
-            ShortcutAction::ToggleAdaptiveTopology,
-            ShortcutAvailability {
-                tool: SculptTool::Mask,
                 ..ready
             }
         ));
@@ -5027,23 +4282,16 @@ mod tests {
     }
 
     #[test]
-    fn frame_render_batch_preserves_fixed_edits_around_topology_edits() {
+    fn frame_render_batch_merges_fixed_topology_edits() {
         let mut batch = FrameRenderBatch::default();
-        batch.queue(vec![1, 2], None);
-        let mut topology = MeshChangeSet::default();
-        topology.dirty_vertices = vec![3, 4];
-        topology.dirty_faces = vec![7];
-        topology.vertex_count = 12;
-        topology.face_count = 9;
-        batch.queue(vec![3], Some(topology));
-        batch.queue(vec![5, 2], None);
-        batch.changes.finalize(12, 9);
+        batch.queue(vec![1, 2]);
+        batch.queue(vec![3, 4]);
+        batch.queue(vec![5, 2]);
+        batch.vertices.sort_unstable();
+        batch.vertices.dedup();
 
         assert!(batch.changed);
-        assert!(batch.has_topology);
-        assert_eq!(batch.changes.dirty_vertices, [1, 2, 3, 4, 5]);
-        assert_eq!(batch.changes.dirty_faces, [7]);
-        assert!(batch.vertices.is_empty());
+        assert_eq!(batch.vertices, [1, 2, 3, 4, 5]);
     }
 
     #[test]
@@ -5054,8 +4302,6 @@ mod tests {
             camera: camera.frame(viewport).unwrap(),
             tool: SculptTool::Draw,
             brush: BrushSettings::default(),
-            adaptive_topology: true,
-            adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             radius_points: 55.0,
         };
         let mut sampler = StrokeSampler::begin(

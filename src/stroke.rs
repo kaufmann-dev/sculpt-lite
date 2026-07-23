@@ -179,12 +179,6 @@ impl<T: Copy> StrokeSampler<T> {
         self.released = true;
     }
 
-    pub fn abort(&mut self) {
-        self.initial_dab = None;
-        self.pending_path.clear();
-        self.released = true;
-    }
-
     #[must_use]
     pub fn is_released(&self) -> bool {
         self.released
@@ -302,19 +296,6 @@ mod tests {
         assert_eq!(drain(&mut sampler, 2).len(), 2);
         assert!(sampler.is_released());
         assert!(sampler.has_pending_path());
-    }
-
-    #[test]
-    fn abort_discards_initial_and_queued_dabs() {
-        let mut sampler = sampler(Pos2::ZERO);
-        sampler.enqueue_pointer(Pos2::new(20.0, 0.0), 1.0, Modifiers::NONE, 10.0, 0);
-
-        sampler.abort();
-
-        assert!(sampler.is_released());
-        assert!(!sampler.has_pending_path());
-        assert!(sampler.take_initial_dab().is_none());
-        assert!(sampler.next_spatial_dab().is_none());
     }
 
     #[test]
