@@ -1418,7 +1418,7 @@ impl SculptLiteApp {
             sculpt: SculptEngine::default(),
             tool: SculptTool::default(),
             brush: BrushSettings::default(),
-            adaptive_topology: false,
+            adaptive_topology: true,
             adaptive_detail: DEFAULT_ADAPTIVE_DETAIL,
             stroke_behaviors: ToolStrokeBehaviors::default(),
             active_stroke_behavior: None,
