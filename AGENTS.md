@@ -18,7 +18,7 @@ Run the ignored large-mesh probes documented in `README.md` individually and in 
 ## Project structure
 
 - `src/app.rs` owns the egui UI, input handling, exact cached document bounds, per-frame render batching, background mesh jobs, and document lifecycle.
-- `src/mesh.rs` owns validated mesh data, adjacency, normals, and spatial queries; `src/voxel_remesh.rs` builds explicit whole-object manifold replacements; `src/sculpt.rs` applies and validates fixed-topology brush operations; `src/stroke.rs` retains captured input state while scheduling distance- and time-based brush dabs.
+- `src/mesh.rs` owns validated mesh data, local topology updates, remeshing, normals, and spatial queries; `src/voxel_remesh.rs` builds explicit whole-object manifold replacements; `src/sculpt.rs` applies and validates brush operations; `src/stroke.rs` retains captured input state while scheduling distance- and time-based brush dabs.
 - `src/renderer.rs` and `src/shader.wgsl` own the wgpu viewport; keep CPU/GPU updates revisioned and local, preserve growth headroom within device limits, and avoid blocking the UI thread.
 - `src/history.rs`, `src/camera.rs`, and `src/stl.rs` respectively own local and whole-mesh undo/redo, orbit-camera math, and STL I/O.
 

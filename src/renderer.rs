@@ -7,12 +7,13 @@ use eframe::egui::{Color32, PaintCallback, Pos2, Rect, Stroke, Ui};
 use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt as _;
 use glam::Vec3;
+use hashbrown::HashMap;
 #[cfg(test)]
 use hashbrown::HashSet;
 use thiserror::Error;
 
 use crate::camera::CameraFrame;
-use crate::mesh::Mesh;
+use crate::mesh::{EdgeKey, Mesh, MeshChangeSet};
 
 pub const REQUIRED_DEPTH_BITS: u8 = 32;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -137,6 +138,33 @@ impl ViewportRenderer {
         }
     }
 
+    /// Applies a topology edit to the CPU mirror without scanning untouched mesh data.
+    pub fn update_mesh_partial(&self, mesh: &Mesh, changes: &MeshChangeSet) {
+        let mut input = self
+            .shared
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_triangle_indices = input.mesh.triangle_indices.len();
+        let previous_edge_indices = input.mesh.edge_indices.len();
+        let dirty = input.mesh.apply_changes(mesh, changes);
+        let topology_upload = topology_upload_required(
+            &dirty,
+            previous_triangle_indices,
+            previous_edge_indices,
+            input.mesh.triangle_indices.len(),
+            input.mesh.edge_indices.len(),
+        );
+        if !dirty.vertices.is_empty() {
+            input.dirty_vertices.extend(dirty.vertices);
+            input.vertex_revision = input.vertex_revision.wrapping_add(1);
+        }
+        if topology_upload {
+            input.dirty_faces.extend(dirty.faces);
+            input.dirty_edges.extend(dirty.edges);
+            input.topology_revision = input.topology_revision.wrapping_add(1);
+        }
+    }
+
     /// Updates view and lighting uniforms. Call after camera input and whenever
     /// the viewport aspect ratio changes.
     pub fn update_camera(&self, camera: CameraFrame) {
@@ -196,14 +224,20 @@ struct RenderInput {
     prepared_gpu: Option<PendingPreparedGpuMesh>,
     camera: CameraUniform,
     full_vertex_upload: bool,
+    full_topology_upload: bool,
     dirty_vertices: Vec<u32>,
+    dirty_faces: Vec<u32>,
+    dirty_edges: Vec<u32>,
 }
 
 impl RenderInput {
     fn install_prepared_mesh(&mut self, upload: PreparedMeshUpload) {
         self.mesh = upload.mesh;
         self.full_vertex_upload = false;
+        self.full_topology_upload = false;
         self.dirty_vertices.clear();
+        self.dirty_faces.clear();
+        self.dirty_edges.clear();
         self.vertex_revision = self.vertex_revision.wrapping_add(1);
         self.topology_revision = self.topology_revision.wrapping_add(1);
         self.prepared_gpu = Some(PendingPreparedGpuMesh {
@@ -219,6 +253,14 @@ pub(crate) struct MeshUpload {
     vertices: Vec<GpuVertex>,
     triangle_indices: Vec<u32>,
     edge_indices: Vec<u32>,
+    edge_slots: HashMap<EdgeKey, u32>,
+}
+
+#[derive(Default)]
+struct UploadChanges {
+    vertices: Vec<u32>,
+    faces: Vec<u32>,
+    edges: Vec<u32>,
 }
 
 pub(crate) struct PreparedMeshUpload {
@@ -286,16 +328,80 @@ impl MeshUpload {
         }
         let edge_count = mesh.topology.edge_faces.len();
         let mut edge_indices = Vec::with_capacity(upload_capacity(edge_count.saturating_mul(2)));
+        let mut edge_slots = HashMap::with_capacity(upload_capacity(edge_count));
         for &(a, b) in mesh.topology.edge_faces.keys() {
             if (a as usize) < vertex_count && (b as usize) < vertex_count {
+                let slot = edge_indices.len() / 2;
                 edge_indices.extend_from_slice(&[a, b]);
+                edge_slots.insert((a, b), slot as u32);
             }
         }
         Self {
             vertices,
             triangle_indices,
             edge_indices,
+            edge_slots,
         }
+    }
+
+    fn apply_changes(&mut self, mesh: &Mesh, changes: &MeshChangeSet) -> UploadChanges {
+        let mut dirty = UploadChanges::default();
+        reserve_upload_headroom(&mut self.vertices, changes.vertex_count);
+        self.vertices
+            .resize(changes.vertex_count, GpuVertex::default());
+        for &vertex in &changes.dirty_vertices {
+            let index = vertex as usize;
+            let Some(position) = mesh.positions.get(index).copied() else {
+                continue;
+            };
+            self.vertices[index] = Self::vertex(
+                position,
+                mesh.normals.get(index).copied(),
+                mesh.mask.get(index).copied(),
+            );
+            dirty.vertices.push(vertex);
+        }
+
+        let triangle_index_count = changes.face_count.saturating_mul(3);
+        reserve_upload_headroom(&mut self.triangle_indices, triangle_index_count);
+        self.triangle_indices.resize(triangle_index_count, 0);
+        for &face in &changes.dirty_faces {
+            let index = face as usize;
+            let Some(&triangle) = mesh.triangles.get(index) else {
+                continue;
+            };
+            self.triangle_indices[index * 3..index * 3 + 3].copy_from_slice(&triangle);
+            dirty.faces.push(face);
+        }
+
+        for &edge in &changes.removed_edges {
+            let Some(slot) = self.edge_slots.remove(&edge) else {
+                continue;
+            };
+            let slot = slot as usize;
+            let last = self.edge_indices.len() / 2 - 1;
+            if slot != last {
+                let moved = (self.edge_indices[last * 2], self.edge_indices[last * 2 + 1]);
+                self.edge_indices[slot * 2] = moved.0;
+                self.edge_indices[slot * 2 + 1] = moved.1;
+                self.edge_slots.insert(moved, slot as u32);
+                dirty.edges.push(slot as u32);
+            }
+            self.edge_indices.truncate(last * 2);
+        }
+        for &edge in &changes.added_edges {
+            if self.edge_slots.contains_key(&edge) || !mesh.topology.edge_faces.contains_key(&edge)
+            {
+                continue;
+            }
+            let slot = (self.edge_indices.len() / 2) as u32;
+            let next_index_count = self.edge_indices.len() + 2;
+            reserve_upload_headroom(&mut self.edge_indices, next_index_count);
+            self.edge_indices.extend_from_slice(&[edge.0, edge.1]);
+            self.edge_slots.insert(edge, slot);
+            dirty.edges.push(slot);
+        }
+        dirty
     }
 
     #[cfg(test)]
@@ -322,14 +428,18 @@ impl MeshUpload {
             }
         }
         let mut edge_indices = Vec::with_capacity(upload_capacity(edges.len().saturating_mul(2)));
+        let mut edge_slots = HashMap::with_capacity(upload_capacity(edges.len()));
         for (a, b) in edges {
+            let slot = (edge_indices.len() / 2) as u32;
             edge_indices.extend_from_slice(&[a, b]);
+            edge_slots.insert((a, b), slot);
         }
 
         Self {
             vertices,
             triangle_indices,
             edge_indices,
+            edge_slots,
         }
     }
 
@@ -373,6 +483,13 @@ fn upload_capacity(len: usize) -> usize {
     len.saturating_add((len / UPLOAD_GROWTH_DIVISOR).max(MIN_UPLOAD_GROWTH))
 }
 
+fn reserve_upload_headroom<T>(values: &mut Vec<T>, len: usize) {
+    if values.capacity() < len {
+        let desired = upload_capacity(len);
+        values.reserve_exact(desired.saturating_sub(values.len()));
+    }
+}
+
 fn coalesced_vertex_ranges(
     dirty_vertices: &mut Vec<u32>,
     vertex_count: usize,
@@ -394,6 +511,19 @@ fn coalesced_vertex_ranges(
         }
     }
     ranges
+}
+
+fn topology_upload_required(
+    dirty: &UploadChanges,
+    previous_triangle_indices: usize,
+    previous_edge_indices: usize,
+    triangle_indices: usize,
+    edge_indices: usize,
+) -> bool {
+    !dirty.faces.is_empty()
+        || !dirty.edges.is_empty()
+        || previous_triangle_indices != triangle_indices
+        || previous_edge_indices != edge_indices
 }
 
 #[repr(C)]
@@ -594,6 +724,65 @@ impl ViewportGpu {
             "sculpt viewport edge indices",
             &mesh.edge_indices,
         );
+        self.triangle_index_count = index_count(&mesh.triangle_indices);
+        self.edge_index_count = index_count(&mesh.edge_indices);
+    }
+
+    fn upload_changed_topology(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        mesh: &MeshUpload,
+        mut dirty_faces: Vec<u32>,
+        mut dirty_edges: Vec<u32>,
+    ) {
+        let triangle_bytes = (mesh.triangle_indices.len() * size_of::<u32>()) as u64;
+        let edge_bytes = (mesh.edge_indices.len() * size_of::<u32>()) as u64;
+        let face_count = mesh.triangle_indices.len() / 3;
+        let face_ranges = coalesced_vertex_ranges(&mut dirty_faces, face_count);
+        let full_triangles = self.triangles.buffer.is_none()
+            || triangle_bytes > self.triangles.capacity
+            || partial_ranges_are_expensive(&face_ranges, face_count);
+        if full_triangles {
+            self.triangles.write(
+                device,
+                queue,
+                "sculpt viewport triangle indices",
+                &mesh.triangle_indices,
+            );
+        } else if let Some(buffer) = &self.triangles.buffer {
+            for range in face_ranges {
+                let indices = range.start * 3..range.end * 3;
+                queue.write_buffer(
+                    buffer,
+                    (indices.start * size_of::<u32>()) as u64,
+                    bytemuck::cast_slice(&mesh.triangle_indices[indices]),
+                );
+            }
+        }
+
+        let edge_count = mesh.edge_indices.len() / 2;
+        let edge_ranges = coalesced_vertex_ranges(&mut dirty_edges, edge_count);
+        let full_edges = self.edges.buffer.is_none()
+            || edge_bytes > self.edges.capacity
+            || partial_ranges_are_expensive(&edge_ranges, edge_count);
+        if full_edges {
+            self.edges.write(
+                device,
+                queue,
+                "sculpt viewport edge indices",
+                &mesh.edge_indices,
+            );
+        } else if let Some(buffer) = &self.edges.buffer {
+            for range in edge_ranges {
+                let indices = range.start * 2..range.end * 2;
+                queue.write_buffer(
+                    buffer,
+                    (indices.start * size_of::<u32>()) as u64,
+                    bytemuck::cast_slice(&mesh.edge_indices[indices]),
+                );
+            }
+        }
         self.triangle_index_count = index_count(&mesh.triangle_indices);
         self.edge_index_count = index_count(&mesh.edge_indices);
     }
@@ -833,7 +1022,15 @@ impl egui_wgpu::CallbackTrait for ViewportPaintCallback {
             gpu.vertex_revision = input.vertex_revision;
         }
         if input.topology_revision != gpu.topology_revision {
-            gpu.upload_topology(device, queue, &input.mesh);
+            let full_upload = input.full_topology_upload || gpu.topology_revision == u64::MAX;
+            let dirty_faces = std::mem::take(&mut input.dirty_faces);
+            let dirty_edges = std::mem::take(&mut input.dirty_edges);
+            input.full_topology_upload = false;
+            if full_upload {
+                gpu.upload_topology(device, queue, &input.mesh);
+            } else {
+                gpu.upload_changed_topology(device, queue, &input.mesh, dirty_faces, dirty_edges);
+            }
             gpu.topology_revision = input.topology_revision;
         }
         if input.camera_revision != gpu.camera_revision {
@@ -977,7 +1174,26 @@ mod tests {
     }
 
     #[test]
-    fn prepared_buffer_capacity_keeps_growth_headroom() {
+    fn partial_vertex_upload_reallocates_when_adaptive_topology_outgrows_buffer() {
+        const CRASHED_BUFFER_BYTES: u64 = 7_510_368;
+        let original_vertices = CRASHED_BUFFER_BYTES as usize / size_of::<GpuVertex>();
+
+        assert!(!full_vertex_upload_required::<GpuVertex>(
+            true,
+            original_vertices,
+            CRASHED_BUFFER_BYTES,
+            &[],
+        ));
+        assert!(full_vertex_upload_required::<GpuVertex>(
+            true,
+            original_vertices + 1,
+            CRASHED_BUFFER_BYTES,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn prepared_buffer_capacity_keeps_adaptive_growth_headroom() {
         let required = 12 * 1024 * 1024;
         let limit = 256 * 1024 * 1024;
         let capacity = gpu_buffer_capacity(required, 0, limit);
@@ -1048,6 +1264,175 @@ mod tests {
     #[test]
     fn camera_uniform_layout_matches_wgsl_uniform_alignment() {
         assert_eq!(size_of::<CameraUniform>(), 128);
+    }
+
+    #[test]
+    fn topology_changes_update_only_the_cpu_mirror_delta() {
+        let mut mesh = Mesh::new(
+            vec![
+                Vec3::X,
+                Vec3::Y,
+                Vec3::NEG_X,
+                Vec3::NEG_Y,
+                Vec3::Z,
+                Vec3::NEG_Z,
+            ],
+            vec![
+                [4, 0, 1],
+                [4, 1, 2],
+                [4, 2, 3],
+                [4, 3, 0],
+                [5, 1, 0],
+                [5, 2, 1],
+                [5, 3, 2],
+                [5, 0, 3],
+            ],
+        )
+        .unwrap();
+        let mut upload = MeshUpload::from_mesh(&mesh);
+        let vertex_capacity = upload.vertices.capacity();
+        let triangle_capacity = upload.triangle_indices.capacity();
+        let edge_capacity = upload.edge_indices.capacity();
+        let active = (0..mesh.positions.len() as u32).collect::<Vec<_>>();
+        let mut recorder = crate::mesh::MeshEditRecorder::new(&mesh);
+        let outcome = mesh.remesh_region(
+            &active,
+            crate::mesh::RemeshSettings {
+                target_edge_length: 0.9,
+                enable_flips: true,
+                relaxation: 0.0,
+                ..crate::mesh::RemeshSettings::default()
+            },
+            &mut recorder,
+        );
+        assert!(outcome.stats.splits > 0);
+        let dirty = upload.apply_changes(&mesh, &outcome.changes);
+        let rebuilt = MeshUpload::from_mesh(&mesh);
+
+        assert!(!dirty.vertices.is_empty());
+        assert!(!dirty.faces.is_empty());
+        assert_eq!(upload.vertices.capacity(), vertex_capacity);
+        assert_eq!(upload.triangle_indices.capacity(), triangle_capacity);
+        assert_eq!(upload.edge_indices.capacity(), edge_capacity);
+        assert_eq!(upload.vertices, rebuilt.vertices);
+        assert_eq!(upload.triangle_indices, rebuilt.triangle_indices);
+        assert_eq!(
+            upload
+                .edge_indices
+                .chunks_exact(2)
+                .map(|edge| (edge[0], edge[1]))
+                .collect::<HashSet<_>>(),
+            rebuilt
+                .edge_indices
+                .chunks_exact(2)
+                .map(|edge| (edge[0], edge[1]))
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn shrinking_dense_tail_updates_counts_even_without_a_dirty_face_slot() {
+        let positions = vec![
+            Vec3::ZERO,
+            Vec3::X,
+            Vec3::Y,
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(4.0, 0.0, 0.0),
+            Vec3::new(3.0, 1.0, 0.0),
+        ];
+        let before = Mesh::new(positions.clone(), vec![[0, 1, 2], [3, 4, 5]]).unwrap();
+        let after = Mesh::new(positions, vec![[0, 1, 2]]).unwrap();
+        let mut upload = MeshUpload::from_mesh(&before);
+        let previous_triangle_indices = upload.triangle_indices.len();
+        let previous_edge_indices = upload.edge_indices.len();
+        let mut changes = MeshChangeSet::default();
+        changes.vertex_count = after.positions.len();
+        changes.face_count = after.triangles.len();
+        changes.dirty_vertices = vec![3, 4, 5];
+        changes.removed_edges = vec![(3, 4), (3, 5), (4, 5)];
+
+        let dirty = upload.apply_changes(&after, &changes);
+        let rebuilt = MeshUpload::from_mesh(&after);
+
+        assert!(dirty.faces.is_empty());
+        assert!(topology_upload_required(
+            &dirty,
+            previous_triangle_indices,
+            previous_edge_indices,
+            upload.triangle_indices.len(),
+            upload.edge_indices.len(),
+        ));
+        assert_eq!(upload.vertices, rebuilt.vertices);
+        assert_eq!(upload.triangle_indices, rebuilt.triangle_indices);
+        assert_eq!(
+            upload
+                .edge_indices
+                .chunks_exact(2)
+                .map(|edge| (edge[0], edge[1]))
+                .collect::<HashSet<_>>(),
+            rebuilt
+                .edge_indices
+                .chunks_exact(2)
+                .map(|edge| (edge[0], edge[1]))
+                .collect::<HashSet<_>>(),
+        );
+    }
+
+    #[test]
+    fn collapse_dense_compaction_matches_a_full_cpu_mirror_rebuild() {
+        let mut mesh = Mesh::new(
+            vec![
+                Vec3::X,
+                Vec3::Y,
+                Vec3::NEG_X,
+                Vec3::NEG_Y,
+                Vec3::Z,
+                Vec3::NEG_Z,
+            ],
+            vec![
+                [4, 0, 1],
+                [4, 1, 2],
+                [4, 2, 3],
+                [4, 3, 0],
+                [5, 1, 0],
+                [5, 2, 1],
+                [5, 3, 2],
+                [5, 0, 3],
+            ],
+        )
+        .unwrap();
+        let mut upload = MeshUpload::from_mesh(&mesh);
+        let active = (0..mesh.positions.len() as u32).collect::<Vec<_>>();
+        let mut recorder = crate::mesh::MeshEditRecorder::new(&mesh);
+        let outcome = mesh.remesh_region(
+            &active,
+            crate::mesh::RemeshSettings {
+                target_edge_length: 2.5,
+                enable_flips: false,
+                relaxation: 0.0,
+                ..crate::mesh::RemeshSettings::default()
+            },
+            &mut recorder,
+        );
+        assert!(outcome.stats.collapses > 0);
+
+        upload.apply_changes(&mesh, &outcome.changes);
+        let rebuilt = MeshUpload::from_mesh(&mesh);
+
+        assert_eq!(upload.vertices, rebuilt.vertices);
+        assert_eq!(upload.triangle_indices, rebuilt.triangle_indices);
+        assert_eq!(
+            upload
+                .edge_indices
+                .chunks_exact(2)
+                .map(|edge| (edge[0], edge[1]))
+                .collect::<HashSet<_>>(),
+            rebuilt
+                .edge_indices
+                .chunks_exact(2)
+                .map(|edge| (edge[0], edge[1]))
+                .collect::<HashSet<_>>(),
+        );
     }
 
     #[test]
