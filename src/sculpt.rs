@@ -21,10 +21,11 @@ pub enum SculptTool {
     Pinch,
     Flatten,
     Mask,
+    Shrink,
 }
 
 impl SculptTool {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Draw,
         Self::Clay,
         Self::Crease,
@@ -34,6 +35,7 @@ impl SculptTool {
         Self::Flatten,
         Self::Grab,
         Self::Mask,
+        Self::Shrink,
     ];
 
     #[must_use]
@@ -48,6 +50,7 @@ impl SculptTool {
             Self::Pinch => "Pinch",
             Self::Flatten => "Flatten",
             Self::Mask => "Mask",
+            Self::Shrink => "Shrink",
         }
     }
 
@@ -63,6 +66,7 @@ impl SculptTool {
             Self::Pinch => "Pull nearby surface points toward the brush center.",
             Self::Flatten => "Move the surface toward the brush's local plane.",
             Self::Mask => "Paint protection that limits the effect of sculpting tools.",
+            Self::Shrink => "Aggressively smooth and shrink the surface without removing polygons.",
         }
     }
 }
@@ -258,7 +262,7 @@ impl CoverageChannel {
     fn for_sample(tool: SculptTool, inverted: bool) -> Option<Self> {
         let polarity = match tool {
             SculptTool::Grab => return None,
-            SculptTool::Smooth => CoveragePolarity::Neutral,
+            SculptTool::Smooth | SculptTool::Shrink => CoveragePolarity::Neutral,
             SculptTool::Draw
             | SculptTool::Clay
             | SculptTool::Crease
@@ -935,6 +939,8 @@ fn propose_pass(
     let brush_normal = frame.normal;
     let smooth_units =
         (tool == SculptTool::Smooth).then(|| taubin_smooth_units(mesh, pass, source_positions));
+    let shrink_units =
+        (tool == SculptTool::Shrink).then(|| laplacian_shrink_units(mesh, pass, source_positions));
     for &vertex in &pass.vertices {
         let index = vertex as usize;
         let Some(&position) = source_positions.get(&vertex) else {
@@ -987,6 +993,12 @@ fn propose_pass(
             }
             SculptTool::Smooth => {
                 let Some(unit) = smooth_units.as_ref().and_then(|units| units.get(&vertex)) else {
+                    continue;
+                };
+                *unit
+            }
+            SculptTool::Shrink => {
+                let Some(unit) = shrink_units.as_ref().and_then(|units| units.get(&vertex)) else {
                     continue;
                 };
                 *unit
@@ -1202,6 +1214,33 @@ fn taubin_smooth_units(
     units
 }
 
+fn laplacian_shrink_units(
+    mesh: &Mesh,
+    pass: &PreparedPass,
+    source_positions: &HashMap<u32, Vec3>,
+) -> HashMap<u32, Vec3> {
+    let mut units = HashMap::with_capacity(pass.vertices.len());
+    for &vertex in &pass.vertices {
+        let Some(position) = source_positions.get(&vertex).copied() else {
+            continue;
+        };
+        let Some(neighbors) = mesh.topology.vertex_neighbors.get(vertex as usize) else {
+            continue;
+        };
+        if neighbors.is_empty() {
+            continue;
+        }
+        let average = neighbors
+            .iter()
+            .filter_map(|neighbor| source_positions.get(neighbor))
+            .copied()
+            .sum::<Vec3>()
+            / neighbors.len() as f32;
+        units.insert(vertex, average - position);
+    }
+    units
+}
+
 fn smoothing_neighbors(mesh: &Mesh, vertex: u32) -> Vec<u32> {
     let Some(neighbors) = mesh.topology.vertex_neighbors.get(vertex as usize) else {
         return Vec::new();
@@ -1304,7 +1343,7 @@ fn capture_source_positions(
             if let Some(&position) = mesh.positions.get(vertex as usize) {
                 source.entry(vertex).or_insert(position);
             }
-            if tool == SculptTool::Smooth
+            if matches!(tool, SculptTool::Smooth | SculptTool::Shrink)
                 && let Some(neighbors) = mesh.topology.vertex_neighbors.get(vertex as usize)
             {
                 for &neighbor in neighbors {
@@ -1406,6 +1445,17 @@ mod tests {
         }
     }
 
+    fn volume(mesh: &Mesh) -> f32 {
+        mesh.triangles
+            .iter()
+            .map(|triangle| {
+                let [a, b, c] = triangle.map(|vertex| mesh.positions[vertex as usize]);
+                a.dot(b.cross(c)) / 6.0
+            })
+            .sum::<f32>()
+            .abs()
+    }
+
     fn coverage_mesh() -> Mesh {
         let mut mesh = grid();
         mesh.positions[4].z = 0.35;
@@ -1451,6 +1501,7 @@ mod tests {
             SculptTool::Crease,
             SculptTool::Inflate,
             SculptTool::Smooth,
+            SculptTool::Shrink,
             SculptTool::Pinch,
             SculptTool::Flatten,
             SculptTool::Mask,
@@ -1490,6 +1541,7 @@ mod tests {
             SculptTool::Crease,
             SculptTool::Inflate,
             SculptTool::Smooth,
+            SculptTool::Shrink,
             SculptTool::Pinch,
             SculptTool::Flatten,
             SculptTool::Mask,
@@ -1532,6 +1584,7 @@ mod tests {
             SculptTool::Crease,
             SculptTool::Inflate,
             SculptTool::Smooth,
+            SculptTool::Shrink,
             SculptTool::Pinch,
             SculptTool::Flatten,
             SculptTool::Mask,
@@ -2090,6 +2143,102 @@ mod tests {
     }
 
     #[test]
+    fn shrink_uses_the_full_one_ring_laplacian_displacement() {
+        let mut mesh = grid();
+        mesh.positions[4].z = 1.0;
+        let _ = mesh.rebuild();
+        let source_positions = mesh
+            .positions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(vertex, position)| (vertex as u32, position))
+            .collect::<HashMap<_, _>>();
+        let pass = PreparedPass {
+            sample: sample(mesh.positions[4], 0),
+            vertices: vec![4],
+            side: PassSide::Primary,
+        };
+        let neighbors = &mesh.topology.vertex_neighbors[4];
+        let expected = neighbors
+            .iter()
+            .map(|&neighbor| mesh.positions[neighbor as usize])
+            .sum::<Vec3>()
+            / neighbors.len() as f32
+            - mesh.positions[4];
+
+        let units = laplacian_shrink_units(&mesh, &pass, &source_positions);
+
+        assert!(units[&4].abs_diff_eq(expected, 1.0e-6));
+    }
+
+    #[test]
+    fn shrink_loses_more_volume_than_smooth_without_changing_topology() {
+        let original = octahedron();
+        let mut smooth = original.clone();
+        let mut shrink = original.clone();
+        let mut settings = test_settings();
+        settings.radius = 3.0;
+        settings.strength = 0.5;
+        settings.falloff = 1.0;
+        let brush_sample = sample(Vec3::ZERO, 0);
+        let mut smooth_engine = SculptEngine::default();
+        let mut shrink_engine = SculptEngine::default();
+        smooth_engine.begin_stroke(&smooth);
+        shrink_engine.begin_stroke(&shrink);
+
+        assert!(smooth_engine.apply_sample(
+            &mut smooth,
+            SculptTool::Smooth,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+        assert!(shrink_engine.apply_sample(
+            &mut shrink,
+            SculptTool::Shrink,
+            &settings,
+            brush_sample,
+            DabKind::Spatial,
+        ));
+
+        assert!(volume(&shrink) < volume(&smooth));
+        assert_eq!(shrink.positions.len(), original.positions.len());
+        assert_eq!(shrink.triangles, original.triangles);
+    }
+
+    #[test]
+    fn shrink_is_neutral_when_the_brush_is_inverted() {
+        let mut normal = coverage_mesh();
+        let mut inverted = normal.clone();
+        let settings = coverage_settings();
+        let normal_sample = sample(normal.positions[4], 0);
+        let mut inverted_sample = normal_sample;
+        inverted_sample.invert_modifier = true;
+        let mut normal_engine = SculptEngine::default();
+        let mut inverted_engine = SculptEngine::default();
+        normal_engine.begin_stroke(&normal);
+        inverted_engine.begin_stroke(&inverted);
+
+        assert!(normal_engine.apply_sample(
+            &mut normal,
+            SculptTool::Shrink,
+            &settings,
+            normal_sample,
+            DabKind::Spatial,
+        ));
+        assert!(inverted_engine.apply_sample(
+            &mut inverted,
+            SculptTool::Shrink,
+            &settings,
+            inverted_sample,
+            DabKind::Spatial,
+        ));
+
+        assert_eq!(normal.positions, inverted.positions);
+    }
+
+    #[test]
     fn mask_brush_adds_and_inverted_mask_brush_erases() {
         let mut mesh = grid();
         let settings = test_settings();
@@ -2258,17 +2407,6 @@ mod tests {
 
     #[test]
     fn taubin_smoothing_keeps_more_volume_than_a_full_laplacian_step() {
-        fn volume(mesh: &Mesh) -> f32 {
-            mesh.triangles
-                .iter()
-                .map(|triangle| {
-                    let [a, b, c] = triangle.map(|vertex| mesh.positions[vertex as usize]);
-                    a.dot(b.cross(c)) / 6.0
-                })
-                .sum::<f32>()
-                .abs()
-        }
-
         let mut mesh = octahedron();
         let before = volume(&mesh);
         let mut settings = test_settings();

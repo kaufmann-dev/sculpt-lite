@@ -1,6 +1,6 @@
 # SculptLite
 
-SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes with area-weighted surface frames, stabilized plane brushes, low-shrink smoothing, configurable capped, accumulating, and Airbrush strokes, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
+SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes with area-weighted surface frames, stabilized plane brushes, low-shrink and intentionally shrinking smoothing, configurable capped, accumulating, and Airbrush strokes, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
 
 ## Viewport controls
 
@@ -8,7 +8,7 @@ Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle mode
 
 With the pointer released, a left click applies one dab and left-drag sculpts from either viewpoint. Choose **Capped** to apply only newly increased brush influence until the button is released, **Accumulate** to build up with every distance-spaced dab while moving, or **Airbrush** to add the same spatial buildup plus timed dabs while held still. Press `A` to cycle these choices. The choice is remembered separately for each sculpt tool and captured when a stroke begins. Grab remains movement-driven: it anchors the affected region on press and keeps moving that region even when the pointer leaves the surface. The usual Shift-to-Smooth and Ctrl-to-Invert modifiers work throughout a stroke.
 
-Draw, Crease, and Pinch derive their working direction from the brush footprint instead of a single triangle. Clay and Flatten additionally stabilize their surface plane over the stroke, while Smooth uses a two-pass correction that loses substantially less volume than basic Laplacian smoothing. Geometry dabs are reduced to a safe partial step when the requested displacement would collapse or reverse a face. When a brush is too small for the local triangle spacing, the status bar warns that the result is undersampled; increase the radius or voxel-remesh a closed mesh at finer resolution for more detail.
+Draw, Crease, and Pinch derive their working direction from the brush footprint instead of a single triangle. Clay and Flatten additionally stabilize their surface plane over the stroke. Smooth uses a two-pass correction that loses substantially less volume than basic Laplacian smoothing, while Shrink intentionally uses a one-pass Laplacian step to smooth and reduce volume without changing polygon count. Geometry dabs are reduced to a safe partial step when the requested displacement would collapse or reverse a face. When a brush is too small for the local triangle spacing, the status bar warns that the result is undersampled; increase the radius or voxel-remesh a closed mesh at finer resolution for more detail.
 
 ## Voxel remeshing
 

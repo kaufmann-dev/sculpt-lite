@@ -138,7 +138,7 @@ impl Default for StrokeBehavior {
 
 #[derive(Clone, Debug)]
 struct ToolStrokeBehaviors {
-    values: [StrokeBehavior; 9],
+    values: [StrokeBehavior; 10],
 }
 
 impl ToolStrokeBehaviors {
@@ -161,6 +161,7 @@ impl ToolStrokeBehaviors {
             SculptTool::Pinch => 6,
             SculptTool::Flatten => 7,
             SculptTool::Mask => 8,
+            SculptTool::Shrink => 9,
         }
     }
 }
@@ -168,7 +169,7 @@ impl ToolStrokeBehaviors {
 impl Default for ToolStrokeBehaviors {
     fn default() -> Self {
         Self {
-            values: [StrokeBehavior::CAPPED; 9],
+            values: [StrokeBehavior::CAPPED; 10],
         }
     }
 }
@@ -243,7 +244,7 @@ const fn shortcut(modifiers: Modifiers, key: Key, action: ShortcutAction) -> Sho
     }
 }
 
-const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
+const SHORTCUT_BINDINGS: [ShortcutBinding; 32] = [
     // Put shortcuts with required Shift modifiers before their less-specific
     // variants because egui permits extra Shift for logical key matching.
     shortcut(
@@ -311,6 +312,11 @@ const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
     ),
     shortcut(
         Modifiers::NONE,
+        Key::Num0,
+        ShortcutAction::SelectTool(SculptTool::Shrink),
+    ),
+    shortcut(
+        Modifiers::NONE,
         Key::OpenBracket,
         ShortcutAction::AdjustRadius(ShortcutDirection::Decrease),
     ),
@@ -347,7 +353,7 @@ const SHORTCUT_BINDINGS: [ShortcutBinding; 31] = [
     shortcut(Modifiers::NONE, Key::I, ShortcutAction::ToggleBrushInvert),
     shortcut(
         Modifiers::NONE,
-        Key::Num0,
+        Key::Backslash,
         ShortcutAction::SetSymmetry(None),
     ),
     shortcut(
@@ -4019,6 +4025,7 @@ mod tests {
         let mut behaviors = ToolStrokeBehaviors::default();
         behaviors.set(SculptTool::Draw, StrokeBehavior::ACCUMULATE);
         behaviors.set(SculptTool::Smooth, StrokeBehavior::AIRBRUSH);
+        behaviors.set(SculptTool::Shrink, StrokeBehavior::ACCUMULATE);
 
         let captured = stroke_behavior_for_press(&behaviors, SculptTool::Draw, Modifiers::NONE);
         behaviors.set(SculptTool::Draw, StrokeBehavior::AIRBRUSH);
@@ -4036,6 +4043,10 @@ mod tests {
         assert_eq!(
             stroke_behavior_for_press(&behaviors, SculptTool::Clay, Modifiers::NONE),
             StrokeBehavior::CAPPED
+        );
+        assert_eq!(
+            stroke_behavior_for_press(&behaviors, SculptTool::Shrink, Modifiers::NONE),
+            StrokeBehavior::ACCUMULATE
         );
         assert_eq!(
             stroke_behavior_for_press(&behaviors, SculptTool::Grab, Modifiers::NONE),
@@ -4148,6 +4159,7 @@ mod tests {
             (SculptTool::Flatten, Key::Num7),
             (SculptTool::Grab, Key::Num8),
             (SculptTool::Mask, Key::Num9),
+            (SculptTool::Shrink, Key::Num0),
         ];
 
         assert_eq!(SculptTool::ALL, assignments.map(|(tool, _shortcut)| tool));
@@ -4172,7 +4184,7 @@ mod tests {
         );
         assert_eq!(
             shortcut_label(&context, "Off", &[ShortcutAction::SetSymmetry(None)]),
-            "Off (0)"
+            "Off (Backslash)"
         );
     }
 
