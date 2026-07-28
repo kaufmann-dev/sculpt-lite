@@ -785,6 +785,27 @@ enum PendingAction {
     Close,
 }
 
+struct ExportDialogTask {
+    receiver: Receiver<Option<PathBuf>>,
+    after: Option<PendingAction>,
+}
+
+fn spawn_file_dialog<T, F>(context: egui::Context, dialog: F) -> std::io::Result<Receiver<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new()
+        .name("sculptlite-file-dialog".to_owned())
+        .spawn(move || {
+            let result = dialog();
+            let _ = sender.send(result);
+            context.request_repaint();
+        })?;
+    Ok(receiver)
+}
+
 fn remesh_disabled_reason(mesh: &Mesh) -> Option<String> {
     source_eligibility(mesh)
         .err()
@@ -1179,6 +1200,7 @@ pub struct SculptLiteApp {
     grab_transform: Option<GrabTransform>,
     frame_render: FrameRenderBatch,
     pending_action: Option<PendingAction>,
+    export_dialog: Option<ExportDialogTask>,
     worker: Option<BackgroundWorker>,
     background_task: Option<BackgroundTask>,
     worker_error: Option<String>,
@@ -1232,6 +1254,7 @@ impl SculptLiteApp {
             grab_transform: None,
             frame_render: FrameRenderBatch::default(),
             pending_action: None,
+            export_dialog: None,
             worker,
             background_task: None,
             worker_error,
@@ -1290,6 +1313,7 @@ impl SculptLiteApp {
             && has_mesh
             && !self.sculpt.is_stroking()
             && self.background_task.is_none()
+            && self.export_dialog.is_none()
             && self.pending_action.is_none()
             && self.error.is_none()
             && !context.input(|input| input.viewport().close_requested());
@@ -1312,7 +1336,10 @@ impl SculptLiteApp {
     }
 
     fn request_action(&mut self, action: PendingAction, context: &egui::Context) {
-        if self.background_task.is_some() || self.sculpt.is_stroking() {
+        if self.background_task.is_some()
+            || self.export_dialog.is_some()
+            || self.sculpt.is_stroking()
+        {
             self.status = "Wait for the current mesh operation to finish".to_owned();
             return;
         }
@@ -1849,7 +1876,10 @@ impl SculptLiteApp {
     }
 
     fn export_as(&mut self, after: Option<PendingAction>, context: &egui::Context) -> bool {
-        if self.background_task.is_some() || self.sculpt.is_stroking() {
+        if self.background_task.is_some()
+            || self.export_dialog.is_some()
+            || self.sculpt.is_stroking()
+        {
             return false;
         }
         let Some(document) = self.document.as_ref() else {
@@ -1868,19 +1898,57 @@ impl SculptLiteApp {
                 |name| format!("{name}-sculpted.stl"),
             );
         self.release_fly(context);
-        let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("STL mesh", &["stl"])
-            .set_title("Export STL As")
-            .set_file_name(suggested_name)
-            .save_file()
-        else {
-            return false;
+        let receiver = match spawn_file_dialog(context.clone(), move || {
+            rfd::FileDialog::new()
+                .add_filter("STL mesh", &["stl"])
+                .set_title("Export STL As")
+                .set_file_name(suggested_name)
+                .save_file()
+        }) {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                self.error = Some(format!("Could not open the export file dialog\n\n{error}"));
+                return false;
+            }
         };
-        if path.extension().is_none() {
-            path.set_extension("stl");
-        }
+        self.export_dialog = Some(ExportDialogTask { receiver, after });
+        self.status = "Choose an export destination in the file dialog".to_owned();
+        true
+    }
 
-        self.start_export(path, after, context)
+    fn poll_export_dialog(&mut self, context: &egui::Context) {
+        let result = match self
+            .export_dialog
+            .as_ref()
+            .map(|task| task.receiver.try_recv())
+        {
+            Some(Ok(path)) => Ok(path),
+            Some(Err(TryRecvError::Disconnected)) => Err(()),
+            Some(Err(TryRecvError::Empty)) | None => return,
+        };
+        let task = self
+            .export_dialog
+            .take()
+            .expect("completed export dialog remains active");
+        match result {
+            Ok(Some(mut path)) => {
+                if path.extension().is_none() {
+                    path.set_extension("stl");
+                }
+                let pending_after = task.after.clone();
+                if !self.start_export(path, task.after, context) {
+                    self.pending_action = pending_after;
+                }
+            }
+            Ok(None) => {
+                self.pending_action = task.after;
+                self.status = "Export canceled".to_owned();
+            }
+            Err(()) => {
+                self.pending_action = task.after;
+                self.error = Some("The export file dialog stopped unexpectedly".to_owned());
+            }
+        }
     }
 
     fn start_export(
@@ -2233,7 +2301,9 @@ impl SculptLiteApp {
     }
 
     fn shortcut_availability(&self) -> ShortcutAvailability {
-        let actions_ready = self.background_task.is_none() && !self.sculpt.is_stroking();
+        let actions_ready = self.background_task.is_none()
+            && self.export_dialog.is_none()
+            && !self.sculpt.is_stroking();
         let mesh_ready = actions_ready
             && self
                 .document
@@ -2305,6 +2375,7 @@ impl SculptLiteApp {
         if fly_shortcuts_suppressed(self.camera.mode(), self.fly_captured, secondary_button_down)
             || context.egui_wants_keyboard_input()
             || self.pending_action.is_some()
+            || self.export_dialog.is_some()
             || self.error.is_some()
         {
             return;
@@ -2326,7 +2397,9 @@ impl SculptLiteApp {
 
     fn top_bar(&mut self, root_ui: &mut egui::Ui, context: &egui::Context) {
         egui::Panel::top("top_bar").show(root_ui, |ui| {
-            let actions_ready = self.background_task.is_none() && !self.sculpt.is_stroking();
+            let actions_ready = self.background_task.is_none()
+                && self.export_dialog.is_none()
+                && !self.sculpt.is_stroking();
             let mesh_ready = actions_ready
                 && self
                     .document
@@ -2434,6 +2507,7 @@ impl SculptLiteApp {
             .show(root_ui, |ui| {
                 ui.heading("Sculpt");
                 let mesh_ready = self.background_task.is_none()
+                    && self.export_dialog.is_none()
                     && !self.sculpt.is_stroking()
                     && self
                         .document
@@ -2879,7 +2953,7 @@ impl SculptLiteApp {
                         .put(
                             button_rect,
                             egui::Button::new("Choose STL…").sense(
-                                if self.background_task.is_none() {
+                                if self.background_task.is_none() && self.export_dialog.is_none() {
                                     Sense::click()
                                 } else {
                                     Sense::hover()
@@ -2935,7 +3009,9 @@ impl SculptLiteApp {
                                 has_mesh,
                                 stroke_active: self.sculpt.is_stroking(),
                                 mesh_job_active: self.background_task.is_some(),
-                                modal_active: self.pending_action.is_some() || self.error.is_some(),
+                                modal_active: self.pending_action.is_some()
+                                    || self.export_dialog.is_some()
+                                    || self.error.is_some(),
                             })
                         {
                             self.capture_fly(context);
@@ -3112,6 +3188,7 @@ impl SculptLiteApp {
                 });
                 if sculpting_allowed(self.fly_captured)
                     && self.background_task.is_none()
+                    && self.export_dialog.is_none()
                     && !self.sculpt.is_stroking()
                     && let Some((position, modifiers)) = viewport_primary_press
                     && let Some(pointer_hit) = self.hit_at(position, camera_frame)
@@ -3478,15 +3555,29 @@ impl SculptLiteApp {
             self.error = None;
         }
     }
+
+    fn export_dialog_prompt(&self, context: &egui::Context) {
+        egui::Modal::new(egui::Id::new("export_file_dialog")).show(context, |ui| {
+            ui.heading("Export STL As");
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Choose a destination in the file dialog.");
+            });
+        });
+    }
 }
 
 impl eframe::App for SculptLiteApp {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = root_ui.ctx().clone();
+        self.poll_export_dialog(&context);
         self.poll_background_task(&context);
         self.enforce_fly_release(&context);
         if context.input(|input| input.viewport().close_requested()) && !self.allow_close {
-            if self
+            if self.export_dialog.is_some() {
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.status = "Finish or cancel the export file dialog before closing".to_owned();
+            } else if self
                 .background_task
                 .as_ref()
                 .is_some_and(BackgroundTask::owns_mesh)
@@ -3545,7 +3636,9 @@ impl eframe::App for SculptLiteApp {
         self.status_bar(root_ui);
         self.tool_panel(root_ui);
         self.viewport(root_ui, &context);
-        if self.error.is_some() {
+        if self.export_dialog.is_some() {
+            self.export_dialog_prompt(&context);
+        } else if self.error.is_some() {
             self.error_prompt(&context);
         } else {
             self.unsaved_prompt(&context);
@@ -3563,6 +3656,9 @@ impl eframe::App for SculptLiteApp {
             }
         }
         if self.background_task.is_some() {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.export_dialog.is_some() {
             context.request_repaint_after(Duration::from_millis(100));
         }
         if self.fly_captured {
@@ -4131,6 +4227,24 @@ mod tests {
     #[test]
     fn mouse_samples_use_full_pressure() {
         assert_eq!(MOUSE_PRESSURE, 1.0);
+    }
+
+    #[test]
+    fn file_dialog_work_does_not_block_the_event_thread() {
+        let context = egui::Context::default();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let result_receiver = spawn_file_dialog(context, move || {
+            release_receiver.recv().unwrap();
+            42
+        })
+        .unwrap();
+
+        assert!(matches!(
+            result_receiver.try_recv(),
+            Err(TryRecvError::Empty)
+        ));
+        release_sender.send(()).unwrap();
+        assert_eq!(result_receiver.recv_timeout(Duration::from_secs(1)), Ok(42));
     }
 
     #[test]
