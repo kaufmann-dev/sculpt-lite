@@ -2,9 +2,29 @@
 
 SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes with area-weighted surface frames, stabilized plane brushes, low-shrink and intentionally shrinking smoothing, configurable capped, accumulating, and Airbrush strokes, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
 
-## Install for your user
+## Install a release
 
-The installer builds SculptLite from source and places it below `~/.local`, so it does not need `sudo`. When `~/.local/bin` comes before `/usr/bin` in `PATH`, this user copy takes precedence over a system package.
+On Fedora x86_64, install or update to the latest release with dnf. The package adds the `sculpt-lite` command, application launcher, icon, and desktop metadata:
+
+```sh
+sudo dnf install https://github.com/kaufmann-dev/sculpt-lite/releases/latest/download/sculpt-lite.x86_64.rpm
+```
+
+Run the same command again to update after a new release. To uninstall, run `sudo dnf remove sculpt-lite`.
+
+On other x86_64 Linux distributions, download and run the AppImage:
+
+```sh
+curl -fLO https://github.com/kaufmann-dev/sculpt-lite/releases/latest/download/sculpt-lite-x86_64.AppImage
+chmod +x sculpt-lite-x86_64.AppImage
+./sculpt-lite-x86_64.AppImage
+```
+
+To uninstall the AppImage, delete the file.
+
+## Install from source
+
+The installer builds SculptLite from source and places it below `~/.local`, so it does not need `sudo`. When `~/.local/bin` comes before `/usr/bin` in `PATH`, this user copy takes precedence over the RPM package.
 
 On Fedora, install the build and desktop-integration prerequisites once, then set up Rust and open a new terminal:
 
@@ -106,3 +126,14 @@ cargo test --release --bin sculpt-lite resolution_96_remesh_probe -- --ignored -
 ## Packages
 
 The Fedora RPM and AppImage scripts consume `target/release/sculpt-lite`. Build the release binary before invoking `packaging/rpm/build-rpm.sh` or `packaging/appimage/build-appimage.sh`.
+
+## Publish a release
+
+Set the new version in `Cargo.toml`, `packaging/rpm/sculpt-lite.spec` (including a `%changelog` entry), and the first `<release>` in `packaging/linux/app.sculptlite.editor.metainfo.xml`. After the commit is on `master`, tag and push it:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The Linux workflow verifies that the tag matches all three versions, builds the RPM and AppImage, and publishes them to a GitHub release with the stable asset names used above.

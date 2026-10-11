@@ -24,4 +24,4 @@ Run the ignored large-mesh probes documented in `README.md` individually and in 
 
 ## Packaging
 
-Build `target/release/sculpt-lite` before running the RPM or AppImage scripts. Keep the version in `Cargo.toml` synchronized with `packaging/rpm/sculpt-lite.spec`, and keep the application ID `app.sculptlite.editor` consistent across native-window and packaging metadata.
+Build `target/release/sculpt-lite` before running the RPM or AppImage scripts. Keep the version in `Cargo.toml` synchronized with `packaging/rpm/sculpt-lite.spec` and the AppStream metainfo (CI enforces this and requires release tags to match), and keep the application ID `app.sculptlite.editor` consistent across native-window and packaging metadata.

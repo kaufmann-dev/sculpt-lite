@@ -54,5 +54,5 @@ xmllint --noout %{SOURCE2}
 %{_datadir}/icons/hicolor/512x512/apps/%{app_id}.png
 
 %changelog
-* Sat Jul 18 2026 SculptLite maintainers <maintainers@sculptlite.invalid> - 0.1.0-1
+* Sun Oct 11 2026 SculptLite maintainers <maintainers@sculptlite.invalid> - 0.1.0-1
 - Build the first native Linux package

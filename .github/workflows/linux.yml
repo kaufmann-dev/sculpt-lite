@@ -25,6 +25,19 @@ jobs:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      - name: Check release version consistency
+        run: |
+          cargo_version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          spec_version="$(awk '/^Version:/ { print $2; exit }' packaging/rpm/sculpt-lite.spec)"
+          metainfo_version="$(grep -oP '<release version="\K[^"]+' packaging/linux/app.sculptlite.editor.metainfo.xml | head -n 1)"
+          printf 'Cargo %s, RPM %s, AppStream %s\n' "$cargo_version" "$spec_version" "$metainfo_version"
+          test -n "$cargo_version"
+          test "$cargo_version" = "$spec_version"
+          test "$cargo_version" = "$metainfo_version"
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v$cargo_version"
+          fi
+
       - name: Install Linux build and smoke-test dependencies
         run: |
           sudo apt-get update
@@ -112,19 +125,20 @@ jobs:
           APPIMAGE_RUNTIME: ${{ runner.temp }}/appimagetool/runtime-x86_64
           APPIMAGETOOL: ${{ runner.temp }}/appimagetool/appimagetool
         run: |
-          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          packaging/appimage/build-appimage.sh
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          packaging/appimage/build-appimage.sh dist/sculpt-lite-x86_64.AppImage
 
       - name: Smoke-test AppImage launch
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
-        run: packaging/linux/smoke-x11.sh dist/SculptLite-0.1.0-x86_64.AppImage
+        run: packaging/linux/smoke-x11.sh dist/sculpt-lite-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: sculpt-lite-appimage-x86_64
-          path: dist/SculptLite-0.1.0-x86_64.AppImage
+          path: dist/sculpt-lite-x86_64.AppImage
           if-no-files-found: error
           compression-level: 0
 
@@ -171,3 +185,52 @@ jobs:
           path: dist/rpm/*.x86_64.rpm
           if-no-files-found: error
           compression-level: 0
+
+  release:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: [ubuntu, fedora-rpm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Publish release with stable asset names
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rpm_files=(release/*.x86_64.rpm)
+          if [[ "${#rpm_files[@]}" -ne 1 || ! -f "${rpm_files[0]}" ]]; then
+            printf 'expected exactly one RPM, found %s\n' "${rpm_files[*]}" >&2
+            exit 1
+          fi
+          if [[ "${rpm_files[0]}" != release/sculpt-lite.x86_64.rpm ]]; then
+            mv "${rpm_files[0]}" release/sculpt-lite.x86_64.rpm
+          fi
+          test -f release/sculpt-lite-x86_64.AppImage
+          notes="$(cat <<'NOTES'
+          ## Install
+
+          Fedora (x86_64):
+
+          ```sh
+          sudo dnf install https://github.com/kaufmann-dev/sculpt-lite/releases/latest/download/sculpt-lite.x86_64.rpm
+          ```
+
+          Other x86_64 Linux distributions: download `sculpt-lite-x86_64.AppImage`, make it executable with `chmod +x`, and run it.
+          NOTES
+          )"
+          gh release create "$GITHUB_REF_NAME" \
+            --title "SculptLite $GITHUB_REF_NAME" \
+            --notes "$notes" \
+            --generate-notes \
+            --verify-tag \
+            release/sculpt-lite.x86_64.rpm \
+            release/sculpt-lite-x86_64.AppImage
