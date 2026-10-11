@@ -58,6 +58,7 @@ jobs:
       - name: Check packaging shell scripts
         run: |
           shellcheck \
+            install \
             packaging/appimage/AppRun \
             packaging/appimage/build-appimage.sh \
             packaging/linux/smoke-x11.sh \

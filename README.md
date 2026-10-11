@@ -2,6 +2,58 @@
 
 SculptLite is a native Linux desktop application for importing, sculpting, remeshing, and exporting STL meshes. It provides responsive fixed-topology sculpting brushes with area-weighted surface frames, stabilized plane brushes, low-shrink and intentionally shrinking smoothing, configurable capped, accumulating, and Airbrush strokes, symmetry, undo and redo, an explicit whole-object voxel remesh, a wireframe overlay, and STL export.
 
+## Install for your user
+
+The installer builds SculptLite from source and places it below `~/.local`, so it does not need `sudo`. When `~/.local/bin` comes before `/usr/bin` in `PATH`, this user copy takes precedence over a system package.
+
+On Fedora, install the build and desktop-integration prerequisites once, then set up Rust and open a new terminal:
+
+```sh
+sudo dnf install \
+  dbus-devel desktop-file-utils gcc gcc-c++ git-core \
+  gtk-update-icon-cache libX11-devel libXcursor-devel libXi-devel \
+  libXrandr-devel libxkbcommon-devel make mesa-libGL-devel \
+  pkgconf-pkg-config rustup vulkan-loader-devel \
+  wayland-devel
+rustup-init -y --profile minimal --default-toolchain 1.96.0
+```
+
+Clone the project, then install or replace the current user copy:
+
+```sh
+git clone https://github.com/kaufmann-dev/sculpt-lite.git
+cd sculpt-lite
+./install
+```
+
+The installer builds and installs the executable, application launcher, icon, and AppStream metadata. For a later update, pull the desired source revision and run `./install` again; existing files are replaced. Confirm that the user copy wins:
+
+```sh
+command -v sculpt-lite
+# Expected: /home/your-user/.local/bin/sculpt-lite
+```
+
+If the installer warns that `~/.local/bin` is not first in `PATH`, add it to your shell profile and open a new terminal:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To remove the executable, launcher, icon, and metadata, run:
+
+```sh
+./install --uninstall
+```
+
+## Start SculptLite
+
+Open SculptLite from the application launcher, start with an empty window, or open an STL mesh directly:
+
+```sh
+sculpt-lite
+sculpt-lite /path/to/model.stl
+```
+
 ## Viewport controls
 
 Choose **Orbit** or **Fly** beside the Frame button, or press `V` to toggle modes. In Orbit, right-drag pans, middle-drag orbits, and the wheel zooms. Fly defaults to **Level** movement, where `W`/`S` and `A`/`D` stay horizontal regardless of look pitch; choose **Free flight** beside the Fly button to make `W`/`S` follow the look direction instead. In either Fly style, hold RMB to capture the pointer, look with the mouse, move down with Shift, move up with Space, hold Ctrl for a temporary 4× speed boost, and use the wheel to adjust the base flight speed. Release RMB or press Escape to release the pointer. Press `F` to frame the mesh and return to Orbit.
@@ -25,29 +77,6 @@ cargo run -- /path/to/model.stl
 # or
 cargo run
 ```
-
-## Install for your user
-
-Install or replace the user-local executable without `sudo`:
-
-```sh
-./install
-```
-
-The installer builds and installs the executable, application launcher, icon, and AppStream metadata. The executable is installed at `~/.local/bin/sculpt-lite`. Ensure that directory appears before `/usr/bin` in `PATH`, then confirm it is the active copy:
-
-```sh
-command -v sculpt-lite
-# Expected: /home/your-user/.local/bin/sculpt-lite
-```
-
-If necessary, add it for the current shell and open a new terminal afterward:
-
-```sh
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-Run `./install` again after pulling or making later changes; the existing executable and desktop files are replaced.
 
 ## Verify a change
 

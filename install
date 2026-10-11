@@ -5,56 +5,98 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly repo_root
 
+usage() {
+    printf 'Usage: %s [--uninstall]\n' "$0"
+}
+
+action=install
+case "${1:-}" in
+    "") ;;
+    --uninstall) action=uninstall ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac
+if (($# > 1)); then
+    usage >&2
+    exit 2
+fi
+
 if [[ -z "${HOME:-}" ]]; then
     printf 'HOME must be set to install SculptLite.\n' >&2
     exit 1
 fi
 
-readonly required_commands=(
-    cargo
-    chmod
-    cp
-    desktop-file-install
-    gtk-update-icon-cache
-    mkdir
-    update-desktop-database
-)
+install_hint() {
+    case "$1" in
+        cargo) printf 'sudo dnf install rustup && rustup-init -y, then open a new terminal' ;;
+        desktop-file-install | update-desktop-database) printf 'sudo dnf install desktop-file-utils' ;;
+        update-mime-database) printf 'sudo dnf install shared-mime-info' ;;
+        *) printf 'sudo dnf install %s' "$1" ;;
+    esac
+}
 
-for command_name in "${required_commands[@]}"; do
+for command_name in \
+    cargo \
+    desktop-file-install \
+    gtk-update-icon-cache \
+    update-desktop-database; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         printf 'Required command not found: %s\n' "$command_name" >&2
+        printf 'On Fedora: %s\n' "$(install_hint "$command_name")" >&2
         exit 1
     fi
 done
 
 readonly local_root="$HOME/.local"
-readonly data_root="$local_root/share"
+readonly bin_dir="$local_root/bin"
+readonly data_root="${XDG_DATA_HOME:-$HOME/.local/share}"
 readonly app_id="app.sculptlite.editor"
+readonly binary="sculpt-lite"
+readonly desktop_file="$data_root/applications/$app_id.desktop"
+readonly icon_file="$data_root/icons/hicolor/512x512/apps/$app_id.png"
+readonly metainfo_file="$data_root/metainfo/$app_id.metainfo.xml"
+
+refresh_caches() {
+    update-desktop-database "$data_root/applications"
+    gtk-update-icon-cache --force --ignore-theme-index \
+        "$data_root/icons/hicolor"
+}
+
+if [[ "$action" == uninstall ]]; then
+    installed_crates="$(cargo install --list --root "$local_root")"
+    if grep -q "^$binary v" <<<"$installed_crates"; then
+        cargo uninstall --root "$local_root" "$binary"
+    fi
+    rm -f "$desktop_file" "$icon_file" "$metainfo_file"
+    mkdir -p "$data_root/applications" "$data_root/icons/hicolor"
+    refresh_caches
+    printf 'SculptLite is uninstalled.\n'
+    exit 0
+fi
 
 cd "$repo_root"
 cargo install --locked --force --path "$repo_root" --root "$local_root"
 
-mkdir -p \
-    "$data_root/applications" \
-    "$data_root/icons/hicolor/512x512/apps" \
-    "$data_root/metainfo"
-
-cp "assets/sculpt-lite.png" \
-    "$data_root/icons/hicolor/512x512/apps/$app_id.png"
-cp "packaging/linux/$app_id.metainfo.xml" \
-    "$data_root/metainfo/$app_id.metainfo.xml"
-chmod 0644 \
-    "$data_root/icons/hicolor/512x512/apps/$app_id.png" \
-    "$data_root/metainfo/$app_id.metainfo.xml"
+install -D -m 0644 "assets/$binary.png" "$icon_file"
+install -D -m 0644 "packaging/linux/$app_id.metainfo.xml" "$metainfo_file"
 
 desktop-file-install \
     --dir="$data_root/applications" \
-    --set-key=Exec --set-value="$local_root/bin/sculpt-lite %f" \
-    --set-key=TryExec --set-value="$local_root/bin/sculpt-lite" \
+    --set-key=Exec --set-value="$bin_dir/$binary %f" \
+    --set-key=TryExec --set-value="$bin_dir/$binary" \
     "packaging/linux/$app_id.desktop"
 
-update-desktop-database "$data_root/applications"
-gtk-update-icon-cache --force --ignore-theme-index \
-    "$data_root/icons/hicolor"
+refresh_caches
 
-printf 'SculptLite is installed at %s/bin/sculpt-lite.\n' "$local_root"
+printf 'SculptLite is installed at %s/%s.\n' "$bin_dir" "$binary"
+if [[ "$(command -v "$binary" || true)" != "$bin_dir/$binary" ]]; then
+    printf 'Warning: %s is not first in PATH for the %s command.\n' "$bin_dir" "$binary" >&2
+    printf 'Add it to your shell profile, then open a new terminal:\n' >&2
+    printf "  export PATH=\"%s:\$PATH\"\n" "$bin_dir" >&2
+fi
